@@ -1,0 +1,16 @@
+# Numeric knobs for `perflab optimize` (grid search) and `perflab agent`.
+# Problem dimensions (M, N, K) are fixed by contract in task.yaml.
+# 4096³ = 137 GFLOP — large enough to saturate GPU and reveal real bottlenecks.
+M: 4096
+N: 4096
+K: 4096
+BLOCK_SIZE_M: 64
+BLOCK_SIZE_N: 64
+BLOCK_SIZE_K: 32
+
+# Grid search space for `perflab optimize` and agent auto-tuning.
+# CUTLASS-derived baselines for H100: BLOCK=128-256, stages=4-5.
+sweep:
+  BLOCK_SIZE_M: [64, 128, 256]
+  BLOCK_SIZE_N: [64, 128, 256]
+  BLOCK_SIZE_K: [32, 64, 128]

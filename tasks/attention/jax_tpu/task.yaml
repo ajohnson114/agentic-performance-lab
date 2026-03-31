@@ -1,0 +1,52 @@
+name: "attention_jax_tpu"
+workspace: "tasks/attention/jax_tpu"
+program_type: "jax"
+target_hardware: "TPU v5e"  # optimized for TPU demo
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  secondary_metric:
+    name: "tokens_per_sec.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 20
+
+profile_plan:
+  always: ["cpu_flame", "jax"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+  top_n: 5
+  max_history: 3
+
+analysis_thresholds:
+  # TPU-specific thresholds
+  tpu_mxu_util_low: 30.0
+  tpu_padding_waste_pct_high: 15.0
+  tpu_infeed_stall_pct_high: 5.0
+  # JAX thresholds
+  jax_recompilation_warn: 1
+  jax_compilation_time_high_ms: 5000.0
+  jax_compilations_excessive: 3
+
+contract:
+  fixed_params: { batch_size: 16, seq_len: 512, d_model: 512, n_heads: 8 }
+  min_repeats: 5
+  required_bench_fields: ["ok", "tflops"]
+
+edit_policy:
+  allowed_paths:
+    - "attention_op.py"
+    - "tuning.yaml"
+
+out_dir: "../../out"

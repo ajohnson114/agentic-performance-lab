@@ -1,0 +1,42 @@
+name: "matmul_python_pure"
+workspace: "tasks/matmul/python"
+program_type: "python"
+# target_hardware: "NVIDIA H100"  # optional: tells the agent what to optimize for
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 1
+  repeats: 3
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 10
+  regression_tolerance: 0.02
+  rlimit_as_gb: 2
+
+analysis_thresholds:
+  perf_ipc_low: 0.5              # Python interpreter inherently has low IPC
+  perf_hotspot_dominance_pct: 30.0 # interpreter overhead is distributed
+  perf_cpus_utilized_low: 0.8    # single-threaded
+
+contract:
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops"]
+
+edit_policy:
+  allowed_paths:
+    - "matmul.py"
+
+out_dir: "../../out"

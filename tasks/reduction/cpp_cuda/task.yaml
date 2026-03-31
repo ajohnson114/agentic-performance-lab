@@ -1,0 +1,53 @@
+name: "reduction_cpp_cuda"
+workspace: "tasks/reduction/cpp_cuda"
+program_type: "cpp"
+target_hardware: null
+
+build:
+  cmd: "nvcc -O2 -o reduce_bin reduce.cu"
+  expected_exit: 0
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "throughput_gbs.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 10
+
+constraints:
+  max_iters: 10
+  regression_tolerance: 0.02
+  rlimit_as_gb: 0
+
+analysis_thresholds:
+  ncu_mem_throughput_high: 70.0  # memory-bound — should hit high bandwidth
+  ncu_mem_bound_high: 75.0       # expected to be memory-bound
+  ncu_sm_util_low: 35.0          # even reduction needs some SM util
+  ncu_sm_util_critical: 25.0
+  gpu_cpu_ratio_low: 0.8         # kernel should dominate
+  sync_count_warn: 2
+
+contract:
+  fixed_params: { N: 67108864, iterations: 100 }
+  min_repeats: 5
+  required_bench_fields: ["ok", "throughput_gbs"]
+
+data_hints:
+  sparsity: 0.0
+  dtype_safety: "fp32_safe"
+  access_pattern: "sequential"   # Reduction reads array sequentially
+  custom:
+    - "Memory-bound workload — optimize for bandwidth, not compute"
+    - "Output is a single scalar (sum reduction)"
+
+edit_policy:
+  allowed_paths:
+    - "reduce.cu"
+    - "tuning.yaml"
+
+out_dir: "../../out"

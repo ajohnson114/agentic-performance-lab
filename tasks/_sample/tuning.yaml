@@ -1,0 +1,64 @@
+# =============================================================================
+# tuning.yaml — Numeric knobs for `perflab optimize` and `perflab agent`
+# =============================================================================
+#
+# This file defines two kinds of parameters:
+#
+# 1. FIXED PARAMETERS (problem dimensions) — protected by contract.fixed_params
+#    in task.yaml. These CANNOT be changed by the agent or optimizer. They define
+#    the problem the code must solve (matrix sizes, batch sizes, sequence lengths).
+#    Example: M, N, K for matmul; batch_size, seq_len for training.
+#
+# 2. TUNABLE PARAMETERS (implementation knobs) — fair game for optimization.
+#    These control HOW the code solves the problem, not WHAT it solves.
+#    Example: block_size, TILE_M, num_warps, num_stages.
+#
+# The `sweep` section defines the search space for grid search (perflab optimize)
+# and auto-tuning (perflab agent). When the agent accepts a code edit and sweep
+# parameters exist, PerfLab automatically sweeps the space (max 15 trials).
+#
+# For CUDA tasks, sweep ranges can be centered on CUTLASS-optimal baselines
+# for your GPU architecture (see perflab/analyzers/cutlass_baselines.py).
+#
+# =============================================================================
+# WHAT GOES IN TUNING.YAML:
+#
+#   ALLOWED (tunable):
+#     - block_size, BLOCK_SIZE_M/N/K     — thread block dimensions
+#     - TILE_M, TILE_N, TILE_K           — tiling dimensions
+#     - num_warps                        — warps per CTA (Triton)
+#     - num_stages                       — pipeline stages (Triton/CUDA)
+#     - batch_size (if not in contract)  — only if not in fixed_params
+#     - lr, momentum                     — training hyperparameters
+#     - num_workers                      — DataLoader parallelism
+#
+#   NOT ALLOWED (must be in contract.fixed_params):
+#     - M, N, K                          — problem dimensions
+#     - seq_len                          — sequence length
+#     - num_images                       — dataset size
+#     - Any parameter that changes WHAT the code computes
+#
+# =============================================================================
+# bench.py reads these values via:
+#   knobs = yaml.safe_load(Path("tuning.yaml").read_text())
+#   block_size = int(knobs.get("block_size", 16))
+# =============================================================================
+
+size: 512
+
+# Uncomment to enable grid search / agent auto-tuning:
+# sweep:
+#   size: [256, 512, 1024, 2048]
+#
+# For CUDA matmul tasks, a realistic sweep might look like:
+# sweep:
+#   TILE_M: [64, 128, 256]
+#   TILE_N: [64, 128, 256]
+#   TILE_K: [16, 32, 64]
+#   NUM_STAGES: [2, 3, 4]
+#
+# For Triton tasks:
+# sweep:
+#   BLOCK_SIZE_M: [64, 128, 256]
+#   BLOCK_SIZE_N: [64, 128, 256]
+#   BLOCK_SIZE_K: [32, 64, 128]

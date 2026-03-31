@@ -1,0 +1,6 @@
+# Numeric knobs for the `perflab optimize` command (knob sweep mode).
+# These are NOT used by `perflab agent` — the agent edits source code directly.
+# Keep defaults small since pure Python is very slow.
+M: 128
+N: 128
+K: 128

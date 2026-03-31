@@ -1,0 +1,7 @@
+# Numeric knobs for `perflab optimize` (grid search) and `perflab agent`.
+# Problem dimensions (M, N, K) are fixed by contract in task.yaml.
+# 4096³ = 137 GFLOP — large enough to saturate GPU Tensor Cores.
+# Dimensions must be multiples of 16 for WMMA Tensor Core operations.
+M: 4096
+N: 4096
+K: 4096

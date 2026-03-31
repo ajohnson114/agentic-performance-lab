@@ -1,0 +1,46 @@
+name: "dataloader_bottleneck_pytorch"
+workspace: "tasks/dataloader_bottleneck/pytorch"
+program_type: "pytorch"
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "samples_per_sec.median"
+    mode: "maximize"
+  warmup: 1
+  repeats: 5
+
+profile_plan:
+  always: ["cpu_flame", "torch_trace"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.1         # GPU is intentionally starved
+  io_hotspot_pct_high: 10.0      # IO is the bottleneck we're optimizing
+  io_non_gpu_fraction_high: 0.3  # lower threshold — non-GPU work is expected
+  phase_dominance_pct: 30.0      # data loading phase will dominate
+  host_device_gpu_active_low: 20.0  # GPU mostly idle by design
+  nsys_gpu_fraction_low: 0.1     # expected low GPU utilization
+
+contract:
+  fixed_params: { batch_size: 32 }
+  min_repeats: 3
+  required_bench_fields: ["ok", "samples_per_sec"]
+
+edit_policy:
+  allowed_paths:
+    - "tuning.yaml"
+    - "dataset.py"
+    - "model.py"
+
+out_dir: "../../out"

@@ -1,0 +1,44 @@
+name: "matmul_jax"
+workspace: "tasks/matmul/jax"
+program_type: "jax"
+# target_hardware: "NVIDIA H100"  # optional: tells the agent what to optimize for
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 20
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 10
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.6         # JIT adds some CPU time
+  jax_recompilation_warn: 1      # any recompilation is a problem
+  jax_compilation_time_high_ms: 3000.0
+  jax_compilations_excessive: 3
+  sync_count_warn: 5
+
+contract:
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops"]
+
+edit_policy:
+  allowed_paths:
+    - "matmul_op.py"
+    - "tuning.yaml"
+
+out_dir: "../../out"

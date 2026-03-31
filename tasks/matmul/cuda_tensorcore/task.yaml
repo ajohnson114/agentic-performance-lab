@@ -1,0 +1,54 @@
+name: "matmul_cuda_tensorcore"
+workspace: "tasks/matmul/cuda_tensorcore"
+program_type: "cuda"
+target_hardware: null
+
+build:
+  cmd: "nvcc -O2 -arch=sm_70 -o hgemm_bin hgemm.cu"
+  expected_exit: 0
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.9         # pure GEMM — GPU must dominate at 4096³
+  ncu_sm_util_low: 70.0          # Tensor Core GEMM should saturate SMs
+  ncu_sm_util_critical: 50.0     # critical if below 50%
+  ncu_compute_low: 60.0          # expect high compute throughput
+  ncu_occupancy_low: 50.0        # needs good occupancy
+  ncu_tc_util_low: 40.0          # Tensor Core utilization threshold
+  sync_count_warn: 2             # minimal host-device sync
+
+contract:
+  fixed_params: { M: 4096, N: 4096, K: 4096 }
+  min_repeats: 5
+  required_bench_fields: ["ok", "tflops"]
+
+data_hints:
+  sparsity: 0.0
+  dtype_safety: "fp16_safe"
+  access_pattern: "blocked"
+  value_range: [-0.5, 0.5]
+
+edit_policy:
+  allowed_paths:
+    - "hgemm.cu"
+    - "tuning.yaml"
+
+out_dir: "../../out"

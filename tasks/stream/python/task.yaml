@@ -1,0 +1,29 @@
+name: stream-python
+program_type: python
+
+edit_policy:
+  allowed_paths:
+    - "*.py"
+
+correctness:
+  cmd: "python tests.py"
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  warmup: 1
+  repeats: 5
+  metric:
+    name: "throughput.median"
+    mode: "maximize"
+
+constraints:
+  max_iters: 8
+  regression_tolerance: 0.02
+
+contract:
+  required_bench_fields:
+    - ok
+    - throughput
+  min_repeats: 3
+
+out_dir: "../../out"

@@ -1,0 +1,54 @@
+name: "transformer_train_pytorch"
+workspace: "tasks/transformer_train/pytorch"
+program_type: "pytorch"
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tokens_per_sec.median"
+    mode: "maximize"
+  warmup: 2
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame", "torch_trace"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.5         # training overhead is real but GPU should dominate at larger batch
+  phase_dominance_pct: 40.0      # fwd/bwd/optim are all significant
+  mem_alloc_overhead_pct: 0.10   # training allocates more
+  sync_count_warn: 15            # gradient syncs expected
+  nsys_gpu_fraction_low: 0.5     # some CPU work between steps
+  ncu_tc_util_low: 20.0          # transformer matmuls should use Tensor Cores
+
+contract:
+  fixed_params: { batch_size: 32, seq_len: 512 }
+  min_repeats: 5
+  required_bench_fields: ["ok", "tokens_per_sec"]
+
+data_hints:
+  dtype_safety: "bf16_safe"      # Training with BF16 mixed precision is safe
+  batch_size_range: [8, 128]     # Typical training batch sizes
+  sequence_lengths: "fixed"      # Fixed seq_len per contract
+  access_pattern: "sequential"
+  custom:
+    - "Transformer model with attention, FFN, and layer norm"
+    - "Loss function is cross-entropy"
+
+edit_policy:
+  allowed_paths:
+    - "model.py"
+    - "tuning.yaml"
+
+out_dir: "../../out"

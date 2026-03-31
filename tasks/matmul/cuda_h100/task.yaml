@@ -1,0 +1,65 @@
+name: "matmul_cuda_h100"
+workspace: "tasks/matmul/cuda_h100"
+program_type: "cuda"
+target_hardware: "NVIDIA H100"
+
+build:
+  cmd: "nvcc -O2 -o sgemm_bin sgemm.cu"
+  expected_exit: 0
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.9         # pure GEMM kernel at 4096³ — GPU must dominate
+  ncu_sm_util_low: 70.0          # tiled SGEMM should saturate SMs
+  ncu_sm_util_critical: 50.0     # critical if below 50%
+  ncu_compute_low: 60.0          # expect high compute throughput
+  ncu_occupancy_low: 50.0        # SGEMM needs good occupancy
+  ncu_tc_util_low: 30.0          # H100 should use Tensor Cores
+  sync_count_warn: 2             # minimal host-device sync
+
+contract:
+  fixed_params: { M: 4096, N: 4096, K: 4096 }
+  min_repeats: 5
+  required_bench_fields: ["ok", "tflops"]
+
+roofline:
+  peak_tflops: 989.0              # TF32 Tensor Core peak (default for FP32 matmuls)
+  peak_mem_bw_gbs: 3350.0
+  title: "H100 SGEMM Roofline (4096³)"
+  peak_fp16_tflops: 1979.0        # FP16 Tensor Core peak
+  dtype_peaks:
+    peak_tflops_fp32: 67.0        # CUDA core FP32 (no Tensor Cores)
+    peak_tflops_tf32: 989.0       # TF32 Tensor Core
+    peak_tflops_fp16: 1979.0      # FP16 Tensor Core
+    peak_tflops_bf16: 1979.0      # BF16 Tensor Core
+
+data_hints:
+  sparsity: 0.0
+  dtype_safety: "fp16_safe"      # TF32 Tensor Cores handle FP32 inputs safely
+  access_pattern: "blocked"
+  value_range: [-0.5, 0.5]
+
+edit_policy:
+  allowed_paths:
+    - "sgemm.cu"
+    - "tuning.yaml"
+
+out_dir: "../../out"

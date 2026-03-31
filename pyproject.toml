@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perflab"
+version = "0.1.0"
+description = "Agentic profiling + optimization lab"
+readme = "README.md"
+license = {text = "AGPL-3.0-or-later"}
+requires-python = ">=3.10"
+dependencies = [
+  "typer>=0.12",
+  "PyYAML>=6.0",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.30"]
+ollama = []
+mcp = ["fastmcp>=2.0"]
+profiling = ["pmu-tools"]
+all = ["openai>=1.0", "anthropic>=0.30", "fastmcp>=2.0"]
+tasks-python = ["numpy"]
+tasks-pytorch = ["numpy", "torch", "torchvision"]
+tasks-jax = ["numpy", "jax", "jaxlib", "optax"]
+tasks-jax-metal = ["numpy", "jax", "jaxlib", "jax-metal", "optax"]
+tasks-triton = ["numpy", "torch", "triton"]
+tasks-all = ["numpy", "torch", "torchvision", "jax", "jaxlib", "optax", "triton"]
+
+[project.scripts]
+perflab = "perflab.cli:app"
+perflab-mcp = "perflab.server.mcp_server:main"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::pyparsing.PyparsingDeprecationWarning",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["perflab*"]

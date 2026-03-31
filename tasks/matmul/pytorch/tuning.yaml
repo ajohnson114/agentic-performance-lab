@@ -1,0 +1,8 @@
+# Numeric knobs for `perflab optimize` (grid search) and `perflab agent`.
+dtype: "fp16"          # fp16 or fp32
+batch: 1               # number of independent matmuls per step
+
+# Grid search space for `perflab optimize` (6 combinations)
+sweep:
+  dtype: ["fp16", "fp32"]
+  batch: [1, 4, 16]

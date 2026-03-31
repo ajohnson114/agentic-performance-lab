@@ -1,0 +1,5 @@
+# Numeric knobs for the `perflab optimize` command (knob sweep mode).
+# These are NOT used by `perflab agent` — the agent edits source code directly.
+M: 2048
+N: 2048
+K: 2048

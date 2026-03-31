@@ -1,0 +1,212 @@
+# ============================================================================
+# PerfLab Task Configuration — Sample Template
+# ============================================================================
+# Copy this directory to tasks/<category>/<name>/ and customize.
+#
+# Required fields: name, workspace, program_type, correctness, benchmark,
+#                  edit_policy
+# Optional fields: build, target_hardware, profile_plan, constraints,
+#                  roofline, contract, agent, analysis_thresholds, out_dir
+#
+# Tip: run `perflab show-task task.yaml` to see the effective configuration
+#      with defaults filled in and overrides highlighted.
+# ============================================================================
+
+name: "sample_task"
+workspace: "tasks/_sample"
+
+# Program type determines which profilers are selected automatically.
+# Options: python | pytorch | jax | triton | cpp | cuda
+program_type: "python"
+
+# Optional: tells the agent what hardware to optimize for.
+# Examples: "NVIDIA A100", "Apple M2 Pro", "Intel Xeon 8380"
+target_hardware: null
+
+# Optional build step — runs before correctness and benchmark.
+# Use this for compiled languages (cpp, cuda).
+# Set to null for interpreted languages.
+build: null
+# build:
+#   cmd: "g++ -O2 -o my_binary my_source.cpp"
+#   expected_exit: 0
+
+# Correctness test — must exit 0 for the code to be considered valid.
+# The agent cannot accept any change that breaks this test.
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+# Benchmark harness — must write JSON metrics to the --json path.
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "throughput.median"       # Dotted path into bench.json
+    mode: "maximize"                # "maximize" or "minimize"
+  warmup: 2                         # Default: 3
+  repeats: 10                       # Default: 20
+
+  # ---------------------------------------------------------------------------
+  # Multi-objective (Pareto) optimization — optional
+  # ---------------------------------------------------------------------------
+  # Define a secondary metric to enable Pareto frontier analysis. The agent
+  # still optimizes for the primary metric, but CI regression checks gate on
+  # *both* metrics — a regression on either one fails the check.
+  #
+  # Common combinations:
+  #   - Maximize throughput (TFLOPS) + minimize tail latency (p95)
+  #   - Maximize throughput + minimize power draw (watts)
+  #   - Minimize latency + minimize memory usage (peak_mb)
+  #
+  # The secondary metric must exist in the bench.json output as a dotted path,
+  # just like the primary metric. Use `perflab compare <A> <B>` to see Pareto
+  # analysis across runs.
+  #
+  # secondary_metric:
+  #   name: "latency_ms.p95"        # Dotted path into bench.json
+  #   mode: "minimize"              # "maximize" or "minimize"
+
+# Which profilers to run. PerfLab also auto-selects based on program_type.
+# Options: cpu_flame, torch_trace, linux_perf, nsys, ncu, metal_trace
+profile_plan:
+  always: ["cpu_flame"]
+  # optional: ["linux_perf"]        # Run if available but don't fail
+
+# ---------------------------------------------------------------------------
+# Agent loop constraints
+# ---------------------------------------------------------------------------
+constraints:
+  max_iters: 10                     # Max optimization iterations (default: 10)
+  regression_tolerance: 0.02        # Candidates must improve by at least this fraction (default: 0.02)
+
+  # Memory limit for subprocesses (Linux only).
+  #   - Omit or set to null → automatic: 4 GB for CPU tasks, disabled for GPU tasks
+  #   - Set to a number     → use that many GB (e.g. 16 for large-matrix CPU work)
+  #   - Set to 0            → disable the limit entirely
+  #
+  # GPU program types (cuda, pytorch, jax, triton) automatically skip this limit
+  # because CUDA runtimes map huge virtual address regions. You only need to set
+  # this explicitly for CPU tasks that legitimately need more than 4 GB, or if you
+  # want to enforce a tighter cap.
+  #
+  # rlimit_as_gb: null              # auto (default)
+  # rlimit_as_gb: 16                # allow up to 16 GB
+  # rlimit_as_gb: 0                 # no limit
+
+  # Prompt token budget — limit LLM prompt size for models with small context windows.
+  # When set, PerfLab trims lower-priority sections (profile diffs, prior run context,
+  # roofline) to fit. Source files and benchmark results are never trimmed.
+  #   - 0 (default)   → no limit
+  #   - 8000          → ~32K chars (good for 32K-context models)
+  #   - 16000         → ~64K chars
+  # prompt_token_budget: 0
+
+  # Number of bottleneck diagnoses to include in LLM prompts and reports.
+  # Higher values give the agent more context but use more tokens.
+  #   - 3 (default)  → top 3 bottlenecks
+  #   - 5            → more context for complex workloads
+  #   - 1            → minimal, focus on the biggest bottleneck
+  # top_n: 3
+
+  # Number of recent optimization iterations to include in the LLM prompt.
+  # Older iterations are dropped to save tokens. The LLM only needs recent
+  # context to avoid repeating failed approaches.
+  #   - 3 (default)  → last 3 iterations
+  #   - 5            → more history for complex multi-stage optimizations
+  #   - 0            → no cap (include all iterations — uses more tokens)
+  # max_history: 3
+
+  # ---------------------------------------------------------------------------
+  # Fast-math permission — allows -ffast-math / --use_fast_math / -Ofast
+  # ---------------------------------------------------------------------------
+  # When true, the agent may use IEEE-noncompliant floating-point optimizations:
+  #   - Operation reordering (a+b+c may compute differently)
+  #   - Reciprocal approximation for division
+  #   - Fused multiply-add across statements
+  #   - Assumes no NaN/Inf inputs
+  # Typical speedup: 10-30% for floating-point-heavy code.
+  # Only enable if your correctness test tolerates the accuracy difference.
+  #
+  # allow_fast_math: true
+  # accuracy_tolerance: "1e-3"  # how much error is acceptable (optional)
+
+# ---------------------------------------------------------------------------
+# Contract — anti-gaming rules
+# ---------------------------------------------------------------------------
+# Prevents the LLM from "optimizing" by shrinking the problem, reducing
+# benchmark iterations, or dropping required metrics.
+#
+# The contract applies to BOTH:
+#   - LLM code edits (can't change problem size in source code)
+#   - Auto-tuning sweeps (every parameter combination is validated)
+#
+# contract:
+#   fixed_params:                   # Values enforced in bench.json meta
+#     M: 512
+#     N: 512
+#     K: 512
+#   min_repeats: 3                  # Minimum benchmark repeats (default: 1)
+#   min_warmup: 0                   # Minimum warmup iterations (default: 0)
+#   required_bench_fields:          # Must appear in bench.json output
+#     - "ok"
+#     - "tflops"
+
+# Optional: roofline analysis (requires hardware peak data).
+# You can also use `perflab peaks --target auto` to detect these.
+# For CUDA tasks on known GPUs, PerfLab auto-detects peaks and provides
+# per-dtype ceilings (FP32, TF32, FP16, BF16) and L2 bandwidth.
+# roofline:
+#   peak_tflops: 10.0
+#   peak_mem_bw_gbs: 200.0
+#   dtype_peaks:
+#     peak_tflops_fp32: 10.0
+#     peak_tflops_fp16: 20.0
+
+# ---------------------------------------------------------------------------
+# Agent beam search configuration
+# ---------------------------------------------------------------------------
+# agent:
+#   n_candidates: 4                 # Candidates per LLM call (default: 6)
+#   top_k: 2                        # Top candidates to re-benchmark (default: 2)
+#   max_iters: 8                    # Agent loop iterations (default: 12)
+
+# ---------------------------------------------------------------------------
+# Bottleneck analysis thresholds
+# ---------------------------------------------------------------------------
+# Different workloads have different "normal" profiles — a data-preprocessing
+# pipeline legitimately sits at 30% GPU utilization, while a pure matmul should
+# be near 100%. Override any subset; omitted fields keep their defaults.
+# Run `perflab thresholds` to list all ~50 fields with types and defaults.
+#
+# analysis_thresholds:
+#   gpu_cpu_ratio_low: 0.3          # flag GPU underutil at 30% instead of 50%
+#   sync_count_warn: 5              # flag sync issues at 5 instead of 10
+#   phase_dominance_pct: 50.0       # flag dominant phases at 50% instead of 60%
+#   nsys_gpu_fraction_low: 0.4      # nsys: GPU fraction threshold
+#   perf_ipc_low: 0.8               # flag low IPC at 0.8 instead of 1.0
+
+# ---------------------------------------------------------------------------
+# Data hints — characteristics of the input data
+# ---------------------------------------------------------------------------
+# These hints help the LLM make better algorithmic choices. They don't affect
+# profiling — they provide context the profiler can't infer.
+#
+# data_hints:
+#   sparsity: 0.95              # 95% of values are zero → consider sparse formats
+#   value_range: [-1.0, 1.0]    # values are small → FP16 is safe
+#   access_pattern: "sequential" # sequential | random | strided | blocked
+#   batch_size_range: [1, 128]  # production batch sizes (1 = latency matters)
+#   dtype_safety: "fp16_safe"   # fp16_safe | bf16_safe | int8_safe
+#   sequence_lengths: "variable_32_2048"  # fixed | variable_<min>_<max>
+#   custom:                     # free-form hints
+#     - "data is symmetric"
+#     - "output is always positive"
+
+# Edit policy — restricts which files the agent can modify.
+# CRITICAL: always scope this to your task's source files. Never include
+# tests.py, bench.py, or task.yaml (they're blocklisted anyway).
+edit_policy:
+  allowed_paths:
+    - "sample.py"
+
+out_dir: "out"

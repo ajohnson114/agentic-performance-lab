@@ -1,0 +1,43 @@
+name: "matmul_pytorch"
+workspace: "tasks/matmul/pytorch"
+program_type: "pytorch"
+# target_hardware: "NVIDIA H100"  # optional: tells the agent what to optimize for
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 20
+
+profile_plan:
+  always: ["cpu_flame", "torch_trace"]
+
+constraints:
+  max_iters: 8
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.7         # some framework overhead expected
+  sync_count_warn: 3             # matmul should have minimal syncs
+  mem_alloc_overhead_pct: 0.03   # tight matmul loop — low alloc overhead
+  nsys_gpu_fraction_low: 0.7     # GPU should be active most of the time
+
+contract:
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops"]
+
+edit_policy:
+  allowed_paths:
+    - "matmul_op.py"
+    - "tuning.yaml"
+
+out_dir: "../../out"

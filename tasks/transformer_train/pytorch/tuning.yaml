@@ -1,0 +1,6 @@
+# Training configuration — realistic workload for H100/A100.
+# batch_size=32 × seq_len=512 = 16,384 tokens/step — enough to saturate GPU.
+# Fixed by contract: batch_size and seq_len cannot be changed.
+batch_size: 32
+seq_len: 512
+lr: 0.001

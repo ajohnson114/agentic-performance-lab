@@ -1,0 +1,53 @@
+name: "matmul_cuda_naive"
+workspace: "tasks/matmul/cuda"
+program_type: "cuda"
+target_hardware: null
+
+build:
+  cmd: "nvcc -O2 -o sgemm_bin sgemm.cu"
+  expected_exit: 0
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 10
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.8         # pure GEMM kernel — GPU should dominate
+  ncu_sm_util_low: 70.0          # tiled SGEMM should saturate SMs
+  ncu_sm_util_critical: 50.0     # critical if below 50%
+  ncu_compute_low: 60.0          # expect high compute throughput
+  ncu_occupancy_low: 50.0        # SGEMM needs good occupancy
+  sync_count_warn: 2             # minimal host-device sync
+
+contract:
+  fixed_params: { M: 1024, N: 1024, K: 1024 }
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops"]
+
+data_hints:
+  sparsity: 0.0
+  dtype_safety: "fp32_safe"
+  access_pattern: "naive"        # Naive row-major matmul, not yet optimized
+  value_range: [-0.5, 0.5]
+
+edit_policy:
+  allowed_paths:
+    - "sgemm.cu"
+    - "tuning.yaml"
+
+out_dir: "../../out"
