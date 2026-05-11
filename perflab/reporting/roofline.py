@@ -235,13 +235,18 @@ def write_roofline_png(
     title: str,
     dtype_peaks: dict[str, float] | None = None,
     l2_bw_gbs: float | None = None,
+    history_points: list[dict] | None = None,
 ) -> None:
+    """history_points: list of dicts with keys 'iteration', 'roofline_ai',
+    'roofline_tflops', 'description'. Plotted as a labeled trail behind the
+    current point. Baseline (iter 0) and accepted patches only."""
     import matplotlib.pyplot as plt
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
-    x_min = max(1e-4, point.ai / 50.0)
-    x_max = max(point.ai * 50.0, 1e-2)
+    all_ai = [point.ai] + [p["roofline_ai"] for p in (history_points or []) if "roofline_ai" in p]
+    x_min = max(1e-4, min(all_ai) / 50.0)
+    x_max = max(max(all_ai) * 50.0, 1e-2)
 
     xs = []
     n = 220
@@ -289,6 +294,25 @@ def write_roofline_png(
                 plt.axhline(val, linestyle=":", color=color, alpha=0.7,
                             label=f"{label} ≈ {val:.1f} TFLOP/s")
 
+    # History trail: baseline + accepted iterations
+    trail = [p for p in (history_points or []) if "roofline_ai" in p and "roofline_tflops" in p]
+    if trail:
+        trail_ai = [p["roofline_ai"] for p in trail]
+        trail_tf = [p["roofline_tflops"] for p in trail]
+        # Faded connecting line
+        plt.plot(trail_ai, trail_tf, "o--", color="#94a3b8", linewidth=1,
+                 markersize=5, zorder=4, label="Optimization trail")
+        for p in trail:
+            label = f"iter {p['iteration']}" if p["iteration"] > 0 else "baseline"
+            plt.annotate(
+                label,
+                (p["roofline_ai"], p["roofline_tflops"]),
+                textcoords="offset points",
+                xytext=(-8, 6),
+                fontsize=7,
+                color="#64748b",
+            )
+
     # Annotation text
     annot_lines = [f"AI={point.ai:.3g}", f"{point.tflops:.2f} TFLOP/s"]
     if point.achieved_bw_gbs is not None:
@@ -296,8 +320,8 @@ def write_roofline_png(
     else:
         annot_lines.append(f"{point.gbs:.1f} GB/s")
 
-    plt.scatter([point.ai], [point.tflops], marker="o", s=80, zorder=5,
-                label=f"Achieved ≈ {point.tflops:.2f} TFLOP/s")
+    plt.scatter([point.ai], [point.tflops], marker="*", s=180, zorder=5,
+                color="#f59e0b", label=f"Best ≈ {point.tflops:.2f} TFLOP/s")
     plt.annotate(
         "\n".join(annot_lines),
         (point.ai, point.tflops),

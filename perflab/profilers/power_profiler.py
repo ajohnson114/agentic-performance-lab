@@ -51,9 +51,11 @@ class PowerProfiler:
             gpu_power_path = artifacts_dir / "gpu_power_log.txt"
             samples: list[float] = []
             mem_samples: list[dict] = []
+            power_unavailable_reason: str | None = None
             stop_event = threading.Event()
 
             def poll_gpu_power():
+                nonlocal power_unavailable_reason
                 while not stop_event.is_set():
                     try:
                         res = run_cmd(
@@ -65,10 +67,12 @@ class PowerProfiler:
                         if res.returncode == 0:
                             for line in res.stdout.strip().splitlines():
                                 parts = [p.strip() for p in line.split(",")]
+                                # power.draw returns "[N/A]" in containers or MIG mode
                                 try:
                                     samples.append(float(parts[0]))
                                 except (ValueError, IndexError):
-                                    pass
+                                    if parts and power_unavailable_reason is None:
+                                        power_unavailable_reason = parts[0]
                                 if len(parts) >= 3:
                                     try:
                                         mem_samples.append({
@@ -93,12 +97,15 @@ class PowerProfiler:
             if samples:
                 gpu_data = _compute_gpu_power_stats(samples)
                 summary["gpu_power"] = gpu_data
-                # Write raw samples
                 gpu_power_path.write_text(
                     "\n".join(f"{s:.1f}" for s in samples),
                     encoding="utf-8",
                 )
                 artifacts["gpu_power_log"] = str(gpu_power_path)
+            elif power_unavailable_reason is not None:
+                # nvidia-smi responded but power.draw is unavailable (e.g.
+                # "[N/A]" in containers, MIG mode, or insufficient privileges).
+                summary["gpu_power_unavailable"] = power_unavailable_reason
 
             if mem_samples:
                 gpu_mem = _compute_gpu_memory_stats(mem_samples)

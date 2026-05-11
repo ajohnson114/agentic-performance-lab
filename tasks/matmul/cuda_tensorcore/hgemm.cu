@@ -33,7 +33,7 @@ constexpr int WMMA_K = 16;
 
 // Naive WMMA kernel: each warp handles one 16x16 output tile.
 // Loads A and B fragments directly from global memory — no shared memory.
-__global__ void hgemm_wmma_naive(int M, int N, int K,
+__global__ void hgemm_kernel(int M, int N, int K,
                                   const half* A, const half* B, float* C) {
     // Warp-level coordinates
     int warpM = (blockIdx.y * blockDim.y + threadIdx.y) / 32 * WMMA_M;
@@ -99,7 +99,7 @@ static int selftest() {
     // 1 warp = 32 threads, need 1 warp for 16x16 tile
     dim3 block(32, 1);
     dim3 grid(1, 1);
-    hgemm_wmma_naive<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
+    hgemm_kernel<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, N * N * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -119,7 +119,7 @@ static int selftest() {
     h_B = float_to_half(h_B_fp32);
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), N * N * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_C, 0, N * N * sizeof(float)));
-    hgemm_wmma_naive<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
+    hgemm_kernel<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, N * N * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
 
     // Warmup
     for (int w = 0; w < warmup; ++w) {
-        hgemm_wmma_naive<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
+        hgemm_kernel<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -207,7 +207,7 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaDeviceSynchronize());
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        hgemm_wmma_naive<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
+        hgemm_kernel<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
         CHECK_CUDA(cudaDeviceSynchronize());
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

@@ -35,7 +35,7 @@ class LLMSection:
     model: str = "gpt-5.2"
     api_base: str = ""
     temperature: float = 0.7
-    max_tokens: int = 4096
+    max_tokens: int = 16000
     # api_key is deliberately NOT stored in this config — it comes from
     # PERFLAB_API_KEY env var only, so it never gets written to disk or
     # serialized into run artifacts.

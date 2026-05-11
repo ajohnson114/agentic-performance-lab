@@ -23,7 +23,7 @@ def generate_sweep_candidates(current_knobs: dict) -> list[KnobPatch]:
     The ``sweep`` key maps knob names to lists of values to try::
 
         sweep:
-          block_size: [16, 32, 64, 128, 256]
+          threadsPerBlock: [16, 32, 64, 128, 256]
           BLOCK_SIZE_M: [32, 64, 128]
 
     Returns one KnobPatch per combination (Cartesian product).  The ``sweep``

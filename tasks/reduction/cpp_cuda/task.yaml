@@ -4,7 +4,7 @@ program_type: "cpp"
 target_hardware: null
 
 build:
-  cmd: "nvcc -O2 -o reduce_bin reduce.cu"
+  cmd: "nvcc -O2 -arch=native -o reduce_bin reduce.cu"
   expected_exit: 0
 
 correctness:

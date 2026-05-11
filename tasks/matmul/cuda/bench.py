@@ -19,7 +19,7 @@ def main():
     M = int(knobs.get("M", 1024))
     N = int(knobs.get("N", 1024))
     K = int(knobs.get("K", 1024))
-    block_size = int(knobs.get("block_size", 16))
+    threadsPerBlock = int(knobs.get("threadsPerBlock", 16))
 
     binary = Path("sgemm_bin")
 
@@ -33,7 +33,7 @@ def main():
     run_cmd = [
         str(binary.resolve()),
         "--M", str(M), "--N", str(N), "--K", str(K),
-        "--block_size", str(block_size),
+        "--threadsPerBlock", str(threadsPerBlock),
         "--json",
     ]
     if warmup is not None:

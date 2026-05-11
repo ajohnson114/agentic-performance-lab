@@ -292,6 +292,44 @@ def validate_patch(
             continue
 
         content = target.read_text(encoding="utf-8")
+
+        # Reject full-file rewrites: SEARCH must not cover the vast majority of the file.
+        # When the model puts the entire file in SEARCH it technically "works" but defeats
+        # the purpose of surgical edits — the agent loop will ask it to try again.
+        file_line_count = content.count("\n") + 1
+        search_line_count = block.search.count("\n") + 1
+        if file_line_count > 20 and search_line_count / file_line_count > 0.70:
+            errors.append(
+                f"Block {idx}: SEARCH block spans {search_line_count}/{file_line_count} lines "
+                f"({search_line_count / file_line_count:.0%}) of '{file_path}'. "
+                f"Make surgical edits — isolate only the specific lines that need to change, "
+                f"not the entire file or function."
+            )
+            continue
+
+        # Anti-new-kernel check: reject REPLACE blocks that introduce __global__ kernels
+        # when none exist in SEARCH. This catches gaming (adding a no-op fast path from
+        # scratch) while allowing legitimate kernel refactors (e.g. splitting naive into
+        # tiled + keeping naive for selftest).
+        import re
+        search_has_global = "__global__" in block.search
+        replace_has_global = "__global__" in block.replace
+        search_has_def = re.search(r"^\s*(static\s+)?\w+\s+\w+\s*\(", block.search, re.MULTILINE)
+        replace_has_def = re.search(r"^\s*(static\s+)?\w+\s+\w+\s*\(", block.replace, re.MULTILINE)
+
+        if replace_has_global and not search_has_global:
+            errors.append(
+                f"Block {idx}: REPLACE introduces __global__ kernel(s) not present in SEARCH. "
+                f"Only modify existing kernels; do not add new ones from scratch."
+            )
+            continue
+        if replace_has_def and not search_has_def:
+            errors.append(
+                f"Block {idx}: REPLACE introduces new function definition(s) not in SEARCH. "
+                f"Modify existing functions only, never create new ones."
+            )
+            continue
+
         if block.search not in content:
             # Try fuzzy matching — auto-correct near-miss SEARCH blocks
             if not _fuzzy_match_and_correct(block, content):

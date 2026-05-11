@@ -210,9 +210,9 @@ If you use PerfLab through the MCP server, there are task-authoring tools to wal
 ```yaml
 # tuning.yaml
 N: 1024
-block_size: 16
+threadsPerBlock: 16
 sweep:
-  block_size: [16, 32, 64, 128, 256]
+  threadsPerBlock: [16, 32, 64, 128, 256]
 ```
 
 ```bash

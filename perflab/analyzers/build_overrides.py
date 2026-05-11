@@ -36,6 +36,8 @@ ALLOWED_FLAGS = frozenset({
     "-falign-functions=32", "-falign-loops=32",
     # Prefetch
     "-fprefetch-loop-arrays",
+    # CUDA / nvcc — line info (required for ncu source correlation)
+    "-lineinfo", "--generate-line-info",
 })
 
 # Flags that require explicit permission (constraints.allow_fast_math: true)
@@ -50,6 +52,22 @@ FAST_MATH_FLAGS = frozenset({
     "-fassociative-math",
     "-freciprocal-math",
 })
+
+# CUDA parameterized flags: matched by regex because their values vary.
+# Each pattern must match the entire flag string.
+_CUDA_ALLOWED_PATTERNS: list[re.Pattern[str]] = [
+    # Target architecture: sm_70 (Volta/V100), sm_75 (Turing/T4),
+    # sm_80 (Ampere/A100), sm_86 (Ampere/RTX30), sm_89 (Ada/RTX40/L4),
+    # sm_90 / sm_90a (Hopper/H100), native (auto-detect)
+    re.compile(r"^-arch=(sm_\d+[a-z]?|native)$"),
+    re.compile(r"^--gpu-architecture=(sm_\d+[a-z]?|native)$"),
+    # Register cap — limits spilling, affects occupancy
+    re.compile(r"^--maxrregcount=\d+$"),
+    # PTX assembler flags passed via -Xptxas (e.g. -Xptxas -v)
+    re.compile(r"^-Xptxas\s+\S.*$"),
+    # Shared memory bank size (4 or 8 bytes)
+    re.compile(r"^-Xptxas\s+--bankmode=(4|8)$"),
+]
 
 # Groups of mutually exclusive flags — only one per group should be used
 _CONFLICTING_GROUPS: list[frozenset[str]] = [
@@ -150,8 +168,10 @@ def load_build_overrides_with_feedback(
             ))
             continue
 
-        # Allowlist check
-        if flag not in effective_allowed:
+        # Allowlist check: exact match or CUDA parameterized pattern
+        if flag not in effective_allowed and not any(
+            p.match(flag) for p in _CUDA_ALLOWED_PATTERNS
+        ):
             result.rejected.append(RejectedFlag(
                 flag=flag, reason="not in allowlist"
             ))

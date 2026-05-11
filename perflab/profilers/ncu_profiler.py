@@ -26,18 +26,18 @@ class NcuProfiler:
         report_path = artifacts_dir / "ncu_report.ncu-rep"
         cmd_parts = shlex.split(bench_cmd)
 
+        # --target-processes all is required when the benchmark command is a
+        # Python/shell wrapper that launches the actual CUDA binary as a
+        # subprocess (e.g. bench.py → sgemm_bin). Without it, ncu profiles
+        # the wrapper process and sees no kernels.
+        ncu_base = ["ncu", "--target-processes", "all", "--set", "full"]
+
         # ncu with CSV output for programmatic analysis
-        csv_cmd = [
-            "ncu", "--set", "full", "--csv",
-            "--log-file", str(csv_path),
-        ] + cmd_parts
+        csv_cmd = ncu_base + ["--csv", "--log-file", str(csv_path)] + cmd_parts
         csv_res = run_cmd(csv_cmd, cwd=cwd)
 
         # Also generate a report file for interactive viewing
-        report_cmd = [
-            "ncu", "--set", "full",
-            "-o", str(report_path),
-        ] + cmd_parts
+        report_cmd = ncu_base + ["-o", str(report_path)] + cmd_parts
         report_res = run_cmd(report_cmd, cwd=cwd)
 
         summary = _parse_ncu_csv(csv_path)

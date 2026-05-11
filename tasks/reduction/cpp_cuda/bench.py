@@ -18,7 +18,7 @@ def main():
     knobs = yaml.safe_load(Path("tuning.yaml").read_text(encoding="utf-8"))
     N = int(knobs.get("N", 16777216))
     iterations = int(knobs.get("iterations", 100))
-    block_size = int(knobs.get("block_size", 256))
+    threadsPerBlock = int(knobs.get("threadsPerBlock", 256))
 
     binary = Path("reduce_bin")
 
@@ -33,7 +33,7 @@ def main():
         str(binary.resolve()),
         "--N", str(N),
         "--iterations", str(iterations),
-        "--block_size", str(block_size),
+        "--threadsPerBlock", str(threadsPerBlock),
         "--json",
     ]
     if warmup is not None:

@@ -125,7 +125,7 @@ class DataHints:
 
 @dataclass
 class AgentSpec:
-    n_candidates: int = 6
+    n_candidates: int = 3
     top_k: int = 2
     max_iters: int = 12
 

@@ -57,6 +57,7 @@ Each file must be within the allowed paths.
 - Do NOT wrap edit blocks in markdown code fences (no ```python or ``` around them)
 - Avoid changes that would break correctness
 - Explain your reasoning before each edit block
+- CRITICAL: Do NOT create new functions or add code outside SEARCH/REPLACE blocks. Only modify existing functions in-place. The kernel/main functions must be replaced, never added.
 
 When asked for multiple candidates, separate them with:
 --- CANDIDATE N ---

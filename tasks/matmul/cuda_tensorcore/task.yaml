@@ -4,7 +4,7 @@ program_type: "cuda"
 target_hardware: null
 
 build:
-  cmd: "nvcc -O2 -arch=sm_70 -o hgemm_bin hgemm.cu"
+  cmd: "nvcc -O2 -arch=native -o hgemm_bin hgemm.cu"
   expected_exit: 0
 
 correctness:

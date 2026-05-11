@@ -4,7 +4,7 @@ program_type: "cuda"
 target_hardware: "NVIDIA H100"
 
 build:
-  cmd: "nvcc -O2 -o sgemm_bin sgemm.cu"
+  cmd: "nvcc -O2 -arch=sm_90 -o sgemm_bin sgemm.cu"
   expected_exit: 0
 
 correctness:

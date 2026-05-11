@@ -1,12 +1,14 @@
 # Numeric knobs for `perflab optimize` (grid search) and `perflab agent`.
 # Problem dimensions (M, N, K) are fixed by contract in task.yaml.
-# 4096³ = 137 GFLOP — large enough to saturate H100 SMs.
-M: 4096
-N: 4096
-K: 4096
-block_size: 16
+M: 1024
+N: 1024
+K: 1024
 
-# Grid search space for `perflab optimize --max-trials`
-# and CUTLASS-centered auto-tuning in agent mode.
+# threadsPerBlock: threads per block dimension (block is threadsPerBlock × threadsPerBlock).
+# Grid is always computed: ceil(M/threadsPerBlock) × ceil(N/threadsPerBlock).
+threadsPerBlock: 16
+
+# Grid search space for `perflab optimize --max-trials`.
+# Valid 2D block dims only: threadsPerBlock² must not exceed 1024 (hardware limit).
 sweep:
-  block_size: [16, 32, 64, 128, 256]
+  threadsPerBlock: [8, 16, 32]

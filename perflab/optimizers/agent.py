@@ -6,8 +6,12 @@ import logging
 import shlex
 import shutil
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Suppress JAX fork() warnings — harmless in agent context where fork is controlled
+warnings.filterwarnings("ignore", message=".*os.fork.*multithreaded.*", category=RuntimeWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -764,6 +768,7 @@ def _build_roofline_context(
     it: int,
     progress: AgentProgress,
     event_log: AgentEventLog,
+    ctx: "AgentContext",
 ) -> dict | None:
     """Build roofline dict with optional achieved_bw, dtype_peaks, and computed AI."""
     roofline_dict: dict | None = None
@@ -805,6 +810,10 @@ def _build_roofline_context(
             if rp_point is not None:
                 roofline_dict["computed_ai"] = rp_point.ai
                 roofline_dict["computed_achieved_tflops"] = rp_point.tflops
+                # Stash on the current history entry so we can plot the trail later
+                if ctx.history:
+                    ctx.history[-1]["roofline_ai"] = rp_point.ai
+                    ctx.history[-1]["roofline_tflops"] = rp_point.tflops
         except Exception:
             logger.warning("Roofline point computation failed", exc_info=True)
     else:
@@ -824,6 +833,50 @@ def _build_roofline_context(
             logger.warning("Roofline auto-detect failed", exc_info=True)
 
     return roofline_dict
+
+
+def _regenerate_roofline_with_history(ctx: "AgentContext") -> None:
+    """Regenerate roofline.png with the full optimization trail from ctx.history.
+
+    Only runs if the task has a roofline spec and at least one history entry
+    has roofline data. Overwrites the last per-iteration PNG so the dashboard
+    picks up the trail automatically.
+    """
+    task = ctx.task
+    if task.roofline is None:
+        return
+
+    trail = [e for e in ctx.history if "roofline_ai" in e and "roofline_tflops" in e]
+    if not trail:
+        return
+
+    # Gold star = best accepted iteration, not just last profiled entry.
+    # Fall back to trail[-1] if best_iter has no roofline data (e.g. NCU skipped that iter).
+    best_entries = [e for e in trail if e.get("iteration") == ctx.best_iter]
+    final = best_entries[0] if best_entries else trail[-1]
+    roof_png = ctx.rp.artifacts_dir / "roofline.png"
+
+    try:
+        from perflab.reporting.roofline import RooflinePoint, write_roofline_png
+        from perflab.roofline_peaks import _lookup_dtype_peaks, _lookup_l2_bw
+
+        pt = RooflinePoint(
+            ai=final["roofline_ai"],
+            tflops=final["roofline_tflops"],
+            gbs=final["roofline_tflops"] * 1000.0 / max(final["roofline_ai"], 1e-9),
+        )
+        write_roofline_png(
+            roof_png,
+            point=pt,
+            peak_tflops=float(task.roofline.peak_tflops),
+            peak_mem_bw_gbs=float(task.roofline.peak_mem_bw_gbs),
+            title=task.roofline.title or f"Roofline — {task.name}",
+            dtype_peaks=_lookup_dtype_peaks(task.target_hardware or ""),
+            l2_bw_gbs=_lookup_l2_bw(task.target_hardware or ""),
+            history_points=trail,  # full trail; gold star renders on top of final dot
+        )
+    except Exception:
+        logger.warning("Failed to regenerate roofline with history trail", exc_info=True)
 
 
 def _build_iteration_prompt(ctx: AgentContext) -> list:
@@ -916,7 +969,7 @@ def _build_iteration_prompt(ctx: AgentContext) -> list:
     hot_asm, sass_asm = _build_assembly_context(task, profiler_summaries, rp.artifacts_dir, progress)
 
     # Roofline
-    roofline_dict = _build_roofline_context(task, bench_data, profiler_summaries, it, progress, event_log)
+    roofline_dict = _build_roofline_context(task, bench_data, profiler_summaries, it, progress, event_log, ctx)
 
     prompt_ctx = PromptContext(
         source_files=source_files,
@@ -1106,9 +1159,11 @@ def _try_accept_best(
                 progress.on_message(f"[agent]   Drift check failed: {exc}")
 
         rel_improvement = abs(cand.value - old_best) / abs(old_best) if old_best != 0 else 0
+        shutil.rmtree(backup_dir, ignore_errors=True)
         return (True, rel_improvement)
 
     # No candidate improved
+    shutil.rmtree(backup_dir, ignore_errors=True)
     progress.on_message("[agent]   No improving candidate this iteration")
     best_desc = scored[0].description if scored else "no valid candidates"
     best_val = scored[0].value if scored else ctx.best_value
@@ -1376,6 +1431,7 @@ def _evaluate_single_candidate(
         ), errors
     finally:
         restore_files(backed_up, ws)
+        shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def run_agent(
@@ -1810,6 +1866,9 @@ def run_agent(
     detected_hw: str | None = None
     if sysinfo.get("nvidia_gpus"):
         detected_hw = sysinfo["nvidia_gpus"][0].get("name")
+
+    # Regenerate the roofline PNG with the full optimization trail before reporting
+    _regenerate_roofline_with_history(ctx)
 
     report_data = generate_reports(ReportParams(
         run_dir=rp.run_dir,

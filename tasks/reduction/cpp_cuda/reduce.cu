@@ -10,7 +10,7 @@
  *
  * Build:  nvcc -O2 -o reduce_bin reduce.cu
  * Usage:  ./reduce_bin [--json] [--selftest] [--N <n>] [--iterations <n>]
- *         [--block_size <n>] [--warmup <n>] [--repeats <n>]
+ *         [--threadsPerBlock <n>] [--warmup <n>] [--repeats <n>]
  */
 
 #include <cstdio>
@@ -33,7 +33,7 @@
 // Naive reduction kernel: one thread accumulates across the full array using
 // a stride loop.  No shared memory, no warp shuffle, no tree reduction.
 // ---------------------------------------------------------------------------
-__global__ void reduce_sum_naive(const float* __restrict__ input,
+__global__ void reduce_kernel(const float* __restrict__ input,
                                  float* __restrict__ output,
                                  int N) {
     float sum = 0.0f;
@@ -68,7 +68,7 @@ static bool selftest() {
         int block = 256;
         int grid = (N + block - 1) / block;
         if (grid > 1024) grid = 1024;
-        reduce_sum_naive<<<grid, block>>>(d_in, d_out, N);
+        reduce_kernel<<<grid, block>>>(d_in, d_out, N);
         cudaDeviceSynchronize();
 
         float gpu_sum = 0.0f;
@@ -98,7 +98,7 @@ struct BenchResult {
     bool ok;
 };
 
-static BenchResult run_bench(int N, int iterations, int block_size,
+static BenchResult run_bench(int N, int iterations, int threadsPerBlock,
                               int warmup, int repeats) {
     size_t bytes = (size_t)N * sizeof(float);
 
@@ -111,8 +111,8 @@ static BenchResult run_bench(int N, int iterations, int block_size,
     cudaMalloc(&d_in, bytes);
     cudaMalloc(&d_out, sizeof(float));
 
-    int grid = (N + block_size - 1) / block_size;
-    if (grid > 1024) grid = 1024;
+    int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+    if (blocksPerGrid > 1024) blocksPerGrid = 1024;
 
     auto run_iterations = [&]() -> double {
         struct timespec t0, t1;
@@ -128,7 +128,7 @@ static BenchResult run_bench(int N, int iterations, int block_size,
             // Anti-pattern #4: naive kernel
             nvtxRangePush("kernel");
             cudaMemset(d_out, 0, sizeof(float));
-            reduce_sum_naive<<<grid, block_size>>>(d_in, d_out, N);
+            reduce_kernel<<<blocksPerGrid, threadsPerBlock>>>(d_in, d_out, N);
             nvtxRangePop();
 
             // Anti-pattern #3: sync after every launch
@@ -182,7 +182,7 @@ static BenchResult run_bench(int N, int iterations, int block_size,
 int main(int argc, char** argv) {
     int N = 16777216;    // 16M elements = 64 MB
     int iterations = 100;
-    int block_size = 256;
+    int threadsPerBlock = 256;
     int warmup = 3;
     int repeats = 10;
     bool json_output = false;
@@ -197,8 +197,8 @@ int main(int argc, char** argv) {
             N = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
             iterations = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--block_size") == 0 && i + 1 < argc) {
-            block_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--threadsPerBlock") == 0 && i + 1 < argc) {
+            threadsPerBlock = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             warmup = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--repeats") == 0 && i + 1 < argc) {
@@ -211,18 +211,18 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    BenchResult res = run_bench(N, iterations, block_size, warmup, repeats);
+    BenchResult res = run_bench(N, iterations, threadsPerBlock, warmup, repeats);
 
     if (json_output) {
         printf("{\n");
         printf("  \"ok\": %s,\n", res.ok ? "true" : "false");
         printf("  \"throughput_gbs\": {\"median\": %.4f},\n", res.median_throughput_gbs);
         printf("  \"time_s\": {\"median\": %.6f},\n", res.median_time_s);
-        printf("  \"meta\": {\"N\": %d, \"iterations\": %d, \"block_size\": %d, \"repeats\": %d}\n",
-               N, iterations, block_size, repeats);
+        printf("  \"meta\": {\"N\": %d, \"iterations\": %d, \"threadsPerBlock\": %d, \"repeats\": %d}\n",
+               N, iterations, threadsPerBlock, repeats);
         printf("}\n");
     } else {
-        printf("N=%d  iterations=%d  block_size=%d\n", N, iterations, block_size);
+        printf("N=%d  iterations=%d  threadsPerBlock=%d\n", N, iterations, threadsPerBlock);
         printf("Median time: %.4f s\n", res.median_time_s);
         printf("Median throughput: %.2f GB/s\n", res.median_throughput_gbs);
     }

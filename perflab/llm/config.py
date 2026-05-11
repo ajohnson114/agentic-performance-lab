@@ -56,7 +56,7 @@ class LLMConfig:
     api_key: str = ""
     api_base: str = ""
     temperature: float = 0.7
-    max_tokens: int = 4096
+    max_tokens: int = 16000
 
     @staticmethod
     def load(path: Path | None = None) -> LLMConfig:

@@ -20,7 +20,7 @@
         }                                                                      \
     } while (0)
 
-__global__ void sgemm_naive(int M, int N, int K,
+__global__ void sgemm_kernel(int M, int N, int K,
                             const float* A, const float* B, float* C) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -59,7 +59,7 @@ static int selftest() {
 
     dim3 block(N, N);
     dim3 grid(1, 1);
-    sgemm_naive<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
+    sgemm_kernel<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C, d_C, sizeof(h_C), cudaMemcpyDeviceToHost));
 
@@ -77,7 +77,7 @@ static int selftest() {
     for (int i = 0; i < N * N; ++i) h_B[i] = 1.0f;
     CHECK_CUDA(cudaMemcpy(d_B, h_B, sizeof(h_B), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_C, 0, sizeof(h_C)));
-    sgemm_naive<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
+    sgemm_kernel<<<grid, block>>>(N, N, N, d_A, d_B, d_C);
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C, d_C, sizeof(h_C), cudaMemcpyDeviceToHost));
 
@@ -102,7 +102,7 @@ static int selftest() {
 
 int main(int argc, char** argv) {
     int M = 1024, N = 1024, K = 1024;
-    int block_size = 16;
+    int threadsPerBlock = 16;
     bool json_output = false;
     int warmup = 3, repeats = 10;
 
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
         if (arg == "--M" && i + 1 < argc) M = std::atoi(argv[++i]);
         else if (arg == "--N" && i + 1 < argc) N = std::atoi(argv[++i]);
         else if (arg == "--K" && i + 1 < argc) K = std::atoi(argv[++i]);
-        else if (arg == "--block_size" && i + 1 < argc) block_size = std::atoi(argv[++i]);
+        else if (arg == "--threadsPerBlock" && i + 1 < argc) threadsPerBlock = std::atoi(argv[++i]);
         else if (arg == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
         else if (arg == "--repeats" && i + 1 < argc) repeats = std::atoi(argv[++i]);
         else if (arg == "--json") json_output = true;
@@ -136,12 +136,12 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMemcpy(d_A, h_A.data(), sA, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), sB, cudaMemcpyHostToDevice));
 
-    dim3 block(block_size, block_size);
-    dim3 grid((N + block_size - 1) / block_size, (M + block_size - 1) / block_size);
+    dim3 block(threadsPerBlock, threadsPerBlock);
+    dim3 grid((N + threadsPerBlock - 1) / threadsPerBlock, (M + threadsPerBlock - 1) / threadsPerBlock);
 
     // Warmup
     for (int w = 0; w < warmup; ++w) {
-        sgemm_naive<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
+        sgemm_kernel<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaDeviceSynchronize());
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        sgemm_naive<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
+        sgemm_kernel<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
         CHECK_CUDA(cudaDeviceSynchronize());
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -168,8 +168,8 @@ int main(int argc, char** argv) {
 
     if (json_output) {
         printf("{\n");
-        printf("  \"meta\": {\"M\": %d, \"N\": %d, \"K\": %d, \"block_size\": %d},\n",
-               M, N, K, block_size);
+        printf("  \"meta\": {\"M\": %d, \"N\": %d, \"K\": %d, \"threadsPerBlock\": %d},\n",
+               M, N, K, threadsPerBlock);
         printf("  \"times_ms\": [");
         for (size_t i = 0; i < times_ms.size(); ++i) {
             if (i) printf(", ");
@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
         printf("  \"ok\": true\n");
         printf("}\n");
     } else {
-        printf("M=%d N=%d K=%d block_size=%d\n", M, N, K, block_size);
+        printf("M=%d N=%d K=%d threadsPerBlock=%d\n", M, N, K, threadsPerBlock);
         printf("p50=%.4f ms  p95=%.4f ms\n", p50, p95);
         printf("tflops_median=%.6f\n", tflops_med);
     }

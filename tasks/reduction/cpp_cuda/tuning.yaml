@@ -2,8 +2,8 @@
 # N=64M elements (256 MB) — large enough to saturate H100 HBM3 bandwidth.
 N: 67108864
 iterations: 100
-block_size: 256
+threadsPerBlock: 256
 
 # Grid search space for `perflab optimize`
 sweep:
-  block_size: [64, 128, 256, 512, 1024]
+  threadsPerBlock: [64, 128, 256, 512, 1024]
