@@ -58,7 +58,7 @@ class TestExportPerfettoTrace:
                 {"function": "sgemm", "pct": 45.0, "module": "libcblas.so"},
             ],
         }
-        result = export_perfetto_trace(out, perf_summary=perf)
+        export_perfetto_trace(out, perf_summary=perf)
         data = json.loads(out.read_text())
         x_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
         assert any(e["name"] == "sgemm" for e in x_events)
@@ -70,14 +70,14 @@ class TestExportPerfettoTrace:
                 {"function": "numpy.zeros", "size_mb": 512.0, "location": "train.py:42"},
             ],
         }
-        result = export_perfetto_trace(out, memray_summary=memray)
+        export_perfetto_trace(out, memray_summary=memray)
         data = json.loads(out.read_text())
         x_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
         assert any(e["cat"] == "memory" for e in x_events)
 
     def test_metadata_sets_process_name(self, tmp_path: Path):
         out = tmp_path / "trace.json"
-        result = export_perfetto_trace(
+        export_perfetto_trace(
             out,
             pyspy_summary={"hotspots": [{"function": "f", "pct": 100}], "total_samples": 10},
             metadata={"task_name": "matmul/cpp"},
@@ -89,7 +89,7 @@ class TestExportPerfettoTrace:
 
     def test_combined_sources(self, tmp_path: Path):
         out = tmp_path / "trace.json"
-        result = export_perfetto_trace(
+        export_perfetto_trace(
             out,
             pyspy_summary={"hotspots": [{"function": "f1", "pct": 50}], "total_samples": 100},
             perf_summary={"ipc": 1.2, "hotspots": [{"function": "f2", "pct": 30}]},

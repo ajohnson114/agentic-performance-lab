@@ -40,7 +40,7 @@ def test_error_output_truncated():
     ctx = _minimal_ctx(last_errors=errors)
     msgs = build_prompt(ctx)
     content = msgs[1].content
-    assert "(truncated)" in content
+    assert "truncated" in content
     # Should not contain the full 5000 chars
     assert "x" * 3000 not in content
 

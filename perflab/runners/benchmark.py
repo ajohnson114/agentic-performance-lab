@@ -1,12 +1,16 @@
 from __future__ import annotations
-from pathlib import Path
+
+import dataclasses
 import hashlib
 import json
 import logging
 import os
 import shlex
 import subprocess
-from perflab.tools.shell import run_cmd, CmdResult
+from pathlib import Path
+
+from perflab.tools.isolation import IsolationPolicy, wrap_command
+from perflab.tools.shell import CmdResult, run_cmd
 
 _GPU_PROGRAM_TYPES = {"cuda", "pytorch", "jax", "triton"}
 
@@ -65,7 +69,7 @@ def _resolve_rlimit(program_type: str | None, rlimit_as_gb: float | None) -> int
       2. GPU program type → DEFAULT_GPU_RLIMIT_AS_BYTES (32 GB)
       3. CPU program type → DEFAULT_RLIMIT_AS_BYTES (4 GB)
     """
-    from perflab.tools.shell import DEFAULT_RLIMIT_AS_BYTES, DEFAULT_GPU_RLIMIT_AS_BYTES
+    from perflab.tools.shell import DEFAULT_GPU_RLIMIT_AS_BYTES, DEFAULT_RLIMIT_AS_BYTES
     if rlimit_as_gb is not None:
         if rlimit_as_gb <= 0:
             return None  # Explicitly disabled
@@ -82,6 +86,8 @@ def run_benchmark(
     fast_mode: bool = False,
     program_type: str | None = None,
     rlimit_as_gb: float | None = None,
+    env_passthrough: list[str] | None = None,
+    isolation: IsolationPolicy | None = None,
 ) -> tuple[CmdResult, dict]:
     """Run the benchmark command and parse bench.json output.
 
@@ -97,8 +103,26 @@ def run_benchmark(
     allocation from exhausting system memory.
 
     rlimit_as_gb overrides the default when set in task.yaml constraints.
+
+    This runs candidate-patched (LLM-authored) code, so the subprocess
+    environment is built via the allowlist (agent_subprocess_env), not the
+    blocklist used for trusted tool invocations. env_passthrough names extra
+    task.yaml-declared vars (task.constraints.env_passthrough) to forward
+    from the current process environment.
+
+    isolation (Fix 2b): optional OS-level sandboxing (see perflab.tools.
+    isolation) layered on top of the rlimit/env-allowlist protections above.
+    Defaults to None (no sandboxing beyond rlimits), matching pre-Fix-2b
+    behavior exactly. When given, this call's own ``cwd`` -- not whatever
+    ``isolation.workspace`` may already hold -- is bound as the read-write
+    workspace, since each candidate benchmarks in its own temporary copy of
+    the workspace (see DESIGN.md, "Backup/restore instead of git") and
+    that's the directory this specific subprocess actually needs to write to.
     """
     run_env = dict(env or {})
+    for name in env_passthrough or []:
+        if name in os.environ:
+            run_env.setdefault(name, os.environ[name])
     if fast_mode:
         run_env["PERFLAB_BENCH_WARMUP"] = "0"
         run_env["PERFLAB_BENCH_REPEATS"] = "2"
@@ -109,8 +133,8 @@ def run_benchmark(
             cfg = load_config()
             run_env.setdefault("PERFLAB_BENCH_WARMUP", str(cfg.benchmark.warmup))
             run_env.setdefault("PERFLAB_BENCH_REPEATS", str(cfg.benchmark.repeats))
-        except Exception:
-            pass  # Config loading is best-effort — defaults still come from bench.py
+        except Exception:  # noqa: BLE001 -- best-effort, defaults still come from bench.py
+            pass
 
     # Thermal gate: wait for GPU to cool if above throttle threshold
     if program_type in _GPU_PROGRAM_TYPES:
@@ -128,9 +152,14 @@ def run_benchmark(
     import time as _time
     run_start = _time.time()
 
+    cmd_args = shlex.split(cmd)
+    if isolation is not None:
+        effective_policy = dataclasses.replace(isolation, workspace=cwd)
+        cmd_args = wrap_command(cmd_args, effective_policy)
+
     res = run_cmd(
-        shlex.split(cmd), cwd=cwd, env=run_env if run_env else None,
-        timeout_s=300, rlimit_as_bytes=rlimit,
+        cmd_args, cwd=cwd, env=run_env if run_env else None,
+        timeout_s=300, rlimit_as_bytes=rlimit, env_mode="allowlist",
     )
     if not bench_path.exists():
         raise FileNotFoundError(f"Benchmark did not create {bench_path}. Stdout/stderr:\n{res.stdout}\n{res.stderr}")

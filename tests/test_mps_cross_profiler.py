@@ -1,8 +1,6 @@
 """Tests for MPS cross-profiler CPU/GPU join in bottleneck_analyzer."""
 from __future__ import annotations
 
-import copy
-
 from perflab.analyzers.bottleneck_analyzer import (
     AnalysisThresholds,
     _analyze_cross_profiler_cpu_gpu,

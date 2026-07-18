@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any
 
 from perflab.llm.base import CompletionResult, Message
 
@@ -19,8 +20,8 @@ class MCPSamplingProvider:
     """
 
     name: str = "mcp-sampling"
-    _sample_fn: Callable[..., Any] = field(default=None, repr=False)
-    _loop: asyncio.AbstractEventLoop = field(default=None, repr=False)
+    _sample_fn: Callable[..., Any] | None = field(default=None, repr=False)
+    _loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
 
     def is_available(self) -> bool:
         return self._sample_fn is not None and self._loop is not None
@@ -34,6 +35,12 @@ class MCPSamplingProvider:
         json_mode: bool = False,
         stop: Sequence[str] | None = None,
     ) -> CompletionResult:
+        if self._sample_fn is None or self._loop is None:
+            raise RuntimeError(
+                "MCPSamplingProvider.complete() called before the MCP sample "
+                "function/event loop were set -- check is_available() first."
+            )
+
         # Extract system message (first message with role="system")
         system_prompt: str | None = None
         user_messages: list[Message] = []

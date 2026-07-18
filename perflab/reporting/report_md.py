@@ -1,6 +1,7 @@
 from __future__ import annotations
+
 from pathlib import Path
-import json
+
 
 def write_report_md(report_path: Path, data: dict) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -32,6 +33,21 @@ def _render(data: dict) -> str:
             lines.append(f"Profiling overhead: ~{overhead:.1f}% of benchmark wall time")
             lines.append("")
             break
+
+    # Roofline peaks (source tier: table / computed / measured / etc.)
+    roofline = data.get("roofline_peaks")
+    if roofline and roofline.get("peak_tflops") is not None:
+        lines.append("## Roofline")
+        lines.append("")
+        bw = roofline.get("peak_mem_bw_gbs")
+        bw_str = f", {bw:.1f} GB/s" if bw is not None else ""
+        lines.append(f"- Peak: {roofline['peak_tflops']:.3f} TFLOPS{bw_str}")
+        source = roofline.get("source")
+        if source:
+            device = roofline.get("device")
+            device_str = f" ({device})" if device else ""
+            lines.append(f"- Source: {source}{device_str}")
+        lines.append("")
 
     # Bottleneck diagnosis
     diags = data.get("bottleneck_diagnoses", [])

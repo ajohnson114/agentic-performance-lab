@@ -13,10 +13,9 @@ from pathlib import Path
 
 import torch
 import yaml
-from torch.profiler import record_function
-
 from dataset import SyntheticImageDataset
 from model import SmallClassifier
+from torch.profiler import record_function
 
 
 def _device():
@@ -68,7 +67,7 @@ def main():
     trace_path = os.environ.get("PERFLAB_TORCH_TRACE_PATH")
     prof = None
     if enabled:
-        from torch.profiler import profile, ProfilerActivity
+        from torch.profiler import ProfilerActivity, profile
         activities = [ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(ProfilerActivity.CUDA)
@@ -76,7 +75,7 @@ def main():
 
     # Warmup
     _sync(device)
-    for images, labels in loader:
+    for images, _labels in loader:
         images = images.to(device, non_blocking=pin_memory)
         with torch.no_grad():
             _ = model(images)
@@ -89,10 +88,10 @@ def main():
 
     ctx = prof if prof is not None else _nullcontext()
     with ctx:
-        for rep in range(repeats):
+        for _rep in range(repeats):
             total_samples = 0
             t0 = time.perf_counter()
-            for images, labels in loader:
+            for images, _labels in loader:
                 with record_function("## data_loading ##"):
                     images = images.to(device, non_blocking=pin_memory)
                 with record_function("## forward ##"):
@@ -109,7 +108,6 @@ def main():
 
     samples_per_sec_list.sort()
     median = samples_per_sec_list[len(samples_per_sec_list) // 2]
-    p95_idx = min(int(0.95 * (len(samples_per_sec_list) - 1)), len(samples_per_sec_list) - 1)
 
     out = {
         "meta": {

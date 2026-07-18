@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from textwrap import dedent
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-import pytest
-
-from perflab.profilers.linux_perf import extract_hot_assembly, _parse_perf_annotate, _demangle
-
+from perflab.profilers.linux_perf import _demangle, _parse_perf_annotate, extract_hot_assembly
 
 # ---------------------------------------------------------------------------
 # Sample perf annotate output

@@ -234,7 +234,7 @@ def recommend_flags_from_profiling(
         if "-funroll-loops" not in cmd_lower:
             recs.append(FlagRecommendation(
                 flag="-funroll-loops",
-                reason=f"DRAM Bound — loop unrolling increases bytes-per-instruction, better hiding DRAM latency",
+                reason="DRAM Bound — loop unrolling increases bytes-per-instruction, better hiding DRAM latency",
                 impact="low",
                 category="optimization",
             ))

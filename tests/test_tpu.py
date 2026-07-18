@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import textwrap
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,7 +13,6 @@ from perflab.analyzers.bottleneck_analyzer import (
     diagnose_bottlenecks,
 )
 from perflab.profilers.jax_profiler import (
-    JaxProfiler,
     _collect_jax_trace_metrics,
     _detect_tpu_device,
     _parse_compilation_metrics,

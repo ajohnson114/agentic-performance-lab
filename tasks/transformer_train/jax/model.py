@@ -10,7 +10,6 @@ jax.jit, efficient attention, and mixed precision.
 import jax
 import jax.numpy as jnp
 
-
 # ---------------------------------------------------------------------------
 # Parameter initialization
 # ---------------------------------------------------------------------------

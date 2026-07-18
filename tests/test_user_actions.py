@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 from perflab.analyzers.user_actions import UserAction, extract_build_suggestions
 
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import math
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,9 @@ def _compute_matmul_roofline(
     bench: dict, meta: dict, measured_dram_bytes: float | None = None,
 ) -> RooflinePoint | None:
     """Compute roofline point using matmul-specific M, N, K keys."""
-    M = int(meta["M"]); N = int(meta["N"]); K = int(meta["K"])
+    M = int(meta["M"])
+    N = int(meta["N"])
+    K = int(meta["K"])
     batch = int(meta.get("batch", 1))
     dtype = str(meta.get("dtype", "fp32"))
     bpe = _dtype_bytes(dtype)
@@ -165,7 +167,9 @@ def _extract_seconds(bench: dict, meta: dict, flops: float) -> float | None:
     # Infer from tflops.median
     if "tflops" in (bench or {}):
         try:
-            achieved = float((bench.get("tflops", {}) or {}).get("median"))
+            # median may be missing/None here -- float(None) raises TypeError,
+            # which the except clause below already handles.
+            achieved = float((bench.get("tflops", {}) or {}).get("median"))  # type: ignore[arg-type]
             if achieved > 0:
                 return flops / (achieved * 1e12)
         except (ValueError, TypeError, KeyError):

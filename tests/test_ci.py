@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -11,13 +11,12 @@ from perflab.ci import (
     CICheckResult,
     MetricCheckResult,
     ProfilerRegression,
+    _check_regression,
+    _default_baseline_path,
+    _detect_profiler_regressions,
     run_ci_check,
     save_baseline,
-    _default_baseline_path,
-    _check_regression,
-    _detect_profiler_regressions,
 )
-
 
 # ---------------------------------------------------------------------------
 # CICheckResult

@@ -5,9 +5,42 @@ import fnmatch
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from perflab.task_spec import TaskSpec
 
 PROTECTED_FILENAMES = {"tests.py", "bench.py", "task.yaml"}
+
+
+def read_source_files(task: TaskSpec) -> dict[str, str]:
+    """Read all files matching edit_policy.allowed_paths.
+
+    Rejects symlinks that resolve outside the workspace to prevent
+    information disclosure (e.g. workspace/link.py -> /etc/passwd).
+    """
+    sources: dict[str, str] = {}
+    ws = task.workspace
+    ws_resolved = str(ws.resolve())
+    for pattern in task.edit_policy.allowed_paths:
+        # Expand glob patterns relative to workspace
+        for p in sorted(ws.rglob("*")):
+            if not p.is_file():
+                continue
+            # Reject symlinks that escape workspace
+            try:
+                resolved = p.resolve()
+                if not str(resolved).startswith(ws_resolved + "/") and str(resolved) != ws_resolved:
+                    continue
+            except OSError:
+                continue
+            rel = str(p.relative_to(ws))
+            if fnmatch.fnmatch(rel, pattern):
+                try:
+                    sources[rel] = p.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    pass
+    return sources
 
 
 @dataclass
@@ -153,14 +186,16 @@ def _diagnose_match_failure(
 
         # Find first differing line
         diff_lines: list[str] = []
-        for i, (expected, found) in enumerate(
-            zip(search_preview, best_window[:preview_n])
+        # zip() strict= needs Python 3.10+ (this codebase still runs on 3.9); these are
+        # intentionally allowed to differ in length (that's what the diagnostics below detect).
+        for _i, (expected, found) in enumerate(
+            zip(search_preview, best_window[:preview_n])  # noqa: B905
         ):
             if expected != found:
                 diff_lines.append(f"  EXPECTED: {expected!r}")
                 diff_lines.append(f"  FOUND:    {found!r}")
                 # Find column of first difference
-                for col, (a, b) in enumerate(zip(expected, found)):
+                for col, (a, b) in enumerate(zip(expected, found)):  # noqa: B905
                     if a != b:
                         diff_lines.append(f"  {'':>10}{' ' * col}^ difference at column {col}")
                         break
@@ -176,7 +211,7 @@ def _diagnose_match_failure(
             + "\n".join(diff_lines)
         )
     else:
-        search_preview_str = "\n".join(f"  {l}" for l in search_preview)
+        search_preview_str = "\n".join(f"  {line}" for line in search_preview)
         diagnostic = (
             f"Search text not found in '{file_path}'. "
             f"No similar region found — the search text may reference code that "
@@ -193,7 +228,7 @@ def _fuzzy_match_and_correct(
     block: SearchReplaceBlock,
     content: str,
     min_similarity: float = 0.80,
-) -> bool:
+) -> tuple[float, int] | None:
     """Try to fuzzy-match the search text and correct it to the actual file content.
 
     When the LLM produces a SEARCH block that is close but not exact (e.g. it
@@ -201,13 +236,14 @@ def _fuzzy_match_and_correct(
     finds the closest matching region in the file and rewrites block.search
     in-place so that the subsequent apply_patch() will succeed.
 
-    Returns True if the block was corrected, False if no close match was found.
+    Returns (similarity_ratio, 1-indexed_start_line) if the block was corrected,
+    or None if no close match was found.
     """
     search_lines = block.search.splitlines()
     file_lines = content.splitlines()
 
     if not search_lines or not file_lines:
-        return False
+        return None
 
     base_window = len(search_lines)
     best_ratio = 0.0
@@ -235,27 +271,74 @@ def _fuzzy_match_and_correct(
     if best_ratio >= min_similarity:
         corrected = "\n".join(file_lines[best_start:best_end])
         # Make sure the corrected text is actually in the file (it should be,
-        # since we built it from file_lines) and is unique enough.
+        # since we built it from file_lines). Uniqueness of the corrected text
+        # is enforced by validate_patch(), same as for exact matches.
         if corrected in content:
             block.search = corrected
-            return True
+            return (best_ratio, best_start + 1)
 
-    return False
+    return None
+
+
+def _ambiguity_error(idx: int, file_path: str, n_matches: int, fuzzy: bool) -> str:
+    prefix = (
+        f"Block {idx}: SEARCH text did not match exactly and its closest "
+        f"fuzzy match appears {n_matches} times in '{file_path}'."
+        if fuzzy
+        else f"Block {idx}: SEARCH text matches {n_matches} locations in '{file_path}'."
+    )
+    return (
+        f"{prefix} Ambiguous edit rejected — include more surrounding context "
+        f"(unchanged lines before/after the target) in the SEARCH block so it "
+        f"matches exactly one location."
+    )
 
 
 def validate_patch(
     blocks: list[SearchReplaceBlock],
     allowed_paths: list[str],
     workspace: Path,
+    notices: list[str] | None = None,
 ) -> list[str]:
     """Validate patch blocks against policy and file contents.
 
     Returns a list of error strings (empty means valid).
+
+    If `notices` is provided, non-fatal warnings are appended to it — currently
+    a note whenever a block's SEARCH text did not match exactly and was
+    auto-corrected via fuzzy matching, so the correction is visible in logs
+    rather than silent.
     """
     errors: list[str] = []
+    workspace_root = workspace.resolve()
     for idx, block in enumerate(blocks):
+        # Reject absolute paths early; `workspace / "/etc/passwd"` would otherwise
+        # resolve to "/etc/passwd" since the absolute right-hand side wins in `/`.
+        if Path(block.file_path).is_absolute():
+            errors.append(
+                f"Block {idx}: path '{block.file_path}' must be relative to the workspace"
+            )
+            continue
+
+        # Check path doesn't escape workspace. Resolve symlinks and ".." segments
+        # first, then use is_relative_to rather than a string-prefix comparison --
+        # a prefix check would let "../<workspace>-evil/x.py" through, since
+        # e.g. "/home/u/proj-evil" startswith "/home/u/proj".
+        try:
+            resolved = (workspace / block.file_path).resolve()
+        except OSError as exc:
+            errors.append(f"Block {idx}: invalid path '{block.file_path}': {exc}")
+            continue
+        if not resolved.is_relative_to(workspace_root):
+            errors.append(f"Block {idx}: path '{block.file_path}' escapes workspace")
+            continue
+
+        # From here on, match against the resolved path relative to the workspace
+        # so traversal tricks (./src/x.py, src/../src/x.py) can't dodge a check.
+        rel = resolved.relative_to(workspace_root).as_posix()
+
         # Defense-in-depth: reject edits targeting protected files
-        basename = Path(block.file_path).name
+        basename = Path(rel).name
         if basename in PROTECTED_FILENAMES:
             errors.append(
                 f"Block {idx}: '{block.file_path}' is a protected file "
@@ -263,20 +346,10 @@ def validate_patch(
             )
             continue
 
-        # Check path doesn't escape workspace
-        try:
-            resolved = (workspace / block.file_path).resolve()
-            if not str(resolved).startswith(str(workspace.resolve())):
-                errors.append(f"Block {idx}: path '{block.file_path}' escapes workspace")
-                continue
-        except Exception as exc:
-            errors.append(f"Block {idx}: invalid path '{block.file_path}': {exc}")
-            continue
-
         # Check against allowed_paths via fnmatch
         if allowed_paths:
             matched = any(
-                fnmatch.fnmatch(block.file_path, pattern)
+                fnmatch.fnmatch(rel, pattern)
                 for pattern in allowed_paths
             )
             if not matched:
@@ -286,7 +359,7 @@ def validate_patch(
                 continue
 
         # Check that the file exists and contains the search text
-        target = workspace / block.file_path
+        target = resolved
         if not target.exists():
             errors.append(f"Block {idx}: file '{block.file_path}' does not exist")
             continue
@@ -301,7 +374,7 @@ def validate_patch(
         if file_line_count > 20 and search_line_count / file_line_count > 0.70:
             errors.append(
                 f"Block {idx}: SEARCH block spans {search_line_count}/{file_line_count} lines "
-                f"({search_line_count / file_line_count:.0%}) of '{file_path}'. "
+                f"({search_line_count / file_line_count:.0%}) of '{block.file_path}'. "
                 f"Make surgical edits — isolate only the specific lines that need to change, "
                 f"not the entire file or function."
             )
@@ -330,23 +403,59 @@ def validate_patch(
             )
             continue
 
-        if block.search not in content:
+        if block.search in content:
+            # Require a unique match: replacing "the first occurrence" of an
+            # ambiguous SEARCH can silently edit the wrong site.
+            n_matches = content.count(block.search)
+            if n_matches > 1:
+                errors.append(
+                    _ambiguity_error(idx, block.file_path, n_matches, fuzzy=False)
+                )
+        else:
             # Try fuzzy matching — auto-correct near-miss SEARCH blocks
-            if not _fuzzy_match_and_correct(block, content):
+            fuzzy_result = _fuzzy_match_and_correct(block, content)
+            if fuzzy_result is None:
                 diagnostic = _diagnose_match_failure(
                     block.search, content, block.file_path
                 )
                 errors.append(f"Block {idx}: {diagnostic}")
+                continue
+
+            ratio, line_num = fuzzy_result
+            # The corrected SEARCH must be unique too.
+            n_matches = content.count(block.search)
+            if n_matches > 1:
+                errors.append(
+                    _ambiguity_error(idx, block.file_path, n_matches, fuzzy=True)
+                )
+                continue
+            if notices is not None:
+                notices.append(
+                    f"Block {idx}: exact SEARCH text not found in "
+                    f"'{block.file_path}'; auto-corrected to the closest "
+                    f"matching region at line {line_num} ({ratio:.0%} similar). "
+                    f"The corrected text was used for the edit."
+                )
 
     return errors
 
 
 def apply_patch(blocks: list[SearchReplaceBlock], workspace: Path) -> None:
-    """Apply search/replace blocks (one occurrence per block)."""
+    """Apply search/replace blocks (one occurrence per block).
+
+    Defense-in-depth: raises ValueError if a block's search text matches more
+    than once — validate_patch() rejects such patches, so hitting this means a
+    caller skipped validation or the file changed underneath us.
+    """
     for block in blocks:
         target = workspace / block.file_path
         content = target.read_text(encoding="utf-8")
-        # Replace only first occurrence
+        n_matches = content.count(block.search)
+        if n_matches > 1:
+            raise ValueError(
+                f"Ambiguous patch: search text matches {n_matches} locations "
+                f"in '{block.file_path}' (patches must match exactly once)"
+            )
         content = content.replace(block.search, block.replace, 1)
         target.write_text(content, encoding="utf-8")
 

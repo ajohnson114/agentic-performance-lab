@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-
 from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis
 
 

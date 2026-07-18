@@ -170,7 +170,7 @@ class TestGpuMemoryPromptIntegration:
 
 class TestAgentExtractHelpers:
     def test_extract_memray_summary(self):
-        from perflab.optimizers.agent import _extract_memray_summary
+        from perflab.optimizers.phases.generate import _extract_memray_summary
         summaries = {
             "memray": {
                 "returncode": 0,
@@ -185,12 +185,12 @@ class TestAgentExtractHelpers:
         assert result["peak_memory_mb"] == 512.0
 
     def test_extract_memray_failed_returns_none(self):
-        from perflab.optimizers.agent import _extract_memray_summary
+        from perflab.optimizers.phases.generate import _extract_memray_summary
         assert _extract_memray_summary({"memray": {"returncode": 1}}) is None
         assert _extract_memray_summary({}) is None
 
     def test_extract_lock_contention(self):
-        from perflab.optimizers.agent import _extract_lock_contention_summary
+        from perflab.optimizers.phases.generate import _extract_lock_contention_summary
         summaries = {
             "lock_contention": {
                 "lock_stats": {"total_contended": 10, "locks": []},
@@ -201,7 +201,7 @@ class TestAgentExtractHelpers:
         assert result is not None
 
     def test_extract_lock_contention_no_contention_returns_none(self):
-        from perflab.optimizers.agent import _extract_lock_contention_summary
+        from perflab.optimizers.phases.generate import _extract_lock_contention_summary
         summaries = {
             "lock_contention": {
                 "lock_stats": {"total_contended": 0},
@@ -211,7 +211,7 @@ class TestAgentExtractHelpers:
         assert _extract_lock_contention_summary(summaries) is None
 
     def test_extract_gpu_memory(self):
-        from perflab.optimizers.agent import _extract_gpu_memory_summary
+        from perflab.optimizers.phases.generate import _extract_gpu_memory_summary
         summaries = {
             "power": {
                 "gpu_memory": {
@@ -226,7 +226,7 @@ class TestAgentExtractHelpers:
         assert result["total_mib"] == 16384
 
     def test_extract_gpu_memory_no_data(self):
-        from perflab.optimizers.agent import _extract_gpu_memory_summary
+        from perflab.optimizers.phases.generate import _extract_gpu_memory_summary
         assert _extract_gpu_memory_summary({}) is None
         assert _extract_gpu_memory_summary({"power": {}}) is None
 
@@ -287,7 +287,7 @@ class TestEbpfPromptIntegration:
 
 class TestAgentExtractEbpf:
     def test_extract_ebpf_summary(self):
-        from perflab.optimizers.agent import _extract_ebpf_summary
+        from perflab.optimizers.phases.generate import _extract_ebpf_summary
         summaries = {
             "ebpf": {
                 "returncode": 0,
@@ -305,12 +305,12 @@ class TestAgentExtractEbpf:
         assert result["write_syscalls"] == 1200
 
     def test_extract_ebpf_failed_returns_none(self):
-        from perflab.optimizers.agent import _extract_ebpf_summary
+        from perflab.optimizers.phases.generate import _extract_ebpf_summary
         assert _extract_ebpf_summary({"ebpf": {"returncode": 1}}) is None
         assert _extract_ebpf_summary({}) is None
 
     def test_extract_ebpf_no_syscalls_returns_none(self):
-        from perflab.optimizers.agent import _extract_ebpf_summary
+        from perflab.optimizers.phases.generate import _extract_ebpf_summary
         assert _extract_ebpf_summary({
             "ebpf": {"returncode": 0, "read_syscalls": 0, "write_syscalls": 0},
         }) is None

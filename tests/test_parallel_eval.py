@@ -1,9 +1,6 @@
 """Tests for parallel candidate evaluation and structured failure memory."""
 from __future__ import annotations
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Structured failure memory in prompt
 # ---------------------------------------------------------------------------
@@ -159,9 +156,9 @@ class TestPromisingAlternatives:
 class TestParallelPrescreen:
     def test_prescreen_with_invalid_patch(self, tmp_path):
         """Prescreening catches validation errors without building."""
-        from perflab.optimizers.agent import _prescreen_candidate
         from perflab.optimizers.patch import SearchReplaceBlock
-        from perflab.task_spec import TaskSpec, CommandSpec, BenchmarkSpec, MetricSpec, EditPolicy
+        from perflab.optimizers.phases.prescreen import _prescreen_candidate
+        from perflab.task_spec import BenchmarkSpec, CommandSpec, EditPolicy, MetricSpec, TaskSpec
 
         # Create a minimal workspace
         ws = tmp_path / "ws"
@@ -186,9 +183,9 @@ class TestParallelPrescreen:
 
     def test_prescreen_with_valid_patch(self, tmp_path):
         """Valid patch that passes build+correctness."""
-        from perflab.optimizers.agent import _prescreen_candidate
         from perflab.optimizers.patch import SearchReplaceBlock
-        from perflab.task_spec import TaskSpec, CommandSpec, BenchmarkSpec, MetricSpec, EditPolicy
+        from perflab.optimizers.phases.prescreen import _prescreen_candidate
+        from perflab.task_spec import BenchmarkSpec, CommandSpec, EditPolicy, MetricSpec, TaskSpec
 
         ws = tmp_path / "ws"
         ws.mkdir()

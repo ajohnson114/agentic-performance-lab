@@ -22,7 +22,8 @@ Usage in tests.py:
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def assert_deterministic(
@@ -51,7 +52,7 @@ def assert_deterministic(
     # --- Phase 1: Same inputs, multiple runs → outputs must be identical ---
     inputs = input_factory()
     outputs = []
-    for run_idx in range(n_runs):
+    for _run_idx in range(n_runs):
         result = fn(*inputs)
         if isinstance(result, torch.Tensor):
             # Detach and clone to prevent aliasing

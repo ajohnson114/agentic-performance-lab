@@ -151,16 +151,33 @@ All activity is logged to `agent_events.jsonl`. Use `perflab replay` to review.
 
 ## Safety
 
-The agent proposes code changes within a tightly constrained sandbox. Key layers:
+PerfLab constrains what the agent may edit through policy checks (protected files, path containment, `allowed_paths`), and can optionally constrain what candidate code may do at runtime via OS-level isolation (`--isolation=restricted`, Linux/bwrap). Without isolation enabled, candidate code runs with your user's privileges — run PerfLab on machines where that is acceptable. These two guarantees are independent; don't assume one implies the other.
+
+### Edit policy
+
+What the agent is allowed to change:
 
 - **Protected files** — `tests.py`, `bench.py`, and `task.yaml` cannot be edited
-- **Edit policy** — `allowed_paths` restricts editable files to specific source files
+- **Allowed paths** — `allowed_paths` restricts editable files to specific source files
 - **Path containment** — every path is resolved and checked against the workspace root
+- **Backup/restore** — files backed up before patching, restored on failure
+
+### Runtime isolation
+
+What the resulting code is allowed to do when it runs, controlled by `--isolation`:
+
+- **`--isolation=none`** (default) — no sandboxing; candidate code runs with your user's full privileges
+- **`--isolation=restricted`** — Bubblewrap (`bwrap`) sandboxing on Linux: network namespace unshared unless `task.yaml` sets `network: true`, filesystem access scoped to the workspace, GPU devices dev-bound explicitly
+- **`--isolation=strict`** — tighter variant of the above for less-trusted code
+- **Resource limits** — memory, process, and file descriptor caps (Linux), applied regardless of isolation level
+
+### Output validation
+
+Checks applied to what a candidate produces, independent of edit policy or runtime isolation:
+
 - **Correctness gate** — every candidate runs `tests.py`; rejected on failure
 - **Contract validation** — benchmark output checked against `contract.fixed_params` (prevents shrinking the problem to "optimize")
-- **Backup/restore** — files backed up before patching, restored on failure
 - **Regression check** — candidates must beat baseline by `regression_tolerance` (default 2%)
-- **Resource limits** — memory, process, and file descriptor caps (Linux)
 - **Anti-gaming** — variance checks, determinism re-runs, speedup threshold alerts
 
 PerfLab also includes `perflab.harness`, a library of anti-gaming utilities for `bench.py` and `tests.py`:
@@ -257,6 +274,8 @@ Add to your client config:
 ```
 
 Tools cover task inspection, profiling, analysis, optimization, CI checks, and task authoring.
+
+**Note:** the MCP server is the most likely place a third-party or untrusted model ends up driving PerfLab — the client (Claude Desktop, Cursor, etc.) decides what the model can invoke, not you at a terminal. The [edit policy vs. runtime isolation](#safety) distinction still applies here: the server enforces the same `allowed_paths`/protected-file checks, but candidate code still runs with your user's full privileges unless isolation (`--isolation=restricted` or `strict`) is explicitly configured for the underlying agent run.
 
 ---
 

@@ -11,9 +11,10 @@ import logging
 import shlex
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING
 
 from perflab.analyzers.compiler_diagnostics import (
     CompilerDiagnostics,
@@ -25,7 +26,11 @@ from perflab.analyzers.compiler_diagnostics import (
 from perflab.runners.benchmark import run_benchmark, validate_contract
 from perflab.runners.correctness import run_correctness
 from perflab.task_spec import TaskSpec
+from perflab.tools.isolation import IsolationPolicy
 from perflab.tools.shell import run_cmd
+
+if TYPE_CHECKING:
+    from perflab.optimizers.agent import AgentContext
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,7 @@ def run_pipeline(
     validate_contract_spec: bool = False,
     save_logs: bool = False,
     progress_fn: Callable[[str], None] | None = None,
+    isolation: IsolationPolicy | None = None,
 ) -> PipelineResult:
     """Execute the build -> correctness -> benchmark -> profile pipeline.
 
@@ -65,6 +71,11 @@ def run_pipeline(
         validate_contract_spec: Raise on contract violations in bench.json.
         save_logs: Write stdout/stderr logs to run_dir/logs/.
         progress_fn: Optional callback for progress messages.
+        isolation: Optional OS-level sandbox policy applied to the
+            correctness and benchmark subprocesses (perflab.tools.isolation).
+            Build and profiler invocations are NOT wrapped: profilers (perf,
+            nsys, ncu) need ptrace/driver/sysfs access a sandbox denies, and
+            build commands are task-defined, not candidate-authored.
 
     Returns:
         PipelineResult with bench dict, timing, diagnostics, and artifacts.
@@ -91,13 +102,15 @@ def run_pipeline(
             try:
                 from perflab.analyzers.build_overrides import (
                     apply_build_overrides as _apply_overrides,
+                )
+                from perflab.analyzers.build_overrides import (
                     load_build_overrides,
                 )
                 overrides = load_build_overrides(ws, allow_fast_math=task.constraints.allow_fast_math)
                 if overrides:
                     build_cmd_str = _apply_overrides(task.build.cmd, overrides)
                     build_cmd_parts = shlex.split(build_cmd_str)
-            except Exception:
+            except Exception:  # noqa: BLE001 -- best-effort optional feature, fall back to the unmodified build command
                 logger.warning("Build override application failed", exc_info=True)
 
         if capture_diagnostics and build_cmd_parts:
@@ -125,6 +138,7 @@ def run_pipeline(
         task.correctness.cmd, cwd=ws,
         program_type=task.program_type,
         rlimit_as_gb=task.constraints.rlimit_as_gb,
+        isolation=isolation,
     )
     if save_logs:
         logs_dir = run_dir / "logs"
@@ -146,6 +160,7 @@ def run_pipeline(
         task.benchmark.cmd, cwd=ws, env=bench_env,
         program_type=task.program_type,
         rlimit_as_gb=task.constraints.rlimit_as_gb,
+        isolation=isolation,
     )
     bench_wall = time.perf_counter() - t0
     bench_stderr = bench_res.stderr if capture_diagnostics else ""
@@ -189,7 +204,7 @@ def run_pipeline(
             sass_results = extract_sass_from_build(task.build.cmd, ws, artifacts_dir)
             if sass_results:
                 artifacts["sass_dump"] = str(artifacts_dir / "sass_dump.txt")
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort optional artifact, must not abort the pipeline
             logger.warning("SASS extraction failed", exc_info=True)
 
     # ------------------------------------------------------------------
@@ -225,7 +240,7 @@ def run_pipeline(
                     l2_bw_gbs=l2_bw,
                 )
                 artifacts["roofline"] = str(roof_png)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- best-effort optional artifact, must not abort the pipeline
         _msg(f"[pipeline] Roofline generation failed: {exc}")
 
     # ------------------------------------------------------------------
@@ -246,8 +261,8 @@ def run_pipeline(
                     json.dumps(pr.summary, indent=2), encoding="utf-8",
                 )
                 for k, v in pr.artifacts.items():
-                    artifacts[k] = str((artifacts_dir / Path(v).name))
-            except Exception as exc:
+                    artifacts[k] = str(artifacts_dir / Path(v).name)
+            except Exception as exc:  # noqa: BLE001 -- a single failed profiler must not abort the others
                 error_summary = {"error": f"{profiler.name} failed: {exc}"}
                 (artifacts_dir / f"{profiler.name}_summary.json").write_text(
                     json.dumps(error_summary, indent=2), encoding="utf-8",
@@ -264,3 +279,27 @@ def run_pipeline(
         diagnostics=diagnostics,
         artifacts=artifacts,
     )
+
+
+def run_pipeline_for_ctx(
+    ctx: AgentContext,
+    do_profiles: bool,
+    capture_diagnostics: bool = False,
+) -> tuple[dict, float | None, float | None, CompilerDiagnostics | None]:
+    """Run correctness + benchmark + optional profiles for an agent iteration.
+
+    Thin adapter from AgentContext to run_pipeline(), shared by the baseline
+    phase (initial profiling) and the evaluate phase (post-accept re-profiling).
+    Returns (bench_dict, bench_wall_time_s, profiled_wall_time_s, diagnostics).
+    """
+    result = run_pipeline(
+        task=ctx.task,
+        run_dir=ctx.rp.run_dir,
+        artifacts_dir=ctx.rp.artifacts_dir,
+        do_profiles=do_profiles,
+        capture_diagnostics=capture_diagnostics,
+        apply_build_overrides=True,
+        progress_fn=ctx.progress.on_message,
+        isolation=ctx.config.isolation,
+    )
+    return result.bench, result.bench_wall_s, result.profile_wall_s, result.diagnostics

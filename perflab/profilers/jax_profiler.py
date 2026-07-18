@@ -3,14 +3,13 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shlex
 import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
-from perflab.tools.shell import run_cmd
+from perflab.profilers.base import ProfileResult, run_bench_under
+from perflab.profilers.interval_union import union_duration
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +40,8 @@ class JaxProfiler:
         # JAX profiler trace: writes TensorBoard-compatible trace files
         env["PERFLAB_JAX_TRACE_DIR"] = str(trace_dir)
 
-        cmd_parts = shlex.split(bench_cmd)
         t0 = time.perf_counter()
-        res = run_cmd(cmd_parts, cwd=cwd, env=env)
+        res = run_bench_under([], bench_cmd, cwd=cwd, env=env)
         duration_s = time.perf_counter() - t0
 
         summary: dict = {
@@ -186,7 +184,7 @@ def _detect_tpu_device() -> dict:
         }
     except ImportError:
         return {}
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort TPU detection, must not abort profiling
         logger.warning("TPU device detection failed", exc_info=True)
         return {}
 
@@ -224,18 +222,36 @@ def _collect_jax_trace_metrics(trace_dir: Path) -> dict:
             import json
             data = json.loads(tf.read_text(encoding="utf-8", errors="replace"))
             events = data if isinstance(data, list) else data.get("traceEvents", [])
+            # Per-file busy intervals: events overlap within a trace
+            # (concurrent device streams, nested host spans), so wall-clock
+            # time is the union of intervals, not the sum of durations.
+            # Events without a timestamp fall back to plain sums.
+            host_iv: list[tuple[float, float]] = []
+            device_iv: list[tuple[float, float]] = []
+            infeed_iv: list[tuple[float, float]] = []
+            all_iv: list[tuple[float, float]] = []
             for ev in events:
                 if not isinstance(ev, dict):
                     continue
                 cat = ev.get("cat", "")
                 dur = ev.get("dur", 0)
                 name = ev.get("name", "")
+                ts = ev.get("ts")
+                interval = None
+                if isinstance(ts, (int, float)) and dur > 0:
+                    interval = (float(ts), float(ts) + float(dur))
 
                 # Categorize events by host vs device
                 if "host" in cat.lower() or cat in ("python", "cpu_op"):
-                    host_time_us += dur
+                    if interval:
+                        host_iv.append(interval)
+                    else:
+                        host_time_us += dur
                 elif "device" in cat.lower() or "tpu" in cat.lower() or "gpu" in cat.lower():
-                    device_time_us += dur
+                    if interval:
+                        device_iv.append(interval)
+                    else:
+                        device_time_us += dur
 
                 # MXU utilization events (XProf format)
                 args = ev.get("args", {})
@@ -247,9 +263,20 @@ def _collect_jax_trace_metrics(trace_dir: Path) -> dict:
 
                 # Infeed stall tracking
                 if "infeed" in name.lower() and dur > 0:
-                    infeed_time_us += dur
+                    if interval:
+                        infeed_iv.append(interval)
+                    else:
+                        infeed_time_us += dur
 
-                total_step_time_us += dur
+                if interval:
+                    all_iv.append(interval)
+                else:
+                    total_step_time_us += dur
+
+            host_time_us += union_duration(host_iv)
+            device_time_us += union_duration(device_iv)
+            infeed_time_us += union_duration(infeed_iv)
+            total_step_time_us += union_duration(all_iv)
         except (json.JSONDecodeError, OSError, KeyError, TypeError):
             continue
 

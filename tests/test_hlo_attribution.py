@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 from perflab.analyzers.hlo_attribution import (
-    HloAttribution,
-    HloOpEntry,
-    compute_hlo_attribution,
     _categorize_op,
     _diagnose_op,
+    compute_hlo_attribution,
 )
 
 

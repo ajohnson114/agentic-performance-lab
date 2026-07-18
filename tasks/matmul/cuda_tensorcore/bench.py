@@ -1,10 +1,10 @@
 """Compile and benchmark the CUDA Tensor Core hgemm binary."""
 from __future__ import annotations
+
 import argparse
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import yaml

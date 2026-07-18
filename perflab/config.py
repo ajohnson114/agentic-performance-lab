@@ -21,6 +21,8 @@ from pathlib import Path
 
 import yaml
 
+from perflab.llm.config import DEFAULT_MODEL
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 class LLMSection:
     """LLM provider settings."""
     provider: str = "openai"
-    model: str = "gpt-5.2"
+    model: str = DEFAULT_MODEL
     api_base: str = ""
     temperature: float = 0.7
     max_tokens: int = 16000
@@ -82,6 +84,18 @@ class AgentSection:
 
 
 @dataclass
+class IsolationSection:
+    """OS-level sandboxing for candidate (LLM-authored) subprocess execution.
+
+    See perflab/tools/isolation.py for the "none" | "restricted" | "strict"
+    tiers. Default is "none" (current, unsandboxed behavior) -- the spec for
+    this feature requires an A/B benchmark-noise validation before
+    "restricted" can become the shipped default; see DESIGN.md.
+    """
+    level: str = "none"  # "none" | "restricted" | "strict"
+
+
+@dataclass
 class PerfLabConfig:
     """Top-level PerfLab configuration.
 
@@ -94,6 +108,7 @@ class PerfLabConfig:
     mps: MPSSection = field(default_factory=MPSSection)
     ollama: OllamaSection = field(default_factory=OllamaSection)
     agent: AgentSection = field(default_factory=AgentSection)
+    isolation: IsolationSection = field(default_factory=IsolationSection)
     # Sparse dict of AnalysisThresholds field overrides.
     # Only specified keys override defaults; unset keys use AnalysisThresholds defaults.
     # task.yaml analysis_thresholds override these (task > config > defaults).
@@ -182,6 +197,11 @@ def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
         if "fast_screen" in agent:
             cfg.agent.fast_screen = bool(agent["fast_screen"])
 
+    isolation = data.get("isolation", {})
+    if isinstance(isolation, dict):
+        if "level" in isolation:
+            cfg.isolation.level = str(isolation["level"])
+
     thresholds = data.get("analysis_thresholds", {})
     if isinstance(thresholds, dict):
         cfg.analysis_thresholds.update(thresholds)
@@ -232,6 +252,10 @@ def _overlay_env(cfg: PerfLabConfig) -> None:
             cfg.ollama.allowed_ports = [int(p) for p in v.split(",") if p.strip()]
         except ValueError:
             pass
+
+    # Isolation
+    if v := os.environ.get("PERFLAB_ISOLATION_LEVEL"):
+        cfg.isolation.level = v
 
 
 def load_config(*, force_reload: bool = False) -> PerfLabConfig:
@@ -295,7 +319,7 @@ def create_user_config() -> Path:
 # Default YAML template (for `perflab init` and documentation)
 # ---------------------------------------------------------------------------
 
-DEFAULT_CONFIG_TEMPLATE = """\
+DEFAULT_CONFIG_TEMPLATE = f"""\
 # PerfLab Configuration
 # =====================
 # Resolution order: env vars > ./perflab.yaml > ~/.config/perflab/config.yaml > defaults
@@ -306,10 +330,10 @@ DEFAULT_CONFIG_TEMPLATE = """\
 
 llm:
   provider: openai           # "openai", "anthropic", or "ollama"
-  model: gpt-5.2             # Model identifier
+  model: {DEFAULT_MODEL}            # Model identifier
   api_base: ""               # Custom API endpoint (leave empty for default)
   temperature: 0.7
-  max_tokens: 4096
+  max_tokens: 16000
   # NOTE: api_key is NOT stored here for security — always use:
   #   export PERFLAB_API_KEY=sk-...
 
@@ -337,6 +361,22 @@ agent:
   fast_screen: true          # Quick benchmark to rank candidates before full eval
   max_history: 3             # How many past iterations the LLM sees in its prompt
   prompt_token_budget: 0     # 0 = unlimited. Set to cap prompt size for small models
+
+isolation:
+  level: none                # "none" | "restricted" | "strict" -- sandbox candidate
+                              # (LLM-authored) subprocess execution on top of the
+                              # rlimit + env-allowlist protections that always apply.
+                              # none:       rlimits only (current behavior).
+                              # restricted: Bubblewrap (Linux only) -- read-only bind
+                              #             of /usr, /lib, the venv, and CUDA/driver
+                              #             paths; read-write bind of the workspace
+                              #             only; network unshared unless task.yaml
+                              #             sets constraints.network: true. Falls back
+                              #             to none (with a logged warning) if bwrap
+                              #             isn't installed/usable, or on non-Linux.
+                              # strict:     restricted + seccomp (ptrace/mount/bpf/
+                              #             keyctl denied) where bwrap supports it.
+                              # See perflab/tools/isolation.py and DESIGN.md.
 
 # ---------------------------------------------------------------------------
 # Analysis thresholds (optional — override bottleneck detection sensitivity)

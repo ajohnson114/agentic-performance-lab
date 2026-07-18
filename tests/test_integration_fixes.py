@@ -1,9 +1,6 @@
 """Regression tests for bug fixes and profiler key integrations."""
 from __future__ import annotations
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # Power samples bug regression test
 # ---------------------------------------------------------------------------

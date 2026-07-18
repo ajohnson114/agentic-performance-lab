@@ -1,9 +1,7 @@
 """Tests for MCP task-authoring tools and template generation."""
 from __future__ import annotations
 
-import json
 import textwrap
-from pathlib import Path
 
 import pytest
 import yaml
@@ -224,7 +222,7 @@ class TestSuggestThresholds:
         from perflab.server.task_templates import suggest_thresholds
 
         result = suggest_thresholds("cpp")
-        for key, entry in result["suggested_thresholds"].items():
+        for _key, entry in result["suggested_thresholds"].items():
             assert "description" in entry
             assert len(entry["description"]) > 0
 

@@ -8,6 +8,7 @@ and perf to show which functions gained or lost CPU share.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -108,10 +109,10 @@ _TRACKED_METRICS: dict[str, list[str]] = {
 }
 
 
-def _resolve_dotted(d: dict, path: str):
+def _resolve_dotted(d: dict, path: str) -> Any:
     """Resolve a dotted path like 'memory.peak_memory_mb' into nested dicts."""
     parts = path.split(".")
-    val = d
+    val: Any = d
     for part in parts:
         if isinstance(val, dict):
             val = val.get(part)

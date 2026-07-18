@@ -4,9 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from perflab.analyzers.diff_flamegraph import (
+    _extract_func_pcts,
     compute_diff_stacks,
     generate_diff_svg,
-    _extract_func_pcts,
 )
 
 

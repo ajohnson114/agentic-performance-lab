@@ -5,17 +5,18 @@ import logging
 import shlex
 from pathlib import Path
 
+from perflab.profilers.base import Profiler
+from perflab.profilers.ebpf_profiler import EbpfProfiler
+from perflab.profilers.jax_profiler import JaxProfiler
+from perflab.profilers.linux_perf import LinuxPerfProfiler
+from perflab.profilers.lock_contention import LockContentionProfiler
+from perflab.profilers.memray_profiler import MemrayProfiler
+from perflab.profilers.metal_trace import MetalTraceProfiler
+from perflab.profilers.ncu_profiler import NcuProfiler
+from perflab.profilers.nsys_profiler import NsysProfiler
+from perflab.profilers.power_profiler import PowerProfiler
 from perflab.profilers.python_pyspy import PySpyProfiler
 from perflab.profilers.pytorch_profiler import TorchProfiler
-from perflab.profilers.linux_perf import LinuxPerfProfiler
-from perflab.profilers.nsys_profiler import NsysProfiler
-from perflab.profilers.ncu_profiler import NcuProfiler
-from perflab.profilers.jax_profiler import JaxProfiler
-from perflab.profilers.metal_trace import MetalTraceProfiler
-from perflab.profilers.memray_profiler import MemrayProfiler
-from perflab.profilers.ebpf_profiler import EbpfProfiler
-from perflab.profilers.lock_contention import LockContentionProfiler
-from perflab.profilers.power_profiler import PowerProfiler
 from perflab.profilers.thread_sched import ThreadSchedProfiler
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ def select_profilers(task):
 
     Returns a list of profiler instances suitable for the given task.
     """
-    profs = []
+    profs: list[Profiler] = []
     # Always attempt py-spy for python-ish tasks
     if task.program_type in {"python", "pytorch", "jax", "triton"}:
         profs.append(PySpyProfiler())
@@ -106,6 +107,6 @@ def extract_sass_from_build(
     except FileNotFoundError:
         logger.warning("cuobjdump not found — SASS extraction unavailable")
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort optional SASS extraction, must not abort profiling
         logger.warning("SASS extraction failed", exc_info=True)
         return None

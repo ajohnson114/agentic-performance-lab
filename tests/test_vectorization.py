@@ -4,41 +4,9 @@ from __future__ import annotations
 from perflab.analyzers.vectorization import (
     VectorizationReport,
     VectorizationSummary,
-    analyze_vectorization,
     check_vectorization_from_perf_annotate,
     format_vectorization_for_prompt,
 )
-
-
-class TestAnalyzeVectorization:
-    def test_empty_input(self):
-        summary = analyze_vectorization([])
-        assert summary.vectorized_count == 0
-        assert summary.not_vectorized_count == 0
-
-    def test_function_without_raw_asm(self):
-        entries = [{"function": "matmul", "hot_lines": [{"pct": 50.0}]}]
-        summary = analyze_vectorization(entries)
-        assert len(summary.functions) == 1
-        assert not summary.functions[0].has_simd
-        assert summary.not_vectorized_count == 1
-
-    def test_function_with_avx_asm(self):
-        entries = [{
-            "function": "matmul",
-            "hot_lines": [{"pct": 80.0}],
-            "raw_asm": "vmovaps %ymm0, %ymm1\nvaddps %ymm2, %ymm3, %ymm4\nmov %rax, %rbx\n",
-        }]
-        summary = analyze_vectorization(entries)
-        assert summary.functions[0].has_simd
-        assert summary.functions[0].simd_isa == "avx"
-        assert summary.vectorized_count == 1
-
-    def test_warning_for_unvectorized(self):
-        entries = [{"function": "slow_func", "hot_lines": [{"pct": 60.0}]}]
-        summary = analyze_vectorization(entries)
-        assert "SIMD" in summary.warning
-        assert "slow_func" in summary.warning
 
 
 class TestCheckFromAnnotate:

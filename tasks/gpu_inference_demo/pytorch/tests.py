@@ -1,7 +1,6 @@
 """Correctness tests for the GPU inference demo pipeline."""
 
 import torch
-
 from pipeline import run_pipeline
 
 

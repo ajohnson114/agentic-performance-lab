@@ -504,7 +504,6 @@ def _parse_jax_diagnostics(stderr: str) -> list[str]:
             m = re.search(r"in\s+([\d.]+)\s*(?:ms|s)", line, re.IGNORECASE)
             if m:
                 val = float(m.group(1))
-                unit = line[m.end() - 1:m.end()].lower() if m.end() <= len(line) else "s"
                 # Check if the matched unit was ms or s
                 if "ms" in line[m.start():m.end() + 2].lower():
                     total_compile_ms += val

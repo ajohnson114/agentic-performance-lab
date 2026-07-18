@@ -20,7 +20,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
 
     losses = []
-    for step in range(10):
+    for _step in range(10):
         tokens = torch.randint(0, 1024, (4, 32), device=device)
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
         logits = model(inputs)
@@ -33,9 +33,9 @@ def main():
         losses.append(loss.item())
 
     # Check: all losses finite
-    for i, l in enumerate(losses):
-        assert not (l != l), f"Loss at step {i} is NaN"  # NaN != NaN
-        assert l < float("inf"), f"Loss at step {i} is infinite"
+    for i, loss_i in enumerate(losses):
+        assert not (loss_i != loss_i), f"Loss at step {i} is NaN"  # NaN != NaN
+        assert loss_i < float("inf"), f"Loss at step {i} is infinite"
 
     # Check: loss is decreasing overall (last < first)
     assert losses[-1] < losses[0], (
@@ -51,7 +51,7 @@ def main():
         assert -5 <= logit_mean <= 5, f"Logit mean out of range: {logit_mean}"
         assert 0.01 <= logit_std <= 50, f"Logit std out of range: {logit_std}"
 
-    print(f"ok  losses={[f'{l:.4f}' for l in losses]}")
+    print(f"ok  losses={[f'{loss_i:.4f}' for loss_i in losses]}")
 
 
 if __name__ == "__main__":

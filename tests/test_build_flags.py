@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from perflab.analyzers.build_flags import (
-    FlagRecommendation,
     recommend_build_flags,
 )
 

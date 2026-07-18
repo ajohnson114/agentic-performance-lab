@@ -1,5 +1,6 @@
 """Benchmark the Triton matmul kernel."""
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -8,7 +9,6 @@ from pathlib import Path
 
 import torch
 import yaml
-
 from matmul_kernel import triton_matmul
 
 
@@ -38,7 +38,7 @@ def main():
     # Warmup
     warmup = int(os.environ.get("PERFLAB_BENCH_WARMUP", 3))
     for _ in range(warmup):
-        C = triton_matmul(A, B, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+        triton_matmul(A, B, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
     torch.cuda.synchronize()
 
     # Benchmark
@@ -47,7 +47,7 @@ def main():
     for _ in range(repeats):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        C = triton_matmul(A, B, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+        triton_matmul(A, B, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         times_ms.append((t1 - t0) * 1000.0)

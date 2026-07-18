@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -7,8 +8,8 @@ from pathlib import Path
 
 import torch
 import yaml
-
 from matmul_op import matmul_op
+
 
 def _device():
     if torch.cuda.is_available():
@@ -57,7 +58,7 @@ def main():
     _sync(dev)
     warmup = int(os.environ.get("PERFLAB_BENCH_WARMUP", 3))
     for _ in range(warmup):
-        y = matmul_op(A, B)
+        matmul_op(A, B)
     _sync(dev)
 
     # Benchmark
@@ -65,7 +66,7 @@ def main():
     enabled, trace_path = maybe_torch_profiler_enabled()
     prof = None
     if enabled:
-        from torch.profiler import profile, ProfilerActivity
+        from torch.profiler import ProfilerActivity, profile
         activities = [ProfilerActivity.CPU]
         # CUDA activity only when available
         if torch.cuda.is_available():
@@ -76,7 +77,7 @@ def main():
     if prof is None:
         for _ in range(repeats):
             t0 = time.perf_counter()
-            y = matmul_op(A, B)
+            matmul_op(A, B)
             _sync(dev)
             t1 = time.perf_counter()
             times.append((t1 - t0) * 1000.0)
@@ -84,7 +85,7 @@ def main():
         with prof:
             for _ in range(repeats):
                 t0 = time.perf_counter()
-                y = matmul_op(A, B)
+                matmul_op(A, B)
                 _sync(dev)
                 t1 = time.perf_counter()
                 times.append((t1 - t0) * 1000.0)

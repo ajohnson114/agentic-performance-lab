@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from perflab.analyzers.gpu_attribution import (
-    AttributionEntry,
     CpuGpuEdge,
     build_cpu_gpu_call_graph,
     compute_attribution_ranking,
@@ -136,7 +135,7 @@ class TestFrameworkEnrichment:
 
     def test_fallback_without_nvtx(self):
         edges = [CpuGpuEdge("cudaLaunchKernel", "my_custom_kernel", 1, 5, 20.0, 8.0, 15.0)]
-        enriched = enrich_with_framework_context(edges, nvtx_ranges=None, program_type="cuda")
+        enrich_with_framework_context(edges, nvtx_ranges=None, program_type="cuda")
         # Raw CUDA: no framework op inferred for unknown kernels
         # This is fine — framework_op is optional
 

@@ -1,12 +1,13 @@
 from __future__ import annotations
+
+import json
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-import json
-import shlex
-from perflab.profilers.base import ProfileResult
-from perflab.tools.shell import run_cmd
+
+from perflab.profilers.base import ProfileResult, run_bench_under
+from perflab.profilers.interval_union import union_duration
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,13 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
     gpu_kernel_stats: dict[str, dict] = {}  # cat=kernel events
     cpu_op_stats: dict[str, dict] = {}      # cat=cpu_op/operator events
     raw_cpu_ops: list[dict] = []             # timestamped CPU ops for temporal cross-ref
+    # Busy intervals for wall-clock metrics: GPU kernels can run concurrently
+    # on multiple streams and CPU op spans nest, so summing durations
+    # double-counts. Events without a timestamp fall back to plain sums.
+    gpu_kernel_intervals: list[tuple[float, float]] = []
+    gpu_kernel_no_ts_us = 0.0
+    cpu_op_intervals: list[tuple[float, float]] = []
+    cpu_op_no_ts_us = 0.0
     sync_count = 0
     total_sync_us = 0.0
     memory_alloc_count = 0
@@ -88,6 +96,11 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
                 gpu_kernel_stats[name] = {"total_us": 0.0, "count": 0}
             gpu_kernel_stats[name]["total_us"] += float(dur)
             gpu_kernel_stats[name]["count"] += 1
+            gpu_ts = ev.get("ts")
+            if isinstance(gpu_ts, (int, float)):
+                gpu_kernel_intervals.append((float(gpu_ts), float(gpu_ts) + float(dur)))
+            else:
+                gpu_kernel_no_ts_us += float(dur)
 
         # CPU operators
         if cat_lower in ("cpu_op", "operator", "cpu_op|operator"):
@@ -95,6 +108,11 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
                 cpu_op_stats[name] = {"total_us": 0.0, "count": 0}
             cpu_op_stats[name]["total_us"] += float(dur)
             cpu_op_stats[name]["count"] += 1
+            cpu_ts = ev.get("ts")
+            if isinstance(cpu_ts, (int, float)):
+                cpu_op_intervals.append((float(cpu_ts), float(cpu_ts) + float(dur)))
+            else:
+                cpu_op_no_ts_us += float(dur)
             # Collect timestamped events for temporal cross-reference with nsys
             ts = ev.get("ts", 0)
             if ts > 0 and dur > 100:  # only ops > 100us to limit volume
@@ -205,10 +223,13 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
         except (KeyError, TypeError, ZeroDivisionError):
             logger.warning("Failed to compute top GPU kernels", exc_info=True)
 
-    # CPU vs GPU breakdown
+    # CPU vs GPU breakdown.
+    # Interval-union rather than summed durations: concurrent GPU kernels
+    # (multiple streams) and nested CPU op spans would otherwise double-count
+    # wall-clock time and skew the ratio.
     try:
-        total_cpu_op_us = sum(s["total_us"] for s in cpu_op_stats.values())
-        total_gpu_kernel_us = sum(s["total_us"] for s in gpu_kernel_stats.values())
+        total_cpu_op_us = union_duration(cpu_op_intervals) + cpu_op_no_ts_us
+        total_gpu_kernel_us = union_duration(gpu_kernel_intervals) + gpu_kernel_no_ts_us
         if total_cpu_op_us > 0 or total_gpu_kernel_us > 0:
             ratio = (total_gpu_kernel_us / total_cpu_op_us) if total_cpu_op_us > 0 else float("inf")
             result["cpu_vs_gpu"] = {
@@ -254,7 +275,9 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
         if dur <= 0:
             continue
         if phase_name not in phase_map:
-            phase_map[phase_name] = {"total_us": 0.0, "count": 0, "ts_ranges": [], "gpu_us": 0.0}
+            phase_map[phase_name] = {
+                "total_us": 0.0, "count": 0, "ts_ranges": [], "gpu_intervals": [],
+            }
         phase_map[phase_name]["total_us"] += float(dur)
         phase_map[phase_name]["count"] += 1
         phase_map[phase_name]["ts_ranges"].append((float(ts), float(ts) + float(dur)))
@@ -274,18 +297,21 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
             for pinfo in phase_map.values():
                 for start, end in pinfo["ts_ranges"]:
                     if start <= ev_ts < end:
-                        pinfo["gpu_us"] += ev_dur
+                        pinfo["gpu_intervals"].append((ev_ts, ev_ts + ev_dur))
                         break
 
         total_phase_us = sum(p["total_us"] for p in phase_map.values())
         phases_list = []
         for name, pinfo in phase_map.items():
             pct = (pinfo["total_us"] / total_phase_us * 100.0) if total_phase_us > 0 else 0.0
-            cpu_us = pinfo["total_us"] - pinfo["gpu_us"]
+            # Union: concurrent kernels within a phase must not double-count,
+            # otherwise gpu_us can exceed the phase duration.
+            phase_gpu_us = union_duration(pinfo["gpu_intervals"])
+            cpu_us = pinfo["total_us"] - phase_gpu_us
             phases_list.append({
                 "name": name,
                 "total_us": round(pinfo["total_us"], 1),
-                "gpu_us": round(pinfo["gpu_us"], 1),
+                "gpu_us": round(phase_gpu_us, 1),
                 "cpu_us": round(max(cpu_us, 0.0), 1),
                 "count": pinfo["count"],
                 "pct": round(pct, 1),
@@ -293,7 +319,8 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
         phases_list.sort(key=lambda p: p["total_us"], reverse=True)
         result["phases"] = phases_list
 
-    # Store timestamped CPU ops for temporal cross-reference with nsys GPU data.
+    # Store timestamped CPU ops (torch-trace clock domain; not comparable with
+    # timestamps from other profiler runs such as nsys).
     # Keyed with underscore prefix to indicate internal use (not displayed in prompt).
     if raw_cpu_ops:
         # Keep top 200 by duration to limit summary size
@@ -312,7 +339,7 @@ class TorchProfiler:
         try:
             import torch  # noqa: F401
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001 -- optional-feature detection; torch import can fail in various ways (missing package, broken CUDA/driver install)
             return False
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
@@ -327,7 +354,7 @@ class TorchProfiler:
             "PERFLAB_TORCH_TRACE_PATH": str(trace_path),
             "PERFLAB_TORCH_WITH_FLOPS": "1",
         }
-        res = run_cmd(shlex.split(bench_cmd), cwd=cwd, env=env)
+        res = run_bench_under([], bench_cmd, cwd=cwd, env=env)
         summary: dict = {"returncode": res.returncode, "duration_s": res.duration_s}
         artifacts = {}
         if trace_path.exists():

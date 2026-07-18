@@ -2,34 +2,34 @@ from __future__ import annotations
 
 import re
 
-from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis
+from perflab.analyzers.bottleneck_cpu import (  # noqa: F401
+    _analyze_io_bottleneck,
+    _analyze_perf,
+)
 
 # Re-export sub-module functions for backward compatibility.
 # Any code doing ``from perflab.analyzers.bottleneck_analyzer import _analyze_ncu``
 # will continue to work.
 from perflab.analyzers.bottleneck_gpu import (  # noqa: F401
+    _analyze_cross_profiler_cpu_gpu,
+    _analyze_gpu_attribution,
+    _analyze_host_device,
+    _analyze_metal,
     _analyze_ncu,
     _analyze_nsys,
-    _analyze_gpu_attribution,
-    _analyze_metal,
-    _analyze_host_device,
-    _analyze_cross_profiler_cpu_gpu,
-)
-from perflab.analyzers.bottleneck_cpu import (  # noqa: F401
-    _analyze_perf,
-    _analyze_io_bottleneck,
 )
 from perflab.analyzers.bottleneck_system import (  # noqa: F401
-    _analyze_torch_trace,
-    _analyze_jax,
-    _analyze_tpu,
-    _analyze_memray,
     _analyze_ebpf,
+    _analyze_jax,
     _analyze_lock_contention,
-    _analyze_thread_sched,
-    _analyze_power,
+    _analyze_memray,
     _analyze_nvtx_phases,
+    _analyze_power,
+    _analyze_thread_sched,
+    _analyze_torch_trace,
+    _analyze_tpu,
 )
+from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis
 
 # Re-export the dataclasses so existing ``from bottleneck_analyzer import AnalysisThresholds``
 # keeps working.

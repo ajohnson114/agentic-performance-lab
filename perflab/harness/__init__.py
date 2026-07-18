@@ -13,12 +13,12 @@ Mitigations provided:
   6. pointer_poison — Defeat static memoization via input mutation and re-run
 """
 
-from perflab.harness.gpu_sync import cuda_sync_guard, SyncTimer
-from perflab.harness.thread_guard import assert_no_new_threads, ThreadGuard
-from perflab.harness.tensor_check import assert_real_tensor
 from perflab.harness.determinism import assert_deterministic
-from perflab.harness.precision import assert_ulp_close
+from perflab.harness.gpu_sync import SyncTimer, cuda_sync_guard
 from perflab.harness.pointer_poison import assert_no_memoization
+from perflab.harness.precision import assert_ulp_close
+from perflab.harness.tensor_check import assert_real_tensor
+from perflab.harness.thread_guard import ThreadGuard, assert_no_new_threads
 
 __all__ = [
     "cuda_sync_guard",

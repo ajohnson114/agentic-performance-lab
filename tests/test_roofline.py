@@ -1,14 +1,12 @@
 """Tests for perflab.reporting.roofline."""
 from __future__ import annotations
 
+# Access private helper for unit testing dtype mapping
 from perflab.reporting.roofline import (
-    RooflinePoint,
+    _dtype_bytes,
     compute_roofline_point,
     select_peak_tflops,
 )
-
-# Access private helper for unit testing dtype mapping
-from perflab.reporting.roofline import _dtype_bytes
 
 
 class TestDtypeBytes:

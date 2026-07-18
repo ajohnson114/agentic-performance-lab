@@ -1,13 +1,17 @@
 """Tests for perflab.reporting.dashboard_html."""
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 
 from perflab.reporting.dashboard_html import (
+    AnalysisData,
     GlanceData,
     ProfilerData,
     write_dashboard_html,
 )
+
+_ANALYSIS_FIELDS = {f.name for f in fields(AnalysisData)}
 
 
 def _write(tmp_path, **kwargs):
@@ -19,6 +23,11 @@ def _write(tmp_path, **kwargs):
         metric_png_rel="metric_history.png",
     )
     defaults.update(kwargs)
+    analysis_kwargs = {
+        k: defaults.pop(k) for k in list(defaults) if k in _ANALYSIS_FIELDS
+    }
+    if analysis_kwargs:
+        defaults["analysis"] = AnalysisData(**analysis_kwargs)
     write_dashboard_html(**defaults)
     return out.read_text(encoding="utf-8")
 

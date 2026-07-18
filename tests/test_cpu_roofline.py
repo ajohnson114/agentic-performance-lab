@@ -1,6 +1,11 @@
 """Tests for CPU roofline spec-based estimation."""
-from unittest.mock import patch
-from perflab.roofline_peaks import _estimate_cpu_peaks, infer_cpu_peaks
+from unittest.mock import MagicMock, patch
+
+from perflab.roofline_peaks import (
+    _estimate_cpu_peaks,
+    _physical_cpu_count,
+    infer_cpu_peaks,
+)
 
 
 def test_estimate_cpu_peaks_returns_peaks_or_none():
@@ -59,7 +64,8 @@ def test_estimate_cpu_peaks_linux_avx512():
 
         mock_run.side_effect = fake_run
 
-        with patch("multiprocessing.cpu_count", return_value=56):
+        # Physical cores (56), not logical (112): SMT must not inflate the roof
+        with patch("perflab.roofline_peaks._physical_cpu_count", return_value=56):
             result = _estimate_cpu_peaks()
         assert result is not None
         assert result.peak_tflops > 0
@@ -67,6 +73,88 @@ def test_estimate_cpu_peaks_linux_avx512():
         expected_tflops = (56 * 32 * 4.8) / 1000.0
         assert abs(result.peak_tflops - expected_tflops) < 0.01
         assert result.source == "cpu-spec"
+
+
+def test_estimate_cpu_peaks_linux_falls_back_to_logical():
+    """When physical core detection fails, logical count is the last resort."""
+    with patch("perflab.roofline_peaks.platform") as mock_plat, \
+         patch("perflab.roofline_peaks._run") as mock_run, \
+         patch("perflab.roofline_peaks._physical_cpu_count", return_value=None), \
+         patch("multiprocessing.cpu_count", return_value=16):
+        mock_plat.system.return_value = "Linux"
+
+        def fake_run(cmd):
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+            if "model name" in cmd_str:
+                return "Some CPU"
+            if "CPU max MHz" in cmd_str:
+                return "3000.0"
+            if "flags" in cmd_str:
+                return "fpu sse sse2 avx2 fma"
+            return None
+
+        mock_run.side_effect = fake_run
+        result = _estimate_cpu_peaks()
+        assert result is not None
+        expected_tflops = (16 * 16 * 3.0) / 1000.0
+        assert abs(result.peak_tflops - expected_tflops) < 0.01
+
+
+class TestPhysicalCpuCount:
+    def test_prefers_psutil_physical_count(self):
+        """psutil.cpu_count(logical=False) wins when psutil is importable."""
+        mock_psutil = MagicMock()
+        mock_psutil.cpu_count.return_value = 8
+        with patch.dict("sys.modules", {"psutil": mock_psutil}):
+            assert _physical_cpu_count() == 8
+        mock_psutil.cpu_count.assert_called_with(logical=False)
+
+    def test_psutil_none_falls_through_to_platform(self):
+        """psutil returning None (unknown) falls through to platform probes."""
+        mock_psutil = MagicMock()
+        mock_psutil.cpu_count.return_value = None
+        with patch.dict("sys.modules", {"psutil": mock_psutil}), \
+             patch("perflab.roofline_peaks.platform") as mock_plat, \
+             patch("perflab.roofline_peaks._run") as mock_run:
+            mock_plat.system.return_value = "Darwin"
+            mock_run.return_value = "10"
+            assert _physical_cpu_count() == 10
+
+    def test_macos_sysctl_fallback_without_psutil(self):
+        with patch.dict("sys.modules", {"psutil": None}), \
+             patch("perflab.roofline_peaks.platform") as mock_plat, \
+             patch("perflab.roofline_peaks._run") as mock_run:
+            mock_plat.system.return_value = "Darwin"
+
+            def fake_run(cmd):
+                if "hw.physicalcpu" in " ".join(cmd):
+                    return "12"
+                return None
+
+            mock_run.side_effect = fake_run
+            assert _physical_cpu_count() == 12
+
+    def test_linux_lscpu_fallback_without_psutil(self):
+        with patch.dict("sys.modules", {"psutil": None}), \
+             patch("perflab.roofline_peaks.platform") as mock_plat, \
+             patch("perflab.roofline_peaks._run") as mock_run:
+            mock_plat.system.return_value = "Linux"
+
+            def fake_run(cmd):
+                cmd_str = " ".join(cmd)
+                if "lscpu" in cmd_str:
+                    return "24"
+                return None
+
+            mock_run.side_effect = fake_run
+            assert _physical_cpu_count() == 24
+
+    def test_returns_none_when_everything_fails(self):
+        with patch.dict("sys.modules", {"psutil": None}), \
+             patch("perflab.roofline_peaks.platform") as mock_plat, \
+             patch("perflab.roofline_peaks._run", return_value=None):
+            mock_plat.system.return_value = "Linux"
+            assert _physical_cpu_count() is None
 
 
 def test_infer_cpu_peaks_prefers_spec():

@@ -4,9 +4,15 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds
-from perflab.runners.benchmark import metric_value, run_benchmark, validate_bench_variance, validate_contract
+from perflab.runners.benchmark import (
+    metric_value,
+    run_benchmark,
+    validate_bench_variance,
+    validate_contract,
+)
 from perflab.runners.correctness import run_correctness
 from perflab.task_spec import TaskSpec
 
@@ -48,7 +54,7 @@ class CICheckResult:
     bench_variance_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        d = {
+        d: dict[str, Any] = {
             "passed": self.passed,
             "current_value": self.current_value,
             "baseline_value": self.baseline_value,
@@ -90,6 +96,7 @@ def _run_bench_full(task: TaskSpec) -> dict:
     # Build
     if task.build is not None:
         import shlex
+
         from perflab.tools.shell import run_cmd
         bres = run_cmd(shlex.split(task.build.cmd), cwd=ws)
         if bres.returncode != task.build.expected_exit:
@@ -146,7 +153,6 @@ def _detect_profiler_regressions(
     Uses AnalysisThresholds for consistent thresholds with the rest of the framework.
     """
     regressions: list[ProfilerRegression] = []
-    t = thresholds or AnalysisThresholds()
 
     # Metrics where decrease is bad (threshold = min regression delta to flag)
     # 5pp: a 5-percentage-point drop in any of these indicates meaningful degradation
@@ -192,7 +198,7 @@ def _find_latest_ncu_summary(task: TaskSpec) -> dict | None:
             run_data = store.get_run(runs[0]["run_id"])
             summaries = run_data.get("profiler_summaries", {})
             return summaries.get("ncu") or summaries.get("ncu_profiler")
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort lookup, missing/corrupt run store shouldn't break CI
         logger.debug("Failed to load NCU summary from prior run", exc_info=True)
     return None
 

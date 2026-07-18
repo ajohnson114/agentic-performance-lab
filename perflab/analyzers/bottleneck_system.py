@@ -12,7 +12,6 @@ def _analyze_tpu(
 ) -> list[BottleneckDiagnosis]:
     """Analyze TPU-specific bottlenecks from JAX profiler data and system info."""
     findings: list[BottleneckDiagnosis] = []
-    si = system_info or {}
 
     # Rule 1: Low MXU utilization (from jax profiler trace data if available)
     mxu_util = jax_summary.get("mxu_utilization_pct")
@@ -264,7 +263,6 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
     # -- Per-phase training breakdown analysis --
     phases = summary.get("phases", [])
     if phases:
-        total_phase_us = sum(p.get("total_us", 0) for p in phases)
         _phase_suggestions: dict[str, list[str]] = {
             "forward": [
                 "Use scaled_dot_product_attention (SDPA) for efficient attention",
@@ -556,7 +554,7 @@ def _analyze_lock_contention(summary: dict, thresholds: AnalysisThresholds) -> l
     locks = lock_stats.get("locks", [])
 
     # Check overall contention ratio
-    total_acquired = sum(l.get("acquired", 0) for l in locks)
+    total_acquired = sum(lock.get("acquired", 0) for lock in locks)
     total_contended = lock_stats.get("total_contended", 0)
     total_wait_ns = lock_stats.get("total_wait_ns", 0)
     total_wait_ms = total_wait_ns / 1e6

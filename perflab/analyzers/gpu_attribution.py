@@ -9,8 +9,14 @@ Attribution linking strategies (in priority order):
 1. correlationId join (NSys SQLite) — exact CPU API → GPU kernel mapping
 2. Call chain walking (NSys callchainId) — user-code caller above cudaLaunchKernel
 3. Temporal NVTX matching — kernel start within NVTX range time window
-4. Torch trace cross-reference — PyTorch operator → kernel by timestamp overlap
-5. Py-spy temporal join — Python function on CPU during cudaLaunchKernel call
+4. Py-spy temporal join — Python function on CPU during cudaLaunchKernel call
+
+Note: a torch-trace timestamp cross-reference (matching nsys kernel launch
+timestamps against PyTorch Chrome-trace operator windows) was removed: the
+torch trace comes from a *separate profiling run* than the nsys capture and
+uses a different clock domain, so there is no anchor to align the two
+timelines and any timestamp-based match would be spurious. Framework-op
+attribution for PyTorch relies on NVTX ranges recorded in the same nsys run.
 """
 from __future__ import annotations
 
@@ -121,8 +127,12 @@ def compute_attribution_ranking(
     1. correlationId call graph (exact CPU API → GPU kernel)
     2. Call chain walking (user-code caller from NSys callchainId)
     3. Temporal NVTX matching (kernel within NVTX range time window)
-    4. Torch trace cross-reference (operator → kernel by timestamp overlap)
-    5. Py-spy temporal join (Python function on CPU during kernel launch)
+    4. Py-spy temporal join (Python function on CPU during kernel launch)
+
+    torch_summary is accepted for API compatibility but is not used for
+    temporal matching: torch-trace timestamps come from a separate run and
+    clock domain than nsys, so timestamp joins between them are meaningless
+    (see module docstring).
 
     Ranking heuristic:
         score = (gpu_pct * 2.0)       -- GPU time is the primary optimization target (2x weight)
@@ -146,9 +156,9 @@ def compute_attribution_ranking(
         for h in perf_summary.get("hotspots", []):
             cpu_hotspots[h.get("function", "")] = h.get("pct", 0)
 
-    # Build temporal indices for cross-referencing
+    # Build temporal indices for cross-referencing.
+    # (No torch-trace index: separate run + clock domain, see docstring.)
     nvtx_temporal = _build_nvtx_temporal_index(nvtx_ranges)
-    torch_op_temporal = _build_torch_op_temporal_index(torch_summary)
     pyspy_temporal = _build_pyspy_temporal_index(pyspy_summary)
 
     # Build kernel → correlation timestamp lookup for temporal matching
@@ -198,12 +208,7 @@ def compute_attribution_ranking(
             timestamps = kernel_timestamps.get(name, [])
             framework_op = _match_kernel_to_nvtx_temporal(timestamps, nvtx_temporal)
 
-        # Strategy 4: Torch trace cross-reference
-        if framework_op is None and torch_op_temporal:
-            timestamps = kernel_timestamps.get(name, [])
-            framework_op = _match_kernel_to_torch_op_temporal(timestamps, torch_op_temporal)
-
-        # Strategy 5: Py-spy temporal join (Python function during launch)
+        # Strategy 4: Py-spy temporal join (Python function during launch)
         pyspy_caller: str | None = None
         if pyspy_temporal:
             timestamps = kernel_timestamps.get(name, [])
@@ -211,14 +216,6 @@ def compute_attribution_ranking(
             # Use py-spy caller if we don't have one from call chain
             if caller_function is None and pyspy_caller:
                 caller_function = pyspy_caller
-
-        # Score
-        # 50μs launch overhead threshold: typical cudaLaunchKernel takes ~5-10μs;
-        # >50μs indicates driver/runtime contention worth flagging for CUDA graphs.
-        # 5.0 bonus: enough to promote a kernel with overhead above non-overhead entries at similar gpu_pct
-        overhead_penalty = 5.0 if overhead_us and overhead_us > 50 else 0.0
-        # gpu_pct * 2.0: GPU time is the primary signal; cpu_pct * 0.5: corroborating CPU evidence
-        score = (gpu_pct * 2.0) + ((cpu_pct or 0) * 0.5) + overhead_penalty
 
         suggestions: list[str] = []
         diagnosis = f"Kernel '{name}' consumes {gpu_pct:.0f}% of GPU time ({total_ms:.1f} ms)"
@@ -435,36 +432,6 @@ def _build_nvtx_temporal_index(
     return index
 
 
-def _build_torch_op_temporal_index(
-    torch_summary: dict | None,
-) -> list[tuple[int, int, str]]:
-    """Build temporal index from PyTorch profiler trace operator events.
-
-    Uses the raw Chrome trace events (cpu_op category) with their timestamps.
-    The torch profiler records operator start/duration in microseconds.
-    """
-    if not torch_summary:
-        return []
-
-    # The torch trace stores raw events with ts (microseconds) and dur
-    raw_events = torch_summary.get("_raw_cpu_ops")
-    if not raw_events:
-        return []
-
-    index: list[tuple[int, int, str]] = []
-    for ev in raw_events:
-        name = ev.get("name", "")
-        ts_us = ev.get("ts", 0)
-        dur_us = ev.get("dur", 0)
-        if name and dur_us > 0:
-            # Convert microseconds to nanoseconds to match nsys timestamps
-            start_ns = int(ts_us * 1000)
-            end_ns = int((ts_us + dur_us) * 1000)
-            index.append((start_ns, end_ns, name))
-    index.sort()
-    return index
-
-
 def _build_pyspy_temporal_index(
     pyspy_summary: dict | None,
 ) -> list[tuple[int, int, str]]:
@@ -547,24 +514,6 @@ def _match_kernel_to_nvtx_temporal(
     if cpu_start <= 0:
         return None
     return _find_best_enclosing(cpu_start, nvtx_index)
-
-
-def _match_kernel_to_torch_op_temporal(
-    kernel_timestamps: list[tuple[int, int]],
-    torch_op_index: list[tuple[int, int, str]],
-) -> str | None:
-    """Find the PyTorch operator that temporally contains a kernel launch.
-
-    Note: torch trace timestamps and nsys timestamps use different clocks,
-    so we match by relative position within the trace rather than absolute
-    time when clocks diverge significantly.
-    """
-    if not kernel_timestamps or not torch_op_index:
-        return None
-    cpu_start, _ = kernel_timestamps[0]
-    if cpu_start <= 0:
-        return None
-    return _find_best_enclosing(cpu_start, torch_op_index)
 
 
 def _match_kernel_to_pyspy_temporal(

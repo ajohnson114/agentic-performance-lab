@@ -3,14 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from perflab.analyzers.bottleneck_analyzer import (
     AnalysisThresholds,
     diagnose_bottlenecks,
 )
 from perflab.profilers.ncu_profiler import _parse_ncu_csv
-
 
 # ---------------------------------------------------------------------------
 # NCU Warp Stall Reason parsing

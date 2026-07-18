@@ -15,7 +15,6 @@ from statistics import median
 import jax
 import jax.numpy as jnp
 import yaml
-
 from attention_op import attention
 
 

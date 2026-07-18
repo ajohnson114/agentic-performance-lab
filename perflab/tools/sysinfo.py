@@ -133,7 +133,7 @@ def collect_system_info() -> dict[str, Any]:
             info["tpu_count"] = len(tpu_devices)
     except ImportError:
         pass
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort hardware probe, must not abort sysinfo collection
         logger.warning("JAX device detection failed", exc_info=True)
 
     # Triton version
@@ -189,7 +189,7 @@ def collect_system_info() -> dict[str, Any]:
     # CPU ISA features
     try:
         info["cpu_isa"] = detect_cpu_isa_features()
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort hardware probe, must not abort sysinfo collection
         logger.warning("CPU ISA feature detection failed", exc_info=True)
 
     return info

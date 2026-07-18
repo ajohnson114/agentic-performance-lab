@@ -1,12 +1,7 @@
 """Tests for CUDA SASS disassembly extraction via cuobjdump."""
 from __future__ import annotations
 
-from pathlib import Path
-
-import pytest
-
-from perflab.profilers.ncu_profiler import _parse_sass_dump, _demangle_kernel_name
-
+from perflab.profilers.ncu_profiler import _demangle_kernel_name, _parse_sass_dump
 
 # ---------------------------------------------------------------------------
 # SASS dump parsing

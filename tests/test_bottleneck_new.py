@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from perflab.analyzers.bottleneck_analyzer import (
     AnalysisThresholds,
-    BottleneckDiagnosis,
     _analyze_ebpf,
     _analyze_lock_contention,
     _analyze_memray,

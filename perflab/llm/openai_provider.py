@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Iterator, Sequence
 
 from perflab.llm.base import CompletionResult, Message
+from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 
 @dataclass
@@ -11,7 +12,7 @@ class OpenAIProvider:
     """Uses the openai SDK. Supports native OpenAI and OpenAI-compatible endpoints."""
 
     name: str = "openai"
-    model: str = "gpt-5.4"
+    model: str = PROVIDER_DEFAULT_MODELS["openai"]
     api_key: str = ""
     api_base: str | None = None
 

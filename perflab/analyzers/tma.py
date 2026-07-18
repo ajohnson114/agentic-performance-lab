@@ -39,7 +39,7 @@ class TMAResult:
             "bad_speculation": self.bad_speculation_pct,
             "retiring": self.retiring_pct,
         }
-        return max(vals, key=vals.get)
+        return max(vals, key=lambda k: vals[k])
 
     def to_dict(self) -> dict:
         return {
@@ -56,7 +56,7 @@ def is_tma_available() -> bool:
     if shutil.which("perf") is None:
         return False
     # Check for TopdownL1 metric group
-    res = run_cmd(["perf", "list", "metric"], timeout=5)
+    res = run_cmd(["perf", "list", "metric"], timeout_s=5)
     return "TopdownL1" in res.stdout or "topdown" in res.stdout.lower()
 
 
@@ -73,7 +73,7 @@ def collect_tma(bench_cmd: str, cwd: Path, output_path: Path) -> TMAResult | Non
         "perf", "stat", "-M", "TopdownL1",
         "-o", str(output_path), "--",
     ] + cmd_parts
-    res = run_cmd(stat_cmd, cwd=cwd)
+    run_cmd(stat_cmd, cwd=cwd)
 
     if output_path.exists():
         text = output_path.read_text(encoding="utf-8", errors="replace")
@@ -91,7 +91,7 @@ def collect_tma(bench_cmd: str, cwd: Path, output_path: Path) -> TMAResult | Non
         "perf", "stat", "-e", fallback_events,
         "-o", str(fallback_path), "--",
     ] + cmd_parts
-    res = run_cmd(fallback_cmd, cwd=cwd)
+    run_cmd(fallback_cmd, cwd=cwd)
 
     if fallback_path.exists():
         text = fallback_path.read_text(encoding="utf-8", errors="replace")
@@ -309,7 +309,7 @@ def _collect_toplev(
         "--csv", str(out_file), "--no-desc",
         "--", *cmd_parts,
     ]
-    res = run_cmd(toplev_cmd, cwd=cwd, timeout=120)
+    run_cmd(toplev_cmd, cwd=cwd, timeout_s=120)
 
     if not out_file.exists():
         return None
@@ -408,7 +408,7 @@ def _collect_amd_tma(
         "perf", "stat", "-e", events,
         "-o", str(out_file), "--",
     ] + cmd_parts
-    res = run_cmd(stat_cmd, cwd=cwd)
+    run_cmd(stat_cmd, cwd=cwd)
 
     if not out_file.exists():
         return None
@@ -468,7 +468,7 @@ def format_tma_summary(tma: TMAResult, level2: TMALevel2Result | None = None) ->
     """Format TMA result as human-readable text for LLM prompt."""
     dominant = tma.dominant_bottleneck.replace("_", " ").title()
     lines = [
-        f"Top-Down Microarchitecture Analysis:",
+        "Top-Down Microarchitecture Analysis:",
         f"  Frontend Bound: {tma.frontend_bound_pct:.1f}%",
         f"  Backend Bound:  {tma.backend_bound_pct:.1f}%",
         f"  Bad Speculation: {tma.bad_speculation_pct:.1f}%",

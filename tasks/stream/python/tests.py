@@ -1,6 +1,6 @@
 """Correctness tests for stream operations."""
 import numpy as np
-from stream import stream_copy, stream_scale, stream_add, stream_triad
+from stream import stream_add, stream_copy, stream_scale, stream_triad
 
 
 def test_copy():

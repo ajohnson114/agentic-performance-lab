@@ -288,7 +288,7 @@ def check_hardware() -> list[CheckResult]:
     except ImportError:
         results.append(CheckResult("hw:tpu", "pass", "JAX not installed (TPU requires JAX)"))
         results.append(CheckResult("hw:jax_gpu", "pass", "JAX not installed"))
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort hardware probe, must not abort doctor run
         logger.warning("Could not query JAX devices", exc_info=True)
         results.append(CheckResult("hw:tpu", "pass", "could not query JAX devices"))
         results.append(CheckResult("hw:jax_gpu", "pass", "could not query JAX devices"))
@@ -305,7 +305,7 @@ def check_llm_provider() -> CheckResult:
         if provider.is_available():
             return CheckResult("llm_provider", "pass", f"{cfg.provider}:{cfg.model}")
         return CheckResult("llm_provider", "warn", f"{cfg.provider} configured but not available")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- best-effort provider probe, report as a warn not a crash
         return CheckResult("llm_provider", "warn", f"not configured ({exc})")
 
 

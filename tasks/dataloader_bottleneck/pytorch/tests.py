@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import torch
-from model import SmallClassifier
 from dataset import SyntheticImageDataset
+from model import SmallClassifier
 
 
 def main():

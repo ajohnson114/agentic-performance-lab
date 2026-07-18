@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Iterator, Sequence
 
 from perflab.llm.base import CompletionResult, Message
+from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 
 @dataclass
@@ -11,7 +12,7 @@ class AnthropicProvider:
     """Uses the anthropic SDK. Extracts system message into separate parameter."""
 
     name: str = "anthropic"
-    model: str = "claude-sonnet-4-6"
+    model: str = PROVIDER_DEFAULT_MODELS["anthropic"]
     api_key: str = ""
 
     def is_available(self) -> bool:
@@ -104,5 +105,4 @@ class AnthropicProvider:
             kwargs["stop_sequences"] = list(stop)
 
         with client.messages.stream(**kwargs) as stream:
-            for text in stream.text_stream:
-                yield text
+            yield from stream.text_stream

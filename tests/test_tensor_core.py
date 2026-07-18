@@ -12,7 +12,6 @@ from perflab.analyzers.bottleneck_analyzer import (
 )
 from perflab.profilers.ncu_profiler import _parse_ncu_csv
 
-
 # ---------------------------------------------------------------------------
 # NCU Tensor Core metric parsing
 # ---------------------------------------------------------------------------

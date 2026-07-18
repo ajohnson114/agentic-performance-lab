@@ -6,14 +6,12 @@ via nvidia-smi polling during benchmark execution.
 from __future__ import annotations
 
 import re
-import shlex
 import shutil
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
 
@@ -27,19 +25,17 @@ class PowerProfiler:
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        cmd_parts = shlex.split(bench_cmd)
         summary: dict = {}
         artifacts: dict[str, str] = {}
 
         # --- CPU power via RAPL (perf stat) ---
         if _has_rapl():
             rapl_path = artifacts_dir / "rapl_stat.txt"
-            rapl_cmd = [
+            run_bench_under([
                 "perf", "stat",
                 "-e", "power/energy-pkg/,power/energy-cores/,power/energy-ram/",
                 "-o", str(rapl_path), "--",
-            ] + cmd_parts
-            rapl_res = run_cmd(rapl_cmd, cwd=cwd)
+            ], bench_cmd, cwd=cwd)
             if rapl_path.exists():
                 rapl_data = _parse_rapl_output(rapl_path)
                 if rapl_data:
@@ -62,7 +58,7 @@ class PowerProfiler:
                             ["nvidia-smi",
                              "--query-gpu=power.draw,memory.used,memory.total",
                              "--format=csv,noheader,nounits"],
-                            timeout=5,
+                            timeout_s=5,
                         )
                         if res.returncode == 0:
                             for line in res.stdout.strip().splitlines():
@@ -81,7 +77,7 @@ class PowerProfiler:
                                         })
                                     except (ValueError, IndexError):
                                         pass
-                    except Exception:
+                    except Exception:  # noqa: BLE001 -- best-effort polling loop, a single failed sample must not kill the thread
                         pass
                     stop_event.wait(0.5)
 
@@ -89,7 +85,7 @@ class PowerProfiler:
             poller.start()
 
             # Run the actual benchmark
-            run_cmd(cmd_parts, cwd=cwd)
+            run_bench_under([], bench_cmd, cwd=cwd)
 
             stop_event.set()
             poller.join(timeout=5)
@@ -118,7 +114,7 @@ def _has_rapl() -> bool:
     """Check if RAPL energy events are available via perf."""
     if shutil.which("perf") is None:
         return False
-    res = run_cmd(["perf", "list"], timeout=5)
+    res = run_cmd(["perf", "list"], timeout_s=5)
     return "power/energy-pkg/" in res.stdout
 
 

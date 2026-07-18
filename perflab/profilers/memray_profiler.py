@@ -7,14 +7,12 @@ Requires: pip install memray
 """
 from __future__ import annotations
 
-import json
 import re
-import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 
 
 @dataclass
@@ -34,14 +32,11 @@ class MemrayProfiler:
         stats_path = artifacts_dir / "memray_stats.txt"
         flamegraph_path = artifacts_dir / "memray_flamegraph.html"
 
-        bench_parts = shlex.split(bench_cmd)
-
         # Run memray to capture allocations
-        record_cmd = [
+        res = run_bench_under([
             "memray", "run", "--output", str(bin_path),
             "--force",  # overwrite existing
-        ] + bench_parts
-        res = run_cmd(record_cmd, cwd=cwd)
+        ], bench_cmd, cwd=cwd)
 
         summary: dict = {"returncode": res.returncode}
 

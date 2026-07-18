@@ -3,7 +3,6 @@
 import jax
 import jax.numpy as jnp
 import optax
-
 from model import (
     cross_entropy_loss,
     init_transformer,
@@ -29,12 +28,12 @@ def main():
     # No jit in tests — keep it simple and deterministic
     losses = []
     step_key = jax.random.PRNGKey(123)
-    for step in range(5):
+    for _step in range(5):
         step_key, subkey = jax.random.split(step_key)
         tokens = jax.random.randint(subkey, (batch_size, seq_len), 0, vocab_size)
         inputs, targets = tokens[:, :-1], tokens[:, 1:]
 
-        def loss_fn(p):
+        def loss_fn(p, inputs=inputs, targets=targets):
             logits = transformer_forward(p, inputs, n_heads)
             return cross_entropy_loss(logits, targets)
 
@@ -46,8 +45,8 @@ def main():
         losses.append(loss_val)
 
     # Check: all losses finite
-    for i, l in enumerate(losses):
-        assert jnp.isfinite(l), f"Loss at step {i} is not finite: {l}"
+    for i, loss_i in enumerate(losses):
+        assert jnp.isfinite(loss_i), f"Loss at step {i} is not finite: {loss_i}"
 
     # Check: loss is decreasing overall (last < first)
     assert losses[-1] < losses[0], (
@@ -63,7 +62,7 @@ def main():
     assert -5 <= logit_mean <= 5, f"Logit mean out of range: {logit_mean}"
     assert 0.01 <= logit_std <= 50, f"Logit std out of range: {logit_std}"
 
-    print(f"ok  losses={[f'{l:.4f}' for l in losses]}")
+    print(f"ok  losses={[f'{loss_i:.4f}' for loss_i in losses]}")
 
 
 if __name__ == "__main__":

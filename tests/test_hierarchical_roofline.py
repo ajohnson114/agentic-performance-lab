@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from perflab.reporting.roofline import compute_roofline_point, RooflinePoint
+from perflab.reporting.roofline import RooflinePoint, compute_roofline_point
 from perflab.roofline_peaks import _lookup_l2_bw
-
 
 # ---------------------------------------------------------------------------
 # L2 bandwidth lookup
@@ -111,7 +110,7 @@ class TestProfilerFlopsRoofline:
 
 class TestHierarchicalClassifyBound:
     def test_dram_bottleneck_identified(self):
-        from perflab.optimizers.prompt import _classify_bound, PromptContext
+        from perflab.optimizers.prompt import PromptContext, _classify_bound
 
         ctx = PromptContext(
             source_files={},
@@ -135,7 +134,7 @@ class TestHierarchicalClassifyBound:
         assert result["peak_l2_bw_gbs"] == 6000.0
 
     def test_l2_bottleneck_identified(self):
-        from perflab.optimizers.prompt import _classify_bound, PromptContext
+        from perflab.optimizers.prompt import PromptContext, _classify_bound
 
         ctx = PromptContext(
             source_files={},
@@ -157,7 +156,7 @@ class TestHierarchicalClassifyBound:
         assert result["bw_bottleneck_level"] == "L2-or-below"
 
     def test_no_l2_data_no_level(self):
-        from perflab.optimizers.prompt import _classify_bound, PromptContext
+        from perflab.optimizers.prompt import PromptContext, _classify_bound
 
         ctx = PromptContext(
             source_files={},
@@ -177,7 +176,7 @@ class TestHierarchicalClassifyBound:
         assert result.get("bw_bottleneck_level") is None
 
     def test_compute_bound_no_bw_level(self):
-        from perflab.optimizers.prompt import _classify_bound, PromptContext
+        from perflab.optimizers.prompt import PromptContext, _classify_bound
 
         ctx = PromptContext(
             source_files={},

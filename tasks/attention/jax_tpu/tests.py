@@ -9,7 +9,6 @@ Checks:
 
 import jax
 import jax.numpy as jnp
-
 from attention_op import attention
 
 
@@ -73,7 +72,6 @@ def main():
     )
 
     # Test 4: Causal property — changing future tokens shouldn't affect past output
-    q2 = q.at[:, -1, :].set(0.0)  # zero out last position queries
     k2_mod = k_tensor.at[:, -1, :].set(999.0)  # change last position keys
     out_modified = attention(q, k2_mod, v, n_heads)
     # Output at position 0 should be identical (causal: can't see position -1... well,

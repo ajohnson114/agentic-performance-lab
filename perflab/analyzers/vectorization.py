@@ -8,7 +8,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-
 # SIMD instruction mnemonics by ISA
 _SSE_RE = re.compile(r"\b(movaps|movups|addps|mulps|subps|divps|xorps|andps|"
                      r"movapd|addpd|mulpd|subpd|divpd|maxps|minps|"
@@ -44,98 +43,6 @@ class VectorizationSummary:
     vectorized_count: int = 0
     not_vectorized_count: int = 0
     warning: str = ""
-
-
-def analyze_vectorization(annotated_hotspots: list[dict]) -> VectorizationSummary:
-    """Analyze perf annotate output for SIMD instruction usage.
-
-    Args:
-        annotated_hotspots: Output of linux_perf._parse_perf_annotate().
-            Each entry has {"function": str, "hot_lines": [{"file", "line", "pct"}]}.
-
-    Returns:
-        VectorizationSummary with per-function reports.
-    """
-    summary = VectorizationSummary()
-
-    for entry in annotated_hotspots:
-        func_name = entry.get("function", "unknown")
-        hot_lines = entry.get("hot_lines", [])
-        hot_pct = sum(h.get("pct", 0) for h in hot_lines)
-
-        report = _analyze_function(func_name, entry, hot_pct)
-        summary.functions.append(report)
-
-        if report.has_simd:
-            summary.vectorized_count += 1
-        else:
-            summary.not_vectorized_count += 1
-
-    if summary.not_vectorized_count > 0 and summary.functions:
-        unvectorized = [f.function for f in summary.functions if not f.has_simd]
-        summary.warning = (
-            f"{summary.not_vectorized_count} hot function(s) lack SIMD instructions: "
-            f"{', '.join(unvectorized[:3])}. "
-            f"Consider -O3 -march=native or manual vectorization."
-        )
-
-    return summary
-
-
-def _analyze_function(
-    func_name: str,
-    entry: dict,
-    hot_pct: float,
-) -> VectorizationReport:
-    """Check a single function for SIMD instructions."""
-    # We check the function name and hot_lines content for SIMD mnemonics.
-    # perf annotate hot_lines have source code, not assembly.
-    # We need the raw annotate text for assembly analysis.
-    # Since we only have the parsed hot_lines, check function name patterns.
-
-    # For the parsed data structure, we can check if the entry has raw assembly
-    raw_asm = entry.get("raw_asm", "")
-
-    simd_count = 0
-    total_count = 0
-    best_isa = "none"
-
-    if raw_asm:
-        lines = raw_asm.splitlines()
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith(";") or line.startswith("#"):
-                continue
-            total_count += 1
-
-            if _AVX512_RE.search(line):
-                simd_count += 1
-                if best_isa in ("none", "sse", "avx"):
-                    best_isa = "avx512"
-            elif _AVX_RE.search(line):
-                simd_count += 1
-                if best_isa in ("none", "sse"):
-                    best_isa = "avx"
-            elif _SSE_RE.search(line):
-                simd_count += 1
-                if best_isa == "none":
-                    best_isa = "sse"
-            elif _NEON_RE.search(line):
-                simd_count += 1
-                if best_isa == "none":
-                    best_isa = "neon"
-
-    simd_ratio = simd_count / total_count if total_count > 0 else 0.0
-
-    return VectorizationReport(
-        function=func_name,
-        has_simd=simd_count > 0,
-        simd_isa=best_isa,
-        simd_instruction_count=simd_count,
-        total_instruction_count=total_count,
-        simd_ratio=simd_ratio,
-        hot_pct=hot_pct,
-    )
 
 
 def check_vectorization_from_perf_annotate(annotate_text: str) -> VectorizationSummary:

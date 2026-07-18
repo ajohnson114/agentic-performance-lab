@@ -13,9 +13,8 @@ from statistics import median
 
 import torch
 import yaml
-from torch.profiler import record_function
-
 from model import SmallTransformer
+from torch.profiler import record_function
 
 
 def main():
@@ -66,7 +65,7 @@ def main():
     trace_path = os.environ.get("PERFLAB_TORCH_TRACE_PATH")
     prof = None
     if do_profile:
-        from torch.profiler import profile, ProfilerActivity
+        from torch.profiler import ProfilerActivity, profile
         activities = [ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(ProfilerActivity.CUDA)

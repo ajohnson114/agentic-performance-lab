@@ -8,6 +8,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypeVar
 
 from fastmcp import Context, FastMCP
 
@@ -19,7 +20,10 @@ mcp = FastMCP("perflab", instructions="PerfLab agentic profiling & optimization 
 _MAX_OUTPUT_BYTES = 100_000  # ~100 KB
 
 
-def _guard_output_size(obj: dict | list) -> dict | list:
+_JSONContainer = TypeVar("_JSONContainer", bound="dict | list")
+
+
+def _guard_output_size(obj: _JSONContainer) -> _JSONContainer | dict:
     """If the JSON-serialized output exceeds _MAX_OUTPUT_BYTES, truncate it."""
     encoded = json.dumps(obj, default=str)
     if len(encoded.encode("utf-8", errors="replace")) <= _MAX_OUTPUT_BYTES:
@@ -80,7 +84,7 @@ def list_tasks(tasks_root: str = "tasks") -> list[dict]:
                 "name": data.get("name", p.parent.name),
                 "program_type": data.get("program_type", "python"),
             })
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort listing, a single malformed task.yaml must not abort the scan
             results.append({"path": str(p), "name": p.parent.name, "error": "failed to parse"})
     return results
 
@@ -144,7 +148,7 @@ def show_task(task_yaml: str) -> dict:
                     "tunable_params": tunable,
                     "sweep": sweep,
                 }
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort tuning.yaml display, skip on any parse issue
             pass
 
     return _guard_output_size(result)
@@ -439,7 +443,7 @@ def validate_task(task_yaml: str) -> dict:
 
     try:
         raw = yaml_mod.safe_load(task_path.read_text(encoding="utf-8"))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- validation tool must report any failure as a structured error, never crash
         return {"valid": False, "errors": [f"YAML parse error: {exc}"], "warnings": []}
 
     if not isinstance(raw, dict):
@@ -517,7 +521,7 @@ def validate_task(task_yaml: str) -> dict:
             )
             for err in contract.validate():
                 errors.append(f"Contract: {err}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- validation tool must report any failure as a structured error, never crash
             errors.append(f"Contract parse error: {exc}")
 
     # 9. Full load attempt
@@ -525,7 +529,7 @@ def validate_task(task_yaml: str) -> dict:
         try:
             from perflab.task_spec import TaskSpec
             TaskSpec.load(task_path)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- validation tool must report any failure as a structured error, never crash
             errors.append(f"TaskSpec.load() failed: {exc}")
 
     return {
@@ -758,7 +762,7 @@ def get_bottlenecks(run_id: str, out_dir: str = "out") -> list[dict]:
             mcp_system_info = json.loads(
                 system_info_path.read_text(encoding="utf-8")
             )
-        except Exception:
+        except (json.JSONDecodeError, OSError):
             pass
     diags = diagnose_bottlenecks(summaries, program_type, device=device, system_info=mcp_system_info)
     return [
@@ -870,7 +874,7 @@ def get_build_recommendations(task_yaml: str, run_id: str | None = None, out_dir
             try:
                 sys_info = json.loads(sys_path.read_text(encoding="utf-8"))
                 cpu_isa = sys_info.get("cpu_isa", {})
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
 
         from perflab.memory.run_store import RunStore
@@ -1098,7 +1102,7 @@ def profile_task(task_yaml: str) -> dict:
                 summaries[p.stem.replace("_summary", "")] = json.loads(
                     p.read_text(encoding="utf-8")
                 )
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
 
     return _guard_output_size({
@@ -1161,7 +1165,7 @@ def start_agent(
                     "baseline_value": result.baseline_value,
                     "run_dir": str(result.run_dir),
                 }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- top-level safety net for a background job; any failure must be reported, not crash the thread
             with _lock:
                 _active_runs[job_id]["status"] = "failed"
                 _active_runs[job_id]["error"] = str(exc)
@@ -1205,7 +1209,7 @@ async def optimize_task(
         preflight = await ctx.sample("Respond with OK.", max_tokens=16)
         if not preflight.text:
             return {"error": "MCP sampling pre-flight returned empty response. Your client may not support sampling."}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- feature-detection probe against an arbitrary MCP client, report any failure as unsupported
         return {"error": f"MCP sampling not supported by your client: {exc}"}
 
     # Concurrency guard
@@ -1278,7 +1282,7 @@ async def optimize_task(
             "run_dir": str(result.run_dir),
             "messages": progress.messages[-20:],
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- top-level safety net for the MCP tool call; any failure must be reported, not crash the connection
         return {"status": "failed", "error": str(exc)}
     finally:
         _agent_lock.release()

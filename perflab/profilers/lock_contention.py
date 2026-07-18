@@ -6,12 +6,11 @@ Linux only — requires perf with lock/c2c support.
 from __future__ import annotations
 
 import re
-import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
 
@@ -23,12 +22,11 @@ class LockContentionProfiler:
         if shutil.which("perf") is None:
             return False
         # Check if perf lock subcommand is available
-        res = run_cmd(["perf", "lock", "--help"], timeout=5)
+        res = run_cmd(["perf", "lock", "--help"], timeout_s=5)
         return res.returncode == 0
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        cmd_parts = shlex.split(bench_cmd)
         summary: dict = {}
         artifacts: dict[str, str] = {}
 
@@ -36,8 +34,9 @@ class LockContentionProfiler:
         lock_data = artifacts_dir / "perf_lock.data"
         lock_report_path = artifacts_dir / "perf_lock_report.txt"
 
-        record_cmd = ["perf", "lock", "record", "-o", str(lock_data), "--"] + cmd_parts
-        run_cmd(record_cmd, cwd=cwd)
+        run_bench_under(
+            ["perf", "lock", "record", "-o", str(lock_data), "--"], bench_cmd, cwd=cwd,
+        )
 
         if lock_data.exists():
             report_cmd = ["perf", "lock", "report", "-i", str(lock_data)]
@@ -52,8 +51,9 @@ class LockContentionProfiler:
         c2c_data = artifacts_dir / "perf_c2c.data"
         c2c_report_path = artifacts_dir / "perf_c2c_report.txt"
 
-        c2c_cmd = ["perf", "c2c", "record", "-o", str(c2c_data), "--"] + cmd_parts
-        c2c_res = run_cmd(c2c_cmd, cwd=cwd)
+        c2c_res = run_bench_under(
+            ["perf", "c2c", "record", "-o", str(c2c_data), "--"], bench_cmd, cwd=cwd,
+        )
 
         if c2c_data.exists() and c2c_res.returncode == 0:
             c2c_report_cmd = ["perf", "c2c", "report", "-i", str(c2c_data), "--stdio"]

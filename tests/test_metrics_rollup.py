@@ -1,8 +1,9 @@
 """Tests for perflab.analyzers.metrics_rollup."""
 from __future__ import annotations
 
+import importlib.util
+
 from perflab.analyzers.metrics_rollup import (
-    RunSummary,
     compute_run_summary,
     is_improvement,
     is_statistically_significant,
@@ -36,7 +37,6 @@ class TestComputeRunSummary:
         s = compute_run_summary(history, baseline_value=200.0, mode="minimize")
         assert s.best_value == 100.0
         # speedup for minimize = baseline/val = 200/100 = 2.0
-        accepted_speedups = [200.0 / 200.0, 200.0 / 100.0]  # [1.0, 2.0]
         assert s.median_speedup == 2.0  # median of [1.0, 2.0] = sorted[1] = 2.0
 
     def test_no_accepted_iterations(self):
@@ -99,11 +99,10 @@ class TestIsStatisticallySignificant:
     def test_identical_distributions(self):
         vals = [1.0, 1.0, 1.0, 1.0, 1.0]
         sig, p = is_statistically_significant(vals, vals)
-        try:
-            from scipy.stats import mannwhitneyu
+        if importlib.util.find_spec("scipy") is not None:
             # With scipy, identical values → not significant (p≥0.05)
             assert sig is False
-        except ImportError:
+        else:
             # Without scipy, falls back to (True, 0.0)
             assert sig is True
             assert p == 0.0

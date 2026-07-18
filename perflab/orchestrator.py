@@ -1,22 +1,28 @@
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
-from pathlib import Path
 import json
+import logging
 import shutil
 import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from perflab.analyzers.metrics_rollup import is_improvement
+from perflab.memory.run_store import RunStore
+from perflab.optimizers.propose_params import (
+    load_knobs,
+    propose_knob_sweep,
+    sample_candidates,
+    save_knobs,
+)
+from perflab.reporting.generate import ReportParams, generate_reports
+from perflab.roofline_peaks import resolve_roofline
+from perflab.runners.benchmark import metric_value
+from perflab.runners.pipeline import run_pipeline
+from perflab.task_spec import TaskSpec
 
 logger = logging.getLogger(__name__)
 
-from perflab.task_spec import TaskSpec
-from perflab.memory.run_store import RunStore
-from perflab.runners.benchmark import metric_value
-from perflab.runners.pipeline import run_pipeline
-from perflab.reporting.generate import ReportParams, generate_reports
-from perflab.roofline_peaks import resolve_roofline
-from perflab.analyzers.metrics_rollup import is_improvement
-from perflab.optimizers.propose_params import load_knobs, save_knobs, propose_knob_sweep, sample_candidates
 
 @dataclass
 class IterationRow:
@@ -39,7 +45,7 @@ def profile_only(task: TaskSpec) -> Path:
         (rp.run_dir / "system_info.json").write_text(
             json.dumps(sysinfo, indent=2), encoding="utf-8"
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort system info capture, must not abort the profiling run
         logger.warning("Failed to collect system info", exc_info=True)
 
     result = run_pipeline(
@@ -95,7 +101,7 @@ def optimize(task: TaskSpec, iters: int | None = None, max_trials: int | None = 
         (rp.run_dir / "system_info.json").write_text(
             json.dumps(sysinfo, indent=2), encoding="utf-8"
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort system info capture, must not abort the optimize run
         logger.warning("Failed to collect system info", exc_info=True)
 
     rows: list[IterationRow] = []
@@ -144,7 +150,7 @@ def optimize(task: TaskSpec, iters: int | None = None, max_trials: int | None = 
                         save_logs=True, validate_contract_spec=True,
                     )
                     vi = metric_value(trial_result.bench, task.benchmark.metric.name)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 -- a single bad trial must not abort the whole sweep
                     rows.append(IterationRow(iter=trial, value=rows[-1].value, accepted=False, notes=f"{cand.description} (error: {exc})"))
                     save_knobs(knobs_path, {k: v for k, v in current_knobs.items() if k != "sweep"})
                     continue
@@ -174,7 +180,7 @@ def optimize(task: TaskSpec, iters: int | None = None, max_trials: int | None = 
                         rows.append(IterationRow(iter=best_iter, value=confirmed_val, accepted=True, notes="confirmed re-benchmark"))
                     else:
                         rows.append(IterationRow(iter=best_iter, value=confirmed_val, accepted=False, notes="confirmation re-benchmark did not hold"))
-                except Exception:
+                except Exception:  # noqa: BLE001 -- best-effort confirmation re-benchmark, keep the sweep's winner if it fails
                     logger.warning("Confirmation re-benchmark failed", exc_info=True)
         else:
             # Legacy mode: iterate until no improvement

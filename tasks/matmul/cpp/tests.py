@@ -1,8 +1,8 @@
 """Correctness test: compile and run C++ matmul at small size, verify against numpy."""
 from __future__ import annotations
+
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np

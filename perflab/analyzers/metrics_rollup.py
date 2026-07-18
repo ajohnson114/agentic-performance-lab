@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Literal
 
@@ -49,6 +50,11 @@ def is_improvement(new: float, best: float, mode: Literal["maximize","minimize"]
         return new < best * (1.0 - tol)
 
 
+def calc_speedup(value: float, baseline: float) -> float:
+    """Compute speedup ratio (value / baseline), returning 1.0 if baseline is zero."""
+    return value / baseline if baseline != 0 else 1.0
+
+
 def compute_run_summary(
     history: list[dict],
     baseline_value: float,
@@ -95,8 +101,10 @@ def compute_run_summary(
         best_value = min(values)
 
     # Median and p90 of speedups for accepted iterations (including baseline)
+    # zip() strict= needs Python 3.10+ (this codebase still runs on 3.9); speedups and history
+    # are always the same length (one appended per history entry above), so a plain zip is safe.
     accepted_speedups = [
-        s for s, e in zip(speedups, history) if e.get("accepted", False)
+        s for s, e in zip(speedups, history) if e.get("accepted", False)  # noqa: B905
     ]
     if not accepted_speedups:
         accepted_speedups = [1.0]

@@ -1,5 +1,6 @@
 """Benchmark the pure-Python matmul."""
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -7,7 +8,6 @@ import time
 from pathlib import Path
 
 import yaml
-
 from matmul import matmul, random_matrix
 
 
@@ -39,7 +39,7 @@ def main():
     times_ms = []
     for _ in range(repeats):
         t0 = time.perf_counter()
-        C = matmul(A, B)
+        matmul(A, B)
         t1 = time.perf_counter()
         times_ms.append((t1 - t0) * 1000.0)
 

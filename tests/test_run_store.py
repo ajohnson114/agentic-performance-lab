@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from perflab.memory.run_store import RunPaths, RunStore
-
+from perflab.memory.run_store import RunStore
 
 # ── RunStore.new_run ──────────────────────────────────────────────
 
@@ -292,6 +290,7 @@ class TestUpdateMeta:
 class TestListRunsCLI:
     def test_no_runs(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         runner = CliRunner()
@@ -301,6 +300,7 @@ class TestListRunsCLI:
 
     def test_shows_runs(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -317,6 +317,7 @@ class TestListRunsCLI:
 
     def test_task_filter(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -331,6 +332,7 @@ class TestListRunsCLI:
 
     def test_limit_flag(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -341,7 +343,7 @@ class TestListRunsCLI:
         result = runner.invoke(app, ["list-runs", "--out-dir", str(tmp_path), "--limit", "2"])
         assert result.exit_code == 0
         # Should only show 2 runs
-        lines = [l for l in result.output.strip().splitlines() if l.strip().startswith("20")]
+        lines = [line for line in result.output.strip().splitlines() if line.strip().startswith("20")]
         assert len(lines) == 2
 
 
@@ -365,6 +367,7 @@ class TestCompareCLI:
 
     def test_basic_output(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -386,6 +389,7 @@ class TestCompareCLI:
 
     def test_minimize_metric(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -399,6 +403,7 @@ class TestCompareCLI:
 
     def test_minimize_regression(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -412,6 +417,7 @@ class TestCompareCLI:
 
     def test_not_found(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -424,6 +430,7 @@ class TestCompareCLI:
 
     def test_bottleneck_diff_display(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)
@@ -440,6 +447,7 @@ class TestCompareCLI:
 
     def test_no_values(self, tmp_path: Path):
         from typer.testing import CliRunner
+
         from perflab.cli import app
 
         store = RunStore(tmp_path)

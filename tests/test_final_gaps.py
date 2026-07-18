@@ -3,19 +3,16 @@ memory fragmentation, non-contiguous detection, TC alignment."""
 from __future__ import annotations
 
 import json
-import re
 import textwrap
 from pathlib import Path
 
 import pytest
 
 from perflab.analyzers.bottleneck_analyzer import (
-    AnalysisThresholds,
     diagnose_bottlenecks,
 )
 from perflab.profilers.jax_profiler import _parse_hlo_dump
 from perflab.profilers.pytorch_profiler import _parse_torch_trace
-
 
 # ---------------------------------------------------------------------------
 # JAX AOT Cost Analysis (HLO FLOP extraction)

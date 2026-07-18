@@ -1,8 +1,6 @@
 """Tests for GPU-side multi-cache-level diagnosis (L1 → L2 → DRAM)."""
 from __future__ import annotations
 
-import pytest
-
 from perflab.analyzers.bottleneck_analyzer import diagnose_bottlenecks
 
 

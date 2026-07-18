@@ -68,10 +68,10 @@ def assert_real_tensor(tensor, name: str = "output") -> None:
     try:
         _ = tensor.shape
         _ = tensor.stride()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- any failure accessing shape/stride indicates a non-concrete tensor
         raise AssertionError(
             f"Lazy evaluation detected: {name} has non-concrete shape/stride: {e}"
-        )
+        ) from e
 
     # Check 6: not a nested tensor
     if tensor.is_nested:

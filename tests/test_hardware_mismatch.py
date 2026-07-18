@@ -1,7 +1,7 @@
 """Tests for hardware mismatch detection in perflab.optimizers.agent."""
 from __future__ import annotations
 
-from perflab.optimizers.agent import _check_hardware_mismatch
+from perflab.optimizers.phases.baseline import _check_hardware_mismatch
 
 
 class TestCheckHardwareMismatch:

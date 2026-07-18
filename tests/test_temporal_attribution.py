@@ -1,31 +1,29 @@
 """Tests for temporal CPU-GPU attribution linking.
 
-Tests the four improved attribution strategies:
+Tests the attribution strategies:
 1. Call chain walking (caller_function propagation)
 2. Temporal NVTX matching (kernel within NVTX time window)
-3. Torch trace cross-reference (operator → kernel by timestamp overlap)
-4. Py-spy temporal join (Python function during kernel launch)
+3. Py-spy temporal join (Python function during kernel launch)
+
+Torch-trace timestamp cross-referencing was removed (separate profiling run
+and clock domain than nsys — no valid alignment), so tests also verify that
+torch summaries do NOT produce temporal framework_op matches.
 """
 from __future__ import annotations
 
 from perflab.analyzers.gpu_attribution import (
-    AttributionEntry,
     CpuGpuEdge,
-    KernelDossier,
+    _build_nvtx_temporal_index,
+    _build_pyspy_temporal_index,
+    _find_best_enclosing,
+    _match_kernel_to_nvtx_temporal,
+    _match_kernel_to_pyspy_temporal,
+    _most_common_caller,
     build_cpu_gpu_call_graph,
     build_kernel_dossiers,
     compute_attribution_ranking,
     enrich_with_framework_context,
-    _build_nvtx_temporal_index,
-    _build_torch_op_temporal_index,
-    _build_pyspy_temporal_index,
-    _find_best_enclosing,
-    _match_kernel_to_nvtx_temporal,
-    _match_kernel_to_torch_op_temporal,
-    _match_kernel_to_pyspy_temporal,
-    _most_common_caller,
 )
-
 
 # ---------------------------------------------------------------------------
 # 1. Call chain walking — caller_function propagation
@@ -187,39 +185,14 @@ class TestTemporalNvtxMatching:
 
 
 # ---------------------------------------------------------------------------
-# 3. Torch trace cross-reference
+# 3. Torch trace cross-reference is disabled (cross-clock matching removed)
 # ---------------------------------------------------------------------------
 
-class TestTorchTraceCrossRef:
-    def test_build_torch_op_index(self):
-        torch_summary = {
-            "_raw_cpu_ops": [
-                {"name": "aten::mm", "ts": 1000, "dur": 5000},  # 1000-6000 us
-                {"name": "aten::relu", "ts": 7000, "dur": 2000},
-            ],
-        }
-        index = _build_torch_op_temporal_index(torch_summary)
-        assert len(index) == 2
-        # Timestamps converted from us to ns
-        assert index[0] == (1_000_000, 6_000_000, "aten::mm")
-
-    def test_empty_torch_summary(self):
-        assert _build_torch_op_temporal_index(None) == []
-        assert _build_torch_op_temporal_index({}) == []
-        assert _build_torch_op_temporal_index({"_raw_cpu_ops": []}) == []
-
-    def test_kernel_matched_to_torch_op(self):
-        """Kernel launch within a torch operator's time window is attributed."""
-        torch_index = [
-            (1_000_000, 6_000_000, "aten::mm"),
-            (7_000_000, 9_000_000, "aten::relu"),
-        ]
-        timestamps = [(3_000_000, 3_500_000)]
-        result = _match_kernel_to_torch_op_temporal(timestamps, torch_index)
-        assert result == "aten::mm"
-
-    def test_torch_cross_ref_in_ranking(self):
-        """Torch trace cross-reference works in the full ranking pipeline."""
+class TestTorchTraceCrossRefDisabled:
+    def test_torch_summary_produces_no_temporal_match(self):
+        """Torch trace timestamps come from a separate run/clock domain than
+        nsys, so no framework_op may be derived from timestamp matching —
+        even when the (meaningless) numbers happen to overlap."""
         nsys = {
             "top_kernels": [
                 {"name": "volta_sgemm_128x128_nn", "pct": 85.0, "total_ms": 100},
@@ -234,7 +207,36 @@ class TestTorchTraceCrossRef:
         }
         torch_summary = {
             "_raw_cpu_ops": [
-                {"name": "aten::mm", "ts": 1000, "dur": 5000},  # 1M - 6M ns
+                # Would "enclose" cpu_start_ns after us→ns conversion, but the
+                # clocks are unrelated so this must not produce a match.
+                {"name": "aten::mm", "ts": 1000, "dur": 5000},
+            ],
+        }
+        ranking = compute_attribution_ranking(nsys, torch_summary=torch_summary)
+        assert ranking[0].framework_op is None
+
+    def test_nvtx_still_matches_with_torch_summary_present(self):
+        """NVTX ranges (recorded in the same nsys run) still drive
+        framework_op attribution when a torch summary is also passed."""
+        nsys = {
+            "top_kernels": [
+                {"name": "volta_sgemm_128x128_nn", "pct": 85.0, "total_ms": 100},
+            ],
+            "cpu_gpu_correlations": [
+                {"api_name": "cudaLaunchKernel",
+                 "kernel_name": "volta_sgemm_128x128_nn",
+                 "stream_id": 1, "gpu_duration_ns": 100_000_000,
+                 "launch_overhead_ns": 10_000,
+                 "cpu_start_ns": 5_000_000, "gpu_start_ns": 5_100_000},
+            ],
+            "nvtx_ranges": [
+                {"name": "aten::mm", "duration_ms": 10.0, "pct": 80.0,
+                 "start_ns": 1_000_000, "end_ns": 15_000_000},
+            ],
+        }
+        torch_summary = {
+            "_raw_cpu_ops": [
+                {"name": "torch_only_op", "ts": 1000, "dur": 5000},
             ],
         }
         ranking = compute_attribution_ranking(nsys, torch_summary=torch_summary)
@@ -356,7 +358,8 @@ class TestEnrichWithTemporalNvtx:
 
 class TestAttributionPriority:
     def test_strategy_priority_order(self):
-        """Verify strategies are applied in priority: callchain > NVTX > torch > pyspy."""
+        """Verify strategies are applied in priority: callchain > NVTX > pyspy
+        (torch temporal matching removed — torch_summary must not win)."""
         nsys = {
             "top_kernels": [
                 {"name": "my_kernel", "pct": 90.0, "total_ms": 200},
@@ -425,10 +428,11 @@ class TestAttributionPriority:
 
 class TestSpeedscopeParsing:
     def test_parse_sampled_profile(self):
-        from perflab.profilers.python_pyspy import _parse_speedscope_json
-        from pathlib import Path
         import json
         import tempfile
+        from pathlib import Path
+
+        from perflab.profilers.python_pyspy import _parse_speedscope_json
 
         data = {
             "$schema": "https://www.speedscope.app/file-format-schema.json",
@@ -471,10 +475,11 @@ class TestSpeedscopeParsing:
         assert result[0]["dur_ns"] == 10000000
 
     def test_parse_evented_profile(self):
-        from perflab.profilers.python_pyspy import _parse_speedscope_json
-        from pathlib import Path
         import json
         import tempfile
+        from pathlib import Path
+
+        from perflab.profilers.python_pyspy import _parse_speedscope_json
 
         data = {
             "shared": {
@@ -509,8 +514,9 @@ class TestSpeedscopeParsing:
         assert forward["dur_ns"] == 40_000_000  # 40ms duration
 
     def test_parse_empty_file(self):
-        from perflab.profilers.python_pyspy import _parse_speedscope_json
         from pathlib import Path
+
+        from perflab.profilers.python_pyspy import _parse_speedscope_json
         assert _parse_speedscope_json(Path("/nonexistent/file.json")) == []
 
 
@@ -520,10 +526,11 @@ class TestSpeedscopeParsing:
 
 class TestTorchTraceRawOps:
     def test_raw_cpu_ops_extracted(self):
-        from perflab.profilers.pytorch_profiler import _parse_torch_trace
-        from pathlib import Path
         import json
         import tempfile
+        from pathlib import Path
+
+        from perflab.profilers.pytorch_profiler import _parse_torch_trace
 
         trace = {
             "traceEvents": [

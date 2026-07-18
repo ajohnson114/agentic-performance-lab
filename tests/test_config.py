@@ -3,25 +3,17 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import yaml
 
 from perflab.config import (
-    PerfLabConfig,
-    LLMSection,
-    BenchmarkSection,
-    ProfilerSection,
-    MPSSection,
-    OllamaSection,
-    AgentSection,
-    load_config,
-    _overlay_yaml,
-    _overlay_env,
     DEFAULT_CONFIG_TEMPLATE,
+    PerfLabConfig,
+    _overlay_env,
+    _overlay_yaml,
+    load_config,
 )
-
 
 # ---------------------------------------------------------------------------
 # Dataclass defaults
@@ -31,7 +23,7 @@ class TestDefaults:
     def test_default_config_values(self):
         cfg = PerfLabConfig()
         assert cfg.llm.provider == "openai"
-        assert cfg.llm.model == "gpt-5.2"
+        assert cfg.llm.model == "gpt-5.6"
         assert cfg.benchmark.warmup == 3
         assert cfg.benchmark.repeats == 20
         assert cfg.profiler.torch_with_flops is True

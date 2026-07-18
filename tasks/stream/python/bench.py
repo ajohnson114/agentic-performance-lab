@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from stream import run_stream, N
+from stream import N, run_stream
 
 
 def main():

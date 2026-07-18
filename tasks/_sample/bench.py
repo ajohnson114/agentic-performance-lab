@@ -18,7 +18,6 @@ from pathlib import Path
 from statistics import median
 
 import yaml
-
 from sample import sum_of_squares
 
 

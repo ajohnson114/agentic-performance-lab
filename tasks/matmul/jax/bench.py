@@ -1,5 +1,6 @@
 """Benchmark JAX jnp.matmul (no jit — agent must discover and add it)."""
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -9,7 +10,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import yaml
-
 from matmul_op import matmul_op
 
 

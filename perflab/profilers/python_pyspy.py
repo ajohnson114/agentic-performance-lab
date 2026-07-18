@@ -1,10 +1,11 @@
 from __future__ import annotations
+
+import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
-import logging
-import shlex
-import shutil
-from perflab.profilers.base import ProfileResult
+
+from perflab.profilers.base import ProfileResult, run_bench_with_sudo_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -135,32 +136,26 @@ class PySpyProfiler:
         artifacts_dir = artifacts_dir.resolve()
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         out_speedscope = artifacts_dir / "pyspy_speedscope.json"
-        from perflab.tools.shell import run_cmd
-        bench_parts = shlex.split(bench_cmd)
 
         # Speedscope JSON gives structured data + timestamps for temporal
         # GPU cross-referencing in a single run (no second benchmark execution).
-        base_cmd = ["py-spy", "record", "--native", "--format", "speedscope",
-                    "-o", str(out_speedscope), "--"] + bench_parts
-        res = run_cmd(base_cmd, cwd=cwd)
+        # Each attempt escalates to sudo when the non-sudo run failed and
+        # produced no artifact (see run_bench_with_sudo_fallback).
+        res, _ = run_bench_with_sudo_fallback(
+            ["py-spy", "record", "--native", "--format", "speedscope",
+             "-o", str(out_speedscope), "--"],
+            bench_cmd, cwd, expect_artifact=out_speedscope,
+        )
         native_mode = True
-
-        # Escalate to sudo if non-sudo failed and sudo is available
-        if res.returncode != 0 and not out_speedscope.exists() and shutil.which("sudo"):
-            sudo_cmd = ["sudo", "-n"] + base_cmd
-            res = run_cmd(sudo_cmd, cwd=cwd)
 
         # Fall back to without --native (some platforms don't support it)
         if res.returncode != 0 and not out_speedscope.exists():
-            base_cmd = ["py-spy", "record", "--format", "speedscope",
-                        "-o", str(out_speedscope), "--"] + bench_parts
-            res = run_cmd(base_cmd, cwd=cwd)
+            res, _ = run_bench_with_sudo_fallback(
+                ["py-spy", "record", "--format", "speedscope",
+                 "-o", str(out_speedscope), "--"],
+                bench_cmd, cwd, expect_artifact=out_speedscope,
+            )
             native_mode = False
-
-            if res.returncode != 0 and not out_speedscope.exists() and shutil.which("sudo"):
-                sudo_cmd = ["sudo", "-n"] + base_cmd
-                res = run_cmd(sudo_cmd, cwd=cwd)
-                native_mode = False
 
         summary: dict = {
             "returncode": res.returncode,

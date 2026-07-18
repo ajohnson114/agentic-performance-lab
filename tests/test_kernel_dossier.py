@@ -1,14 +1,11 @@
 """Tests for unified kernel dossier: attribution + NCU + SASS matching and rendering."""
 from __future__ import annotations
 
-import pytest
-
 from perflab.analyzers.gpu_attribution import (
     KernelDossier,
     _match_kernel,
     build_kernel_dossiers,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fuzzy kernel name matching
@@ -184,7 +181,6 @@ class TestBuildKernelDossiers:
 
 class TestDossierPromptRendering:
     def test_dossier_renders_in_prompt(self):
-        from perflab.analyzers.gpu_attribution import KernelDossier
         from perflab.optimizers.prompt import PromptContext, build_prompt
 
         dossier = KernelDossier(
@@ -230,7 +226,6 @@ class TestDossierPromptRendering:
 
     def test_dossier_suppresses_standalone_sass(self):
         """When dossiers are present, standalone SASS section should not render."""
-        from perflab.analyzers.gpu_attribution import KernelDossier
         from perflab.optimizers.prompt import PromptContext, build_prompt
 
         dossier = KernelDossier(

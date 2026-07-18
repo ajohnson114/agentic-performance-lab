@@ -15,7 +15,6 @@ from statistics import median
 
 import torch
 import yaml
-
 from pipeline import run_pipeline
 
 

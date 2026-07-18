@@ -1,23 +1,19 @@
 """Tests for TMA Level 2/3, profiler-driven flag recommendations, and flag tracking."""
 from __future__ import annotations
 
-import pytest
-
-from perflab.analyzers.tma import (
-    TMALevel2Result,
-    _parse_toplev_output,
-    _parse_amd_tma,
-    format_tma_summary,
-    TMAResult,
-)
-from perflab.analyzers.build_flags import (
-    FlagRecommendation,
-    recommend_flags_from_profiling,
-)
 from perflab.analyzers.bottleneck_analyzer import (
     diagnose_bottlenecks,
 )
-
+from perflab.analyzers.build_flags import (
+    recommend_flags_from_profiling,
+)
+from perflab.analyzers.tma import (
+    TMALevel2Result,
+    TMAResult,
+    _parse_amd_tma,
+    _parse_toplev_output,
+    format_tma_summary,
+)
 
 # ---------------------------------------------------------------------------
 # TMA Level 2 parsing (toplev)

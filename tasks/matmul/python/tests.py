@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import numpy as np
-
 from matmul import matmul, random_matrix
 
 

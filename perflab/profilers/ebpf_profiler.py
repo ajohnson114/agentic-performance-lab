@@ -10,15 +10,13 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
-
+from perflab.profilers.base import ProfileResult, run_bench_under
 
 # One-liner bpftrace scripts for common patterns
 _SYSCALL_LATENCY_SCRIPT = r"""
@@ -62,8 +60,6 @@ class EbpfProfiler:
         return shutil.which("bpftrace") is not None
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
-        from perflab.tools.shell import run_cmd
-
         artifacts_dir = artifacts_dir.resolve()
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,7 +91,7 @@ class EbpfProfiler:
                 time.sleep(0.5)
 
                 # Run the benchmark synchronously
-                res = run_cmd(shlex.split(bench_cmd), cwd=cwd)
+                res = run_bench_under([], bench_cmd, cwd=cwd)
                 bench_returncode = res.returncode
         finally:
             if bpf_proc is not None:

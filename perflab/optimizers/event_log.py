@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +98,14 @@ class AgentEventLog:
             "blocks": block_summaries,
         })
 
+    def patch_fuzzy_correction(
+        self, iteration: int, candidate_index: int, notices: list[str],
+    ) -> None:
+        self._write("patch_fuzzy_correction", iteration, {
+            "candidate_index": candidate_index,
+            "notices": notices,
+        })
+
     def candidate_correctness(
         self, iteration: int, candidate_index: int,
         passed: bool, returncode: int, stderr_preview: str,
@@ -155,6 +163,15 @@ class AgentEventLog:
     ) -> None:
         self._write("anti_gaming_warning", iteration, {
             "check_type": check_type,
+            "details": details,
+            "candidate_index": candidate_index,
+        })
+
+    def rlimit_warning(
+        self, iteration: int, details: str,
+        candidate_index: int | None = None,
+    ) -> None:
+        self._write("rlimit_warning", iteration, {
             "details": details,
             "candidate_index": candidate_index,
         })
@@ -246,6 +263,10 @@ def replay_events(run_dir: Path) -> str:
             for b in blocks:
                 lines.append(f"{iter_str}    Patch: {b['file_path']} (search: {b['search_preview']!r}...)")
 
+        elif et == "patch_fuzzy_correction":
+            for note in ev.get("notices", []):
+                lines.append(f"{iter_str}  ⚠ FUZZY PATCH CORRECTION (candidate {ev.get('candidate_index', '?')}): {note}")
+
         elif et == "candidate_correctness":
             status = "PASSED" if ev["passed"] else f"FAILED (rc={ev['returncode']})"
             lines.append(f"{iter_str}  Correctness: {status}")
@@ -277,11 +298,14 @@ def replay_events(run_dir: Path) -> str:
         elif et == "anti_gaming_warning":
             lines.append(f"{iter_str}  ⚠ ANTI-GAMING [{ev.get('check_type', '?')}]: {ev.get('details', '')}")
 
+        elif et == "rlimit_warning":
+            lines.append(f"{iter_str}  ⚠ RLIMIT WARNING: {ev.get('details', '')}")
+
         elif et == "early_stop":
             lines.append(f"\n{iter_str}EARLY STOP: {ev['reason']}")
 
         elif et == "run_complete":
-            lines.append(f"\n=== Run Complete ===")
+            lines.append("\n=== Run Complete ===")
             lines.append(f"  Baseline: {ev['baseline_value']:.6g}")
             lines.append(f"  Best: {ev['best_value']:.6g} (iter {ev['best_iter']})")
             lines.append(f"  Iterations: {ev['total_iterations']}, LLM calls: {ev['total_llm_calls']}")

@@ -111,7 +111,9 @@ def assert_ulp_close(
     ulp_dists = []
     a_list = a_sampled.tolist()
     r_list = r_sampled.tolist()
-    for a_val, r_val in zip(a_list, r_list):
+    # a_list/r_list are always the same length (sliced/derived together above); zip() strict=
+    # needs Python 3.10+ and this codebase still runs on 3.9.
+    for a_val, r_val in zip(a_list, r_list):  # noqa: B905
         ulp_dists.append(_ulp_distance(a_val, r_val))
 
     ulp_dists.sort()

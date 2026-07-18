@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
+from perflab.profilers.interval_union import union_duration
 from perflab.tools.shell import run_cmd
 
 logger = logging.getLogger(__name__)
@@ -23,16 +23,14 @@ class NsysProfiler:
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
         report_base = artifacts_dir / "nsys_report"
-        cmd_parts = shlex.split(bench_cmd)
 
         # nsys profile with stats
-        profile_cmd = [
+        profile_res = run_bench_under([
             "nsys", "profile",
             "--stats=true",
             f"--output={report_base}",
             "--force-overwrite=true",
-        ] + cmd_parts
-        profile_res = run_cmd(profile_cmd, cwd=cwd)
+        ], bench_cmd, cwd=cwd)
 
         nsys_rep = Path(f"{report_base}.nsys-rep")
         sqlite_path = Path(f"{report_base}.sqlite")
@@ -254,20 +252,24 @@ def _extract_top_api_calls(conn: sqlite3.Connection, result: dict) -> None:
 
 
 def _extract_gpu_utilization(conn: sqlite3.Connection, result: dict) -> None:
-    """GPU active percentage = kernel time / trace span."""
-    row = conn.execute("""
-        SELECT SUM(end-start) AS total_ns,
-               MIN(start)     AS first_start,
-               MAX(end)       AS last_end
-        FROM CUPTI_ACTIVITY_KIND_KERNEL
-    """).fetchone()
-    if not row or row["total_ns"] is None:
+    """GPU active percentage = union of kernel busy intervals / trace span.
+
+    Kernels can run concurrently on multiple streams, so summing per-kernel
+    durations double-counts overlap (and can exceed 100%). The GPU is
+    "active" whenever at least one kernel is running, i.e. the interval union.
+    """
+    rows = conn.execute(
+        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL"
+    ).fetchall()
+    intervals = [(r["start"], r["end"]) for r in rows
+                 if r["start"] is not None and r["end"] is not None]
+    if not intervals:
         return
 
-    total_ns = row["total_ns"]
-    span_ns = row["last_end"] - row["first_start"]
+    busy_ns = union_duration(intervals)
+    span_ns = max(e for _, e in intervals) - min(s for s, _ in intervals)
     if span_ns > 0:
-        result["gpu_active_pct"] = round(total_ns / span_ns * 100.0, 1)
+        result["gpu_active_pct"] = round(busy_ns / span_ns * 100.0, 1)
 
 
 def _extract_kernel_gaps(conn: sqlite3.Connection, result: dict) -> None:
@@ -572,7 +574,7 @@ def _extract_callchain_context(conn: sqlite3.Connection, result: dict) -> None:
 
     # Load call chain entries — try common table names across nsys versions
     chain_entries: dict[int, list[dict]] = {}
-    for chain_table, symbol_col in [
+    for chain_table, _symbol_col in [
         ("CallchainIds", "symbol"),
         ("CALLCHAIN", "symbol"),
     ]:

@@ -1,15 +1,12 @@
 """Tests for CUTLASS baseline configurations and auto-tuning integration."""
 from __future__ import annotations
 
-import pytest
-
 from perflab.analyzers.cutlass_baselines import (
     TileConfig,
-    lookup_cutlass_config,
-    generate_sweep_around_baseline,
     format_cutlass_hint,
+    generate_sweep_around_baseline,
+    lookup_cutlass_config,
 )
-
 
 # ---------------------------------------------------------------------------
 # CUTLASS config lookup

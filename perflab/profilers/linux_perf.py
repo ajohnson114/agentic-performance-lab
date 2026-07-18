@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
 logger = logging.getLogger(__name__)
@@ -57,24 +56,20 @@ class LinuxPerfProfiler:
         perf_data = artifacts_dir / "perf.data"
         script_path = artifacts_dir / "perf_script.txt"
 
-        cmd_parts = shlex.split(bench_cmd)
-
         # perf stat: high-level counters with specific events
-        stat_cmd = [
+        stat_res = run_bench_under([
             "perf", "stat",
             "-e", "cycles,instructions,cache-references,cache-misses,"
                   "branch-instructions,branch-misses,"
                   "L1-dcache-load-misses,LLC-load-misses,"
                   "task-clock",
             "-o", str(stat_path), "--",
-        ] + cmd_parts
-        stat_res = run_cmd(stat_cmd, cwd=cwd)
+        ], bench_cmd, cwd=cwd)
 
         # perf record: call graph sampling
-        record_cmd = [
-            "perf", "record", "-g", "-o", str(perf_data), "--"
-        ] + cmd_parts
-        record_res = run_cmd(record_cmd, cwd=cwd)
+        record_res = run_bench_under(
+            ["perf", "record", "-g", "-o", str(perf_data), "--"], bench_cmd, cwd=cwd,
+        )
 
         # perf script: export call stacks for analysis
         if perf_data.exists():
@@ -173,6 +168,7 @@ def _parse_perf_stat(path: Path) -> dict:
         count_str = m.group(1).replace(",", "")
         event = m.group(2)
 
+        count: int | float
         try:
             count = int(count_str)
         except ValueError:

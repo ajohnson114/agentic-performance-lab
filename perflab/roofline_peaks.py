@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -21,119 +22,330 @@ class Peaks:
     dtype_peaks: dict[str, float] | None = None  # per-dtype peaks if available
 
 
-# Known per-dtype peaks (TFLOPS) for common GPUs.
-# Values are theoretical peaks for tensor core / CUDA core operations.
-_KNOWN_GPU_DTYPE_PEAKS: dict[str, dict[str, float]] = {
-    "A100": {
-        "peak_tflops_fp32": 19.5,
-        "peak_tflops_tf32": 156.0,
-        "peak_tflops_fp16": 312.0,
-        "peak_tflops_bf16": 312.0,
-    },
-    "A100-SXM": {
-        "peak_tflops_fp32": 19.5,
-        "peak_tflops_tf32": 156.0,
-        "peak_tflops_fp16": 312.0,
-        "peak_tflops_bf16": 312.0,
-    },
-    "H100": {
-        "peak_tflops_fp32": 67.0,
-        "peak_tflops_tf32": 989.0,
-        "peak_tflops_fp16": 1979.0,
-        "peak_tflops_bf16": 1979.0,
-    },
-    "H100-SXM": {
-        "peak_tflops_fp32": 67.0,
-        "peak_tflops_tf32": 989.0,
-        "peak_tflops_fp16": 1979.0,
-        "peak_tflops_bf16": 1979.0,
-    },
-    "RTX 4090": {
-        "peak_tflops_fp32": 82.6,
-        "peak_tflops_tf32": 82.6,
-        "peak_tflops_fp16": 165.2,
-        "peak_tflops_bf16": 165.2,
-    },
-    "RTX 4080": {
-        "peak_tflops_fp32": 48.7,
-        "peak_tflops_tf32": 48.7,
-        "peak_tflops_fp16": 97.5,
-        "peak_tflops_bf16": 97.5,
-    },
-    "RTX 3090": {
-        "peak_tflops_fp32": 35.6,
-        "peak_tflops_tf32": 71.0,
-        "peak_tflops_fp16": 142.0,
-        "peak_tflops_bf16": 142.0,
-    },
-    "V100": {
-        "peak_tflops_fp32": 15.7,
-        "peak_tflops_fp16": 125.0,
-    },
-}
+@dataclass(frozen=True)
+class GpuSpec:
+    """One consolidated spec-sheet entry per known GPU.
+
+    Adding a GPU means adding a single entry to _KNOWN_GPU_SPECS below.
+
+    dtype_peaks: theoretical per-dtype peaks (TFLOPS) for tensor core /
+        CUDA core operations.
+    mem_bw_gbs: spec-sheet HBM/GDDR bandwidth (GB/s). Kept as a separate
+        field rather than folded into dtype_peaks, since downstream
+        consumers of dtype_peaks treat it as TFLOPS-only.
+    l2_bw_gbs: approximate peak aggregate L2 read bandwidth across all SMs
+        (GB/s). L2 is the practical upper bound for data-reuse-heavy
+        kernels (tiled matmuls).
+    smem_per_sm_kb / num_sms / max_regs_per_sm: SM resource limits for
+        hardware context in LLM prompts (configurable shared memory per SM,
+        number of streaming multiprocessors, registers per SM;
+        max_regs_per_thread is always 255 for CUDA -- a hardware limit).
+    """
+
+    dtype_peaks: dict[str, float]
+    mem_bw_gbs: float | None = None
+    l2_bw_gbs: float | None = None
+    smem_per_sm_kb: int | None = None
+    num_sms: int | None = None
+    max_regs_per_sm: int | None = None
 
 
-# Known L2 cache bandwidth (GB/s) for common GPUs.
-# L2 is the practical upper bound for data-reuse-heavy kernels (tiled matmuls).
-# Values are approximate peak aggregate read bandwidth across all SMs.
-_KNOWN_GPU_L2_BW: dict[str, float] = {
-    "A100": 6000.0,       # 40 MB L2, ~6 TB/s aggregate read
-    "A100-SXM": 6000.0,
-    "H100": 12000.0,      # 50 MB L2, ~12 TB/s aggregate read
-    "H100-SXM": 12000.0,
-    "RTX 4090": 3200.0,   # 72 MB L2, ~3.2 TB/s
-    "RTX 4080": 2400.0,   # 64 MB L2, ~2.4 TB/s
-    "RTX 3090": 2400.0,   # 6 MB L2, ~2.4 TB/s
-    "V100": 3100.0,       # 6 MB L2, ~3.1 TB/s
+# Known specs for common GPUs (per-dtype peaks, memory/L2 bandwidth, SM
+# resource limits -- see GpuSpec).
+# Keys are matched two ways against a real `nvidia-smi --query-gpu=name`
+# string: an exact match against a full marketing name (tier 1, source=
+# "table"), or -- logged as an unverified "assumed" match, never claiming
+# source="table" -- a substring match against a short legacy key. The short
+# keys stay ambiguous on purpose: e.g. "H100" alone can't tell PCIe/SXM/NVL
+# apart even though they differ ~1.6x on bandwidth, so callers that need a
+# real nvidia-smi name resolved should prefer an exact hit or fall through to
+# the computed/measured tiers instead of trusting a substring guess.
+# NOTE: insertion order matters -- the substring lookups iterate in order, so
+# the full marketing names must stay ahead of the short legacy keys.
+_KNOWN_GPU_SPECS: dict[str, GpuSpec] = {
+    # --- Full nvidia-smi marketing names (tier 1 candidates) ---
+    "NVIDIA A100-SXM4-40GB": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 19.5,
+            "peak_tflops_tf32": 156.0,
+            "peak_tflops_fp16": 312.0,
+            "peak_tflops_bf16": 312.0,
+        },
+        mem_bw_gbs=1555.0,
+    ),
+    "NVIDIA A100-SXM4-80GB": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 19.5,
+            "peak_tflops_tf32": 156.0,
+            "peak_tflops_fp16": 312.0,
+            "peak_tflops_bf16": 312.0,
+        },
+        mem_bw_gbs=2039.0,
+    ),
+    "NVIDIA A100-PCIE-40GB": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 19.5,
+            "peak_tflops_tf32": 156.0,
+            "peak_tflops_fp16": 312.0,
+            "peak_tflops_bf16": 312.0,
+        },
+        mem_bw_gbs=1555.0,
+    ),
+    "NVIDIA A100 80GB PCIe": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 19.5,
+            "peak_tflops_tf32": 156.0,
+            "peak_tflops_fp16": 312.0,
+            "peak_tflops_bf16": 312.0,
+        },
+        mem_bw_gbs=1935.0,
+    ),
+    "NVIDIA H100 80GB HBM3": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 67.0,
+            "peak_tflops_tf32": 989.0,
+            "peak_tflops_fp16": 1979.0,
+            "peak_tflops_bf16": 1979.0,
+        },
+        mem_bw_gbs=3352.0,
+    ),
+    "NVIDIA H100 PCIe": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 51.0,
+            "peak_tflops_tf32": 756.0,
+            "peak_tflops_fp16": 1513.0,
+            "peak_tflops_bf16": 1513.0,
+        },
+        mem_bw_gbs=2039.0,
+    ),
+    "NVIDIA H100 NVL": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 67.0,
+            "peak_tflops_tf32": 989.0,
+            "peak_tflops_fp16": 1979.0,
+            "peak_tflops_bf16": 1979.0,
+        },
+        mem_bw_gbs=3900.0,
+    ),
+    "NVIDIA GeForce RTX 4090": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 82.6,
+            "peak_tflops_tf32": 82.6,
+            "peak_tflops_fp16": 165.2,
+            "peak_tflops_bf16": 165.2,
+        },
+        mem_bw_gbs=1008.0,
+    ),
+    "NVIDIA GeForce RTX 4080": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 48.7,
+            "peak_tflops_tf32": 48.7,
+            "peak_tflops_fp16": 97.5,
+            "peak_tflops_bf16": 97.5,
+        },
+        mem_bw_gbs=716.8,
+    ),
+    "NVIDIA GeForce RTX 3090": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 35.6,
+            "peak_tflops_tf32": 71.0,
+            "peak_tflops_fp16": 142.0,
+            "peak_tflops_bf16": 142.0,
+        },
+        mem_bw_gbs=936.2,
+    ),
+    "Tesla V100-SXM2-16GB": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 15.7,
+            "peak_tflops_fp16": 125.0,
+        },
+        mem_bw_gbs=900.0,
+    ),
+    "Tesla V100-PCIE-16GB": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 14.0,
+            "peak_tflops_fp16": 112.0,
+        },
+        mem_bw_gbs=900.0,
+    ),
+    # --- Short legacy keys: substring/"assumed" match only, see note above ---
+    "A100": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 19.5,
+            "peak_tflops_tf32": 156.0,
+            "peak_tflops_fp16": 312.0,
+            "peak_tflops_bf16": 312.0,
+        },
+        mem_bw_gbs=1555.0,
+        l2_bw_gbs=6000.0,  # 40 MB L2, ~6 TB/s aggregate read
+        smem_per_sm_kb=164,
+        num_sms=108,
+        max_regs_per_sm=65536,
+    ),
+    "A100-SXM": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 19.5,
+            "peak_tflops_tf32": 156.0,
+            "peak_tflops_fp16": 312.0,
+            "peak_tflops_bf16": 312.0,
+        },
+        mem_bw_gbs=2039.0,
+        l2_bw_gbs=6000.0,
+        smem_per_sm_kb=164,
+        num_sms=108,
+        max_regs_per_sm=65536,
+    ),
+    "H100": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 67.0,
+            "peak_tflops_tf32": 989.0,
+            "peak_tflops_fp16": 1979.0,
+            "peak_tflops_bf16": 1979.0,
+        },
+        mem_bw_gbs=3352.0,
+        l2_bw_gbs=12000.0,  # 50 MB L2, ~12 TB/s aggregate read
+        smem_per_sm_kb=228,
+        num_sms=132,
+        max_regs_per_sm=65536,
+    ),
+    "H100-SXM": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 67.0,
+            "peak_tflops_tf32": 989.0,
+            "peak_tflops_fp16": 1979.0,
+            "peak_tflops_bf16": 1979.0,
+        },
+        mem_bw_gbs=3352.0,
+        l2_bw_gbs=12000.0,
+        smem_per_sm_kb=228,
+        num_sms=132,
+        max_regs_per_sm=65536,
+    ),
+    "RTX 4090": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 82.6,
+            "peak_tflops_tf32": 82.6,
+            "peak_tflops_fp16": 165.2,
+            "peak_tflops_bf16": 165.2,
+        },
+        mem_bw_gbs=1008.0,
+        l2_bw_gbs=3200.0,  # 72 MB L2, ~3.2 TB/s
+        smem_per_sm_kb=100,
+        num_sms=128,
+        max_regs_per_sm=65536,
+    ),
+    "RTX 4080": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 48.7,
+            "peak_tflops_tf32": 48.7,
+            "peak_tflops_fp16": 97.5,
+            "peak_tflops_bf16": 97.5,
+        },
+        mem_bw_gbs=716.8,
+        l2_bw_gbs=2400.0,  # 64 MB L2, ~2.4 TB/s
+        smem_per_sm_kb=100,
+        num_sms=76,
+        max_regs_per_sm=65536,
+    ),
+    "RTX 3090": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 35.6,
+            "peak_tflops_tf32": 71.0,
+            "peak_tflops_fp16": 142.0,
+            "peak_tflops_bf16": 142.0,
+        },
+        mem_bw_gbs=936.2,
+        l2_bw_gbs=2400.0,  # 6 MB L2, ~2.4 TB/s
+        smem_per_sm_kb=100,
+        num_sms=82,
+        max_regs_per_sm=65536,
+    ),
+    "V100": GpuSpec(
+        dtype_peaks={
+            "peak_tflops_fp32": 15.7,
+            "peak_tflops_fp16": 125.0,
+        },
+        mem_bw_gbs=900.0,
+        l2_bw_gbs=3100.0,  # 6 MB L2, ~3.1 TB/s
+        smem_per_sm_kb=96,
+        num_sms=80,
+        max_regs_per_sm=65536,
+    ),
 }
 
 
 def _lookup_l2_bw(device_name: str) -> float | None:
-    """Try to match a device name against known GPU L2 bandwidth tables."""
+    """Try to match a device name against known GPU L2 bandwidth specs."""
     name_upper = (device_name or "").upper()
-    for key, bw in _KNOWN_GPU_L2_BW.items():
-        if key.upper() in name_upper:
-            return bw
+    for key, spec in _KNOWN_GPU_SPECS.items():
+        if spec.l2_bw_gbs is not None and key.upper() in name_upper:
+            return spec.l2_bw_gbs
     return None
-
-
-# Known GPU SM resource limits for hardware context in LLM prompts.
-# max_regs_per_thread: always 255 for CUDA (hardware limit)
-# max_smem_per_sm_kb: configurable shared memory per SM
-# num_sms: number of streaming multiprocessors
-_KNOWN_GPU_SM_SPECS: dict[str, dict[str, int | float]] = {
-    "V100":     {"max_smem_per_sm_kb": 96,  "num_sms": 80,  "max_regs_per_sm": 65536},
-    "A100":     {"max_smem_per_sm_kb": 164, "num_sms": 108, "max_regs_per_sm": 65536},
-    "A100-SXM": {"max_smem_per_sm_kb": 164, "num_sms": 108, "max_regs_per_sm": 65536},
-    "RTX 3090": {"max_smem_per_sm_kb": 100, "num_sms": 82,  "max_regs_per_sm": 65536},
-    "RTX 4090": {"max_smem_per_sm_kb": 100, "num_sms": 128, "max_regs_per_sm": 65536},
-    "RTX 4080": {"max_smem_per_sm_kb": 100, "num_sms": 76,  "max_regs_per_sm": 65536},
-    "H100":     {"max_smem_per_sm_kb": 228, "num_sms": 132, "max_regs_per_sm": 65536},
-    "H100-SXM": {"max_smem_per_sm_kb": 228, "num_sms": 132, "max_regs_per_sm": 65536},
-}
 
 
 def _lookup_sm_specs(device_name: str) -> dict[str, int | float] | None:
     """Look up SM resource limits for a GPU."""
     name_upper = (device_name or "").upper()
-    for key, specs in _KNOWN_GPU_SM_SPECS.items():
+    for key, spec in _KNOWN_GPU_SPECS.items():
+        if spec.smem_per_sm_kb is None or spec.num_sms is None or spec.max_regs_per_sm is None:
+            continue
         if key.upper() in name_upper:
-            return dict(specs)
+            return {
+                "max_smem_per_sm_kb": spec.smem_per_sm_kb,
+                "num_sms": spec.num_sms,
+                "max_regs_per_sm": spec.max_regs_per_sm,
+            }
     return None
 
 
-def _lookup_dtype_peaks(device_name: str) -> dict[str, float] | None:
-    """Try to match a device name against known GPU dtype peak tables."""
+def _lookup_dtype_peaks_exact(device_name: str) -> tuple[str, dict[str, float]] | None:
+    """Exact (case/whitespace-insensitive) match on a full nvidia-smi name -- tier 1."""
+    name_norm = (device_name or "").strip().upper()
+    if not name_norm:
+        return None
+    for key, spec in _KNOWN_GPU_SPECS.items():
+        if spec.dtype_peaks and key.strip().upper() == name_norm:
+            return key, dict(spec.dtype_peaks)
+    return None
+
+def _lookup_dtype_peaks_prefix(device_name: str) -> tuple[str, dict[str, float]] | None:
+    """Substring match against the legacy short keys -- an unverified "assumed" match."""
     name_upper = (device_name or "").upper()
-    for key, peaks in _KNOWN_GPU_DTYPE_PEAKS.items():
-        if key.upper() in name_upper:
-            return dict(peaks)
+    for key, spec in _KNOWN_GPU_SPECS.items():
+        if spec.dtype_peaks and key.upper() in name_upper:
+            return key, dict(spec.dtype_peaks)
+    return None
+
+def _lookup_dtype_peaks(device_name: str) -> dict[str, float] | None:
+    """Try to match a device name against known GPU dtype peak tables.
+
+    Kept substring-based for backward compatibility: callers such as
+    agent.py/pipeline.py/prompt.py pass free-text `task.target_hardware`
+    (e.g. "A100"), not a real nvidia-smi name, so a prefix match is the
+    intended behavior there.
+    """
+    match = _lookup_dtype_peaks_prefix(device_name)
+    return match[1] if match else None
+
+def _representative_tflops(dtype_peaks: dict[str, float]) -> float | None:
+    """Pick a single headline TFLOPS number out of a per-dtype peaks dict."""
+    for key in ("peak_tflops_bf16", "peak_tflops_fp16", "peak_tflops_tf32", "peak_tflops_fp32"):
+        if key in dtype_peaks:
+            return dtype_peaks[key]
     return None
 
 _CACHE_PATH = Path(os.environ.get("PERFLAB_PEAKS_CACHE", str(Path.home() / ".cache" / "perflab" / "peaks.json")))
 
 def cache_path() -> Path:
     return _CACHE_PATH
+
+def _slugify_gpu_name(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", (name or "").strip()).strip("-").lower()
+    return slug or "unknown-gpu"
+
+def gpu_measured_cache_path(gpu_name: str) -> Path:
+    """Per-GPU-name sibling of cache_path(), so a measured probe runs once per machine per card."""
+    return _CACHE_PATH.parent / f"peaks-{_slugify_gpu_name(gpu_name)}.json"
 
 def _use_cache() -> bool:
     return os.environ.get("PERFLAB_PEAKS_NO_CACHE", "").strip() == ""
@@ -164,6 +376,54 @@ def _run(cmd: list[str]) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
 
+
+def _physical_cpu_count() -> int | None:
+    """Physical core count, excluding SMT/hyperthread siblings.
+
+    Peak FLOPs scale with physical FMA pipelines; using the logical CPU
+    count overestimates the compute roof ~2x on hyperthreaded machines.
+    Returns None if no method succeeds (caller falls back to logical count).
+    """
+    try:
+        import psutil  # optional dependency
+        n = psutil.cpu_count(logical=False)
+        if n:
+            return int(n)
+    except ImportError:
+        pass
+
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        out = _run(["sysctl", "-n", "hw.physicalcpu"])
+        if out:
+            try:
+                return int(out)
+            except ValueError:
+                pass
+    elif sys_name == "Linux":
+        # lscpu: unique (core, socket) pairs = physical cores
+        out = _run(["bash", "-c",
+                    "lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l"])
+        if out:
+            try:
+                n = int(out)
+                if n > 0:
+                    return n
+            except ValueError:
+                pass
+        # /sys topology: each physical core has one unique thread_siblings_list
+        out = _run(["bash", "-c",
+                    "cat /sys/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list"
+                    " 2>/dev/null | sort -u | wc -l"])
+        if out:
+            try:
+                n = int(out)
+                if n > 0:
+                    return n
+            except ValueError:
+                pass
+    return None
+
 # ---------------- CUDA (multi-GPU) ----------------
 
 def _nvidia_smi_query(fields: list[str]) -> list[dict[str,str]] | None:
@@ -171,12 +431,14 @@ def _nvidia_smi_query(fields: list[str]) -> list[dict[str,str]] | None:
     out = _run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"])
     if not out:
         return None
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
     res = []
     for line in lines:
         parts = [p.strip() for p in line.split(",")]
         d = {}
-        for k, v in zip(fields, parts):
+        # fields/parts may differ in length for a malformed CSV row; zip() strict=
+        # needs Python 3.10+ and this codebase still runs on 3.9.
+        for k, v in zip(fields, parts):  # noqa: B905
             d[k] = v
         res.append(d)
     return res
@@ -225,7 +487,126 @@ def _cores_per_sm(cc: str) -> int | None:
         return 128 if minor >= 1 else 64
     return None
 
+def _computed_gpu_bandwidth(g: dict[str, str]) -> float | None:
+    """Tier 2: theoretical peak BW from bus_width/8 x clock x 2 (DDR)."""
+    try:
+        bus = float(g.get("memory.bus_width", "0"))
+        mem_mhz = float(g.get("memory.clock", "0"))
+        if bus > 0 and mem_mhz > 0:
+            return (bus / 8.0) * (mem_mhz * 1e6) * 2.0 / 1e9
+    except (ValueError, TypeError, ZeroDivisionError):
+        pass
+    return None
+
+def _computed_gpu_tflops(g: dict[str, str], cc: str) -> float | None:
+    """Tier 2: CUDA-core count x clock derived compute peak."""
+    try:
+        sm_clock_ghz = float(g.get("clocks.max.sm", "0")) / 1000.0
+        sms = None
+        if g.get("multiprocessor_count"):
+            try:
+                sms = int(float(g["multiprocessor_count"]))
+            except (ValueError, TypeError):
+                sms = None
+        csm = _cores_per_sm(cc)
+        if sms is not None and csm is not None and sm_clock_ghz > 0:
+            return (sms * csm * 2.0 * sm_clock_ghz) / 1000.0
+    except (ValueError, TypeError, ZeroDivisionError):
+        pass
+    return None
+
+_GPU_PROBE_SECONDS = 5.0
+
+def _gpu_matmul_tflops_probe(dev: Any) -> float | None:
+    """Tier 3: fp16 matmul TFLOPS probe, run for ~_GPU_PROBE_SECONDS."""
+    import torch
+    try:
+        torch.manual_seed(0)
+        m = n = k = 4096
+        a = torch.randn((m, k), device=dev, dtype=torch.float16)
+        b = torch.randn((k, n), device=dev, dtype=torch.float16)
+        for _ in range(3):
+            _ = a @ b
+        torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        iters = 0
+        while time.perf_counter() - t0 < _GPU_PROBE_SECONDS:
+            _ = a @ b
+            iters += 1
+        torch.cuda.synchronize(dev)
+        elapsed = time.perf_counter() - t0
+        if iters == 0 or elapsed <= 0:
+            return None
+        flops = 2.0 * m * n * k * iters
+        return (flops / elapsed) / 1e12
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+def _gpu_bandwidth_copy_probe(dev: Any) -> float | None:
+    """Tier 3: device-to-device copy_ bandwidth sweep, run for ~_GPU_PROBE_SECONDS."""
+    import torch
+    try:
+        n = 256 * 1024 * 1024 // 4  # 256MB float32
+        x = torch.empty((n,), device=dev, dtype=torch.float32)
+        y = torch.empty((n,), device=dev, dtype=torch.float32)
+        for _ in range(3):
+            y.copy_(x)
+        torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        iters = 0
+        while time.perf_counter() - t0 < _GPU_PROBE_SECONDS:
+            y.copy_(x)
+            iters += 1
+        torch.cuda.synchronize(dev)
+        elapsed = time.perf_counter() - t0
+        if iters == 0 or elapsed <= 0:
+            return None
+        bytes_moved = x.numel() * x.element_size() * iters
+        return (bytes_moved / elapsed) / 1e9
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+def _measured_cuda_peaks(name: str, idx: int) -> Peaks | None:
+    """Tier 3: measured torch-calibration fallback, cached per-GPU-name so it runs once per machine."""
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    cache_file = gpu_measured_cache_path(name)
+    if _use_cache():
+        try:
+            if cache_file.exists():
+                c = json.loads(cache_file.read_text(encoding="utf-8"))
+                return Peaks(float(c["peak_tflops"]), float(c["peak_mem_bw_gbs"]), "measured", name)
+        except (json.JSONDecodeError, OSError, KeyError, ValueError):
+            logger.warning("Failed to load GPU measured-peaks cache %s", cache_file, exc_info=True)
+
+    dev = torch.device(f"cuda:{idx}")
+    tflops = _gpu_matmul_tflops_probe(dev)
+    gbs = _gpu_bandwidth_copy_probe(dev)
+    if not tflops or not gbs or tflops <= 0 or gbs <= 0:
+        return None
+
+    peaks = Peaks(float(tflops), float(gbs), "measured", name)
+    if _use_cache():
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(
+                json.dumps({"peak_tflops": peaks.peak_tflops, "peak_mem_bw_gbs": peaks.peak_mem_bw_gbs}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.warning("Failed to save GPU measured-peaks cache %s", cache_file, exc_info=True)
+    return peaks
+
 def infer_cuda_peaks(preferred_index: int | None = None) -> Peaks | None:
+    """Three-tier GPU peak resolution: exact table match, then computed, then measured.
+
+    Peaks.source records which tier produced the number: "table" (tier 1,
+    exact nvidia-smi name match), "computed" (tier 2, bus_width/clock derived),
+    or "measured" (tier 3, torch calibration probe, cached per GPU name).
+    """
     fields = ["name", "compute_cap", "clocks.max.sm", "memory.clock", "memory.bus_width", "multiprocessor_count"]
     gpus = _nvidia_smi_query(fields)
     if not gpus:
@@ -239,45 +620,36 @@ def infer_cuda_peaks(preferred_index: int | None = None) -> Peaks | None:
     cc = g.get("compute_cap", "")
     device_id = f"{name} cc{cc} idx{idx}"
 
-    bw = None
-    try:
-        bus = float(g.get("memory.bus_width", "0"))
-        mem_mhz = float(g.get("memory.clock", "0"))
-        if bus > 0 and mem_mhz > 0:
-            bw = (bus / 8.0) * (mem_mhz * 1e6) * 2.0 / 1e9
-    except (ValueError, TypeError, ZeroDivisionError):
-        bw = None
+    dtype_peaks: dict[str, float] | None = None
+    exact = _lookup_dtype_peaks_exact(name)
+    if exact is not None:
+        matched_key, dtype_peaks = exact
+        table_tflops = _representative_tflops(dtype_peaks)
+        table_bw = _KNOWN_GPU_SPECS[matched_key].mem_bw_gbs
+        if table_tflops is not None and table_bw is not None:
+            return Peaks(float(table_tflops), float(table_bw), "table", device_id, dtype_peaks=dtype_peaks)
+    else:
+        prefix = _lookup_dtype_peaks_prefix(name)
+        if prefix is not None:
+            matched_key, dtype_peaks = prefix
+            logger.warning(
+                "GPU %r has no exact peaks-table entry; %r matched by substring only -- "
+                "treating as unverified and preferring computed/measured peaks over the table",
+                name, matched_key,
+            )
 
-    tflops = None
-    try:
-        sm_clock_ghz = float(g.get("clocks.max.sm", "0")) / 1000.0
-        sms = None
-        if g.get("multiprocessor_count"):
-            try:
-                sms = int(float(g["multiprocessor_count"]))
-            except (ValueError, TypeError):
-                sms = None
-        csm = _cores_per_sm(cc)
-        if sms is not None and csm is not None and sm_clock_ghz > 0:
-            tflops = (sms * csm * 2.0 * sm_clock_ghz) / 1000.0
-    except (ValueError, TypeError, ZeroDivisionError):
-        tflops = None
+    bw = _computed_gpu_bandwidth(g)
+    tflops = _computed_gpu_tflops(g, cc)
+    if bw is not None and tflops is not None:
+        return Peaks(float(tflops), float(bw), "computed", device_id, dtype_peaks=dtype_peaks)
 
-    src = "nvidia-smi"
-    if bw is None or tflops is None:
-        calib = infer_torch_calibration(device=f"cuda:{idx}")
-        if calib:
-            if bw is None:
-                bw = calib.peak_mem_bw_gbs
-            if tflops is None:
-                tflops = calib.peak_tflops
-            src = "nvidia-smi+torch-calib"
+    calib = _measured_cuda_peaks(name, idx)
+    if calib is not None:
+        final_tflops = tflops if tflops is not None else calib.peak_tflops
+        final_bw = bw if bw is not None else calib.peak_mem_bw_gbs
+        return Peaks(float(final_tflops), float(final_bw), "measured", device_id, dtype_peaks=dtype_peaks)
 
-    if bw is None or tflops is None:
-        return None
-
-    dtype_peaks = _lookup_dtype_peaks(name)
-    return Peaks(float(tflops), float(bw), src, device_id, dtype_peaks=dtype_peaks)
+    return None
 
 # ---------------- MPS / Metal (multi device awareness) ----------------
 
@@ -447,11 +819,15 @@ def _estimate_cpu_peaks() -> Peaks | None:
         cpu_name = _run(["bash", "-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"]) or "CPU"
         cpu_name = cpu_name.strip()
 
-        # Core count
-        try:
-            cores = multiprocessing.cpu_count()
-        except (OSError, NotImplementedError):
-            pass
+        # Core count — physical cores, not logical: SMT doubles the logical
+        # count but not the FMA pipelines, so logical count would
+        # overestimate the compute roof ~2x on hyperthreaded machines.
+        cores = _physical_cpu_count()
+        if cores is None:
+            try:
+                cores = multiprocessing.cpu_count()
+            except (OSError, NotImplementedError):
+                pass
 
         # Max clock
         freq_str = _run(["bash", "-c", "lscpu | grep 'CPU max MHz' | awk '{print $NF}'"])
@@ -486,8 +862,12 @@ def _estimate_cpu_peaks() -> Peaks | None:
         bw_gbs = None
         if sys_name == "Linux":
             # Try lsmem / dmidecode for memory bandwidth
-            mem_info = _run(["bash", "-c", "sudo dmidecode -t memory 2>/dev/null | grep -i 'speed:' | head -1 | awk '{print $2}'"])
-            channels_str = _run(["bash", "-c", "sudo dmidecode -t memory 2>/dev/null | grep -ic 'size:.*[0-9]'"])
+            # sudo -n: never prompt for a password (would block the run
+            # waiting on stdin). If credentials aren't cached, sudo exits
+            # non-zero, the pipeline yields no output, and _run/the empty
+            # checks below fall through to the conservative bw estimate.
+            mem_info = _run(["bash", "-c", "sudo -n dmidecode -t memory 2>/dev/null | grep -i 'speed:' | head -1 | awk '{print $2}'"])
+            channels_str = _run(["bash", "-c", "sudo -n dmidecode -t memory 2>/dev/null | grep -ic 'size:.*[0-9]'"])
             if mem_info and channels_str:
                 try:
                     mem_mhz = float(mem_info)
@@ -662,7 +1042,7 @@ def infer_tpu_peaks() -> Peaks | None:
         n_chips = len(tpu_devices)
 
         # Match against known specs
-        for name, (bf16_tflops, hbm_bw, hbm_gb) in _KNOWN_TPU_SPECS.items():
+        for name, (bf16_tflops, hbm_bw, _hbm_gb) in _KNOWN_TPU_SPECS.items():
             if name.lower() in chip_kind.lower() or chip_kind.lower() in name.lower():
                 return Peaks(
                     peak_tflops=bf16_tflops,
@@ -679,7 +1059,7 @@ def infer_tpu_peaks() -> Peaks | None:
         return None
     except ImportError:
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort TPU detection, must not abort roofline resolution
         logger.warning("TPU peak detection failed", exc_info=True)
         return None
 
@@ -730,6 +1110,6 @@ def resolve_roofline(task) -> dict | None:
                 "source": peaks.source,
                 "device": peaks.device,
             }
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort auto-detect, must not abort the caller
         logger.warning("Roofline auto-detect failed", exc_info=True)
     return None

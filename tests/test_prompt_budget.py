@@ -1,8 +1,11 @@
 """Tests for prompt token budget trimming."""
-from perflab.optimizers.prompt import (
-    PromptContext, build_prompt, _estimate_tokens, _trim_to_budget,
-)
 from perflab.llm.base import Message
+from perflab.optimizers.prompt import (
+    PromptContext,
+    _estimate_tokens,
+    _trim_to_budget,
+    build_prompt,
+)
 
 
 def _minimal_ctx(**kwargs):
@@ -60,8 +63,7 @@ def test_trim_removes_prior_run_context_first():
         prompt_token_budget=500,
         prior_run_context="## Prior run context\nSome previous run data " * 50,
     )
-    msgs = build_prompt(ctx)
-    content = msgs[1].content
+    build_prompt(ctx)
     # Prior run context should be removed if budget is tight
     # (the exact behavior depends on total size)
 

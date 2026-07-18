@@ -1,7 +1,6 @@
 """Tests for the grid search knob sweep in perflab optimize."""
 from __future__ import annotations
 
-import pytest
 from perflab.optimizers.propose_params import (
     KnobPatch,
     generate_sweep_candidates,

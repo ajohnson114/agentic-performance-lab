@@ -3,14 +3,13 @@ from __future__ import annotations
 import logging
 import platform
 import re
-import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
 logger = logging.getLogger(__name__)
@@ -34,23 +33,21 @@ class MetalTraceProfiler:
                 capture_output=True, timeout=10,
             )
             return r.returncode == 0
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return False
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
         trace_path = artifacts_dir / "metal_trace.trace"
         export_xml = artifacts_dir / "metal_trace_export.xml"
         counters_xml = artifacts_dir / "metal_counters_export.xml"
-        cmd_parts = shlex.split(bench_cmd)
 
         # Record Metal System Trace
-        record_cmd = [
+        record_res = run_bench_under([
             "xctrace", "record",
             "--template", "Metal System Trace",
             "--output", str(trace_path),
             "--launch", "--",
-        ] + cmd_parts
-        record_res = run_cmd(record_cmd, cwd=cwd)
+        ], bench_cmd, cwd=cwd)
 
         # Export GPU submission data
         if trace_path.exists():

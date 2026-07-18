@@ -1,10 +1,17 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from pathlib import Path
+
 import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from perflab.optimizers.patch import read_source_files
+
+if TYPE_CHECKING:
+    from perflab.task_spec import TaskSpec
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +21,72 @@ class RunPaths:
     run_dir: Path
     artifacts_dir: Path
     logs_dir: Path
+
+
+def snapshot_workspace(task: TaskSpec, run_dir: Path, label: str) -> Path | None:
+    """Zip all allowed_paths files to run_dir/snapshots/<label>.zip."""
+    import zipfile
+
+    sources = read_source_files(task)
+    if not sources:
+        return None
+
+    snap_dir = run_dir / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = snap_dir / f"{label}.zip"
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel_path, content in sources.items():
+            zf.writestr(rel_path, content)
+
+    return zip_path
+
+
+_profiler_summary_cache: dict[str, tuple[dict[str, float], dict[str, dict]]] = {}
+
+
+def load_profiler_summaries(artifacts_dir: Path) -> dict[str, dict]:
+    """Load all *_summary.json files from artifacts dir.
+
+    Each profiler writes its own ``<name>_summary.json`` keyed by profiler
+    name (e.g. ``nsys``, ``torch_profiler``, ``pyspy``).  When multiple
+    profilers report overlapping metrics (e.g. GPU kernel time from both
+    NSys and torch profiler), each profiler's data is kept in its own
+    namespace — consumers choose which source to use based on context
+    (e.g. ``nsys`` for correlationId data, ``torch_profiler`` for operator
+    breakdown).  There is no merging or conflict resolution at load time.
+
+    Results are cached by directory path + file mtimes. Subsequent calls
+    return the cached result if no summary files have been modified.
+    """
+    cache_key = str(artifacts_dir)
+    summaries: dict[str, dict] = {}
+    if not artifacts_dir.exists():
+        return summaries
+
+    # Build mtime fingerprint for cache validation
+    current_mtimes: dict[str, float] = {}
+    for p in artifacts_dir.glob("*_summary.json"):
+        try:
+            current_mtimes[str(p)] = p.stat().st_mtime
+        except OSError:
+            pass
+
+    if cache_key in _profiler_summary_cache:
+        cached_mtimes, cached_summaries = _profiler_summary_cache[cache_key]
+        if cached_mtimes == current_mtimes:
+            return cached_summaries
+
+    for p in artifacts_dir.glob("*_summary.json"):
+        try:
+            summaries[p.stem.replace("_summary", "")] = json.loads(
+                p.read_text(encoding="utf-8")
+            )
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to load profiler summary %s", p, exc_info=True)
+
+    _profiler_summary_cache[cache_key] = (current_mtimes, summaries)
+    return summaries
 
 class RunStore:
     def __init__(self, out_root: Path):

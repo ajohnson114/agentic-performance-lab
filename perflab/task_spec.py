@@ -3,7 +3,8 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
+
 import yaml
 
 from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds
@@ -49,6 +50,7 @@ class Constraints:
     max_history: int = 3  # number of recent iterations to include in LLM prompt
     allow_fast_math: bool = False  # allow -ffast-math, --use_fast_math (breaks IEEE compliance)
     accuracy_tolerance: str | None = None  # "exact", "1e-3", "1e-1" — how much error is acceptable
+    env_passthrough: list[str] = field(default_factory=list)  # extra env vars to forward to candidate subprocesses
 
 @dataclass
 class RooflineSpec:
@@ -152,7 +154,7 @@ class TaskSpec:
     out_dir: Path = Path("out")  # relative to repo root by default
 
     @staticmethod
-    def load(path: str | Path) -> "TaskSpec":
+    def load(path: str | Path) -> TaskSpec:
         p = Path(path)
         data = yaml.safe_load(p.read_text(encoding="utf-8"))
 
@@ -160,6 +162,19 @@ class TaskSpec:
             if x is None:
                 return None
             return CommandSpec(cmd=str(x.get("cmd")), expected_exit=int(x.get("expected_exit", 0)))
+
+        def metric_mode(raw: str, field_path: str) -> Literal["maximize", "minimize"]:
+            if raw not in ("maximize", "minimize"):
+                raise ValueError(
+                    f"{field_path}: mode must be 'maximize' or 'minimize', got {raw!r}"
+                )
+            return cast(Literal["maximize", "minimize"], raw)
+
+        def program_type_literal(raw: str) -> ProgramType:
+            valid = ("python", "pytorch", "jax", "triton", "cpp", "cuda")
+            if raw not in valid:
+                raise ValueError(f"program_type must be one of {valid}, got {raw!r}")
+            return cast(ProgramType, raw)
 
         # workspace field is for documentation; the YAML file lives in the
         # workspace directory, so p.parent is the canonical workspace path.
@@ -173,14 +188,14 @@ class TaskSpec:
 
         metric = MetricSpec(
             name=str(data["benchmark"]["metric"]["name"]),
-            mode=str(data["benchmark"]["metric"].get("mode", "maximize")),
+            mode=metric_mode(str(data["benchmark"]["metric"].get("mode", "maximize")), "benchmark.metric"),
         )
         secondary_metric = None
         sec_data = data["benchmark"].get("secondary_metric")
         if sec_data:
             secondary_metric = SecondaryMetricSpec(
                 name=str(sec_data["name"]),
-                mode=str(sec_data.get("mode", "minimize")),
+                mode=metric_mode(str(sec_data.get("mode", "minimize")), "benchmark.secondary_metric"),
             )
 
         benchmark = BenchmarkSpec(
@@ -207,7 +222,7 @@ class TaskSpec:
             _ga = load_config().agent
             _cfg_max_history = _ga.max_history
             _cfg_token_budget = _ga.prompt_token_budget
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort, dataclass defaults still apply
             pass
 
         constraints = Constraints(
@@ -217,6 +232,7 @@ class TaskSpec:
             prompt_token_budget=int(constraints_data.get("prompt_token_budget", _cfg_token_budget)),
             top_n=int(constraints_data.get("top_n", 3)),
             max_history=int(constraints_data.get("max_history", _cfg_max_history)),
+            env_passthrough=list(constraints_data.get("env_passthrough", [])),
         )
 
         edit_policy = EditPolicy(
@@ -267,16 +283,17 @@ class TaskSpec:
         try:
             from perflab.config import load_config
             merged_thresh.update(load_config().analysis_thresholds)
-        except Exception:
-            pass  # Config loading is optional; defaults still apply
+        except Exception:  # noqa: BLE001 -- config loading is optional; defaults still apply
+            pass
         task_thresh = data.get("analysis_thresholds", {}) or {}
         merged_thresh.update(task_thresh)  # task.yaml overrides config
 
         thresh_kwargs = {}
         for f in dataclasses.fields(AnalysisThresholds):
             if f.name in merged_thresh:
-                # f.type is a string due to __future__ annotations; cast via default's type
-                thresh_kwargs[f.name] = type(f.default)(merged_thresh[f.name])
+                # f.type is a string due to __future__ annotations; cast via default's type.
+                # Every AnalysisThresholds field has a default, so f.default is never MISSING.
+                thresh_kwargs[f.name] = type(f.default)(merged_thresh[f.name])  # type: ignore[misc]
         analysis_thresholds = AnalysisThresholds(**thresh_kwargs)
 
         # Data hints (optional)
@@ -296,7 +313,7 @@ class TaskSpec:
         return TaskSpec(
             name=str(data["name"]),
             workspace=ws,
-            program_type=str(data["program_type"]),
+            program_type=program_type_literal(str(data["program_type"])),
             target_hardware=data.get("target_hardware"),
             build=build,
             correctness=correctness,

@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from perflab.profilers.ncu_profiler import classify_sass_instructions
-from perflab.reporting.roofline import compute_kernel_ceiling
 from perflab.analyzers.microarch import (
+    build_microarch_summary,
     compute_benchmark_stability,
     detect_clock_throttle,
     format_pipeline_heatmap,
-    build_microarch_summary,
 )
-
+from perflab.profilers.ncu_profiler import classify_sass_instructions
+from perflab.reporting.roofline import compute_kernel_ceiling
 
 # ---------------------------------------------------------------------------
 # SASS instruction classification

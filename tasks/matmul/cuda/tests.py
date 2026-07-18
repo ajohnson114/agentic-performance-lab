@@ -1,5 +1,6 @@
 """Correctness test: compile and run CUDA sgemm at small size, verify output."""
 from __future__ import annotations
+
 import json
 import subprocess
 from pathlib import Path

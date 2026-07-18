@@ -3,12 +3,11 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,6 @@ class NcuProfiler:
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
         csv_path = artifacts_dir / "ncu_metrics.csv"
         report_path = artifacts_dir / "ncu_report.ncu-rep"
-        cmd_parts = shlex.split(bench_cmd)
 
         # --target-processes all is required when the benchmark command is a
         # Python/shell wrapper that launches the actual CUDA binary as a
@@ -33,12 +31,14 @@ class NcuProfiler:
         ncu_base = ["ncu", "--target-processes", "all", "--set", "full"]
 
         # ncu with CSV output for programmatic analysis
-        csv_cmd = ncu_base + ["--csv", "--log-file", str(csv_path)] + cmd_parts
-        csv_res = run_cmd(csv_cmd, cwd=cwd)
+        csv_res = run_bench_under(
+            ncu_base + ["--csv", "--log-file", str(csv_path)], bench_cmd, cwd=cwd,
+        )
 
         # Also generate a report file for interactive viewing
-        report_cmd = ncu_base + ["-o", str(report_path)] + cmd_parts
-        report_res = run_cmd(report_cmd, cwd=cwd)
+        report_res = run_bench_under(
+            ncu_base + ["-o", str(report_path)], bench_cmd, cwd=cwd,
+        )
 
         summary = _parse_ncu_csv(csv_path)
         summary["csv_returncode"] = csv_res.returncode
@@ -757,7 +757,7 @@ def _parse_ncu_csv(path: Path) -> dict:
             # Aggregate achieved bandwidth
             if duration_ns_col:
                 total_dur_ns = 0.0
-                for kname_d, krows_d in kernel_groups.items():
+                for _kname_d, krows_d in kernel_groups.items():
                     dur_vals_d = [v for r in krows_d if (v := _safe_float(r.get(duration_ns_col))) is not None]
                     total_dur_ns += sum(dur_vals_d)
                 if total_dur_ns > 0:

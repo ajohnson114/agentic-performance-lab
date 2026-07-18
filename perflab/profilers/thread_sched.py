@@ -6,12 +6,11 @@ runtime, wait time, migrations, and scheduling latency.
 from __future__ import annotations
 
 import re
-import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult
+from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
 
@@ -23,21 +22,20 @@ class ThreadSchedProfiler:
         if shutil.which("perf") is None:
             return False
         # perf sched requires root or perf_event_paranoid <= 1
-        res = run_cmd(["perf", "sched", "--help"], timeout=5)
+        res = run_cmd(["perf", "sched", "--help"], timeout_s=5)
         return res.returncode == 0
 
     def run(self, bench_cmd: str, cwd: Path, artifacts_dir: Path) -> ProfileResult:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        cmd_parts = shlex.split(bench_cmd)
         summary: dict = {}
         artifacts: dict[str, str] = {}
         perf_data = artifacts_dir / "perf_sched.data"
 
         # perf sched record
-        record_cmd = [
-            "perf", "sched", "record", "-o", str(perf_data), "--",
-        ] + cmd_parts
-        record_res = run_cmd(record_cmd, cwd=cwd, timeout=300)
+        record_res = run_bench_under(
+            ["perf", "sched", "record", "-o", str(perf_data), "--"],
+            bench_cmd, cwd=cwd, timeout_s=300,
+        )
 
         if record_res.returncode != 0 or not perf_data.exists():
             summary["error"] = f"perf sched record failed (rc={record_res.returncode})"
@@ -46,7 +44,7 @@ class ThreadSchedProfiler:
         # perf sched latency
         latency_path = artifacts_dir / "sched_latency.txt"
         latency_cmd = ["perf", "sched", "latency", "-i", str(perf_data)]
-        latency_res = run_cmd(latency_cmd, cwd=cwd, timeout=60)
+        latency_res = run_cmd(latency_cmd, cwd=cwd, timeout_s=60)
         if latency_res.returncode == 0 and latency_res.stdout.strip():
             latency_path.write_text(latency_res.stdout, encoding="utf-8")
             artifacts["sched_latency"] = str(latency_path)
@@ -59,7 +57,7 @@ class ThreadSchedProfiler:
         timehist_cmd = [
             "perf", "sched", "timehist", "--summary", "-i", str(perf_data),
         ]
-        timehist_res = run_cmd(timehist_cmd, cwd=cwd, timeout=60)
+        timehist_res = run_cmd(timehist_cmd, cwd=cwd, timeout_s=60)
         if timehist_res.returncode == 0 and timehist_res.stdout.strip():
             timehist_path.write_text(timehist_res.stdout, encoding="utf-8")
             artifacts["sched_timehist"] = str(timehist_path)

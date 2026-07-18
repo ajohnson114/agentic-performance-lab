@@ -97,7 +97,7 @@ class TestGenerateReports:
             tmp_path,
             system_info={"cpu_isa": {"avx2": True, "max_simd_width_bits": 256}},
         )
-        result = generate_reports(_minimal_params(
+        generate_reports(_minimal_params(
             run_dir,
             build_cmd="g++ -O2 -o matmul matmul.cpp",
         ))
@@ -111,7 +111,7 @@ class TestGenerateReports:
             summaries={"linux_perf": {"ipc": 1.5, "cache_miss_rate": 0.02}},
             baseline_summaries={"linux_perf": {"ipc": 0.8, "cache_miss_rate": 0.10}},
         )
-        result = generate_reports(_minimal_params(run_dir))
+        generate_reports(_minimal_params(run_dir))
         html = (run_dir / "dashboard.html").read_text()
         assert "Profile diff" in html or "profile diff" in html.lower() or "ipc" in html
 

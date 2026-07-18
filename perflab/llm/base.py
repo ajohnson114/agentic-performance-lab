@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Iterator, Protocol, Sequence
+from typing import Protocol
 
 
 @dataclass

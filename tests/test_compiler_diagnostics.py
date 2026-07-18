@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from perflab.analyzers.compiler_diagnostics import (
     CompilerDiagnostics,
-    CrossReferencedInsight,
     OptimizationRemark,
     _fuzzy_kernel_match,
     _infer_element_bits,
@@ -22,7 +21,6 @@ from perflab.analyzers.compiler_diagnostics import (
     get_diagnostic_env_vars,
     parse_compiler_output,
 )
-
 
 # ---------------------------------------------------------------------------
 # get_diagnostic_build_flags

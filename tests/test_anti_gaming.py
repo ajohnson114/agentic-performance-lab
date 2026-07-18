@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # 1. GPU Sync (SyncTimer, cuda_sync_guard)
 # ---------------------------------------------------------------------------
@@ -239,14 +238,15 @@ class TestPrecision:
         assert _ulp_distance(1.0, 1.0) == 0.0
 
     def test_ulp_distance_nan(self):
+
         from perflab.harness.precision import _ulp_distance
-        import math
         assert _ulp_distance(float("nan"), 1.0) == float("inf")
 
     def test_ulp_distance_close_values(self):
-        from perflab.harness.precision import _ulp_distance
         # Adjacent floats should be 1 ULP apart
         import struct
+
+        from perflab.harness.precision import _ulp_distance
         bits = struct.pack('d', 1.0)
         int_val = struct.unpack('Q', bits)[0]
         next_float = struct.unpack('d', struct.pack('Q', int_val + 1))[0]
@@ -392,8 +392,8 @@ class TestCorrectnessTwice:
         assert warnings == []
 
     def test_first_pass_second_fail(self, tmp_workspace: Path):
+
         from perflab.runners.correctness import run_correctness_twice
-        import os
         # Script that fails when PERFLAB_DETERMINISM_SEED is set
         test_script = tmp_workspace / "tests.py"
         test_script.write_text(textwrap.dedent("""\
@@ -522,14 +522,14 @@ class TestAntiGamingEventLog:
 class TestHarnessImports:
     def test_all_exports_importable(self):
         from perflab.harness import (
-            cuda_sync_guard,
             SyncTimer,
-            assert_no_new_threads,
             ThreadGuard,
-            assert_real_tensor,
             assert_deterministic,
-            assert_ulp_close,
             assert_no_memoization,
+            assert_no_new_threads,
+            assert_real_tensor,
+            assert_ulp_close,
+            cuda_sync_guard,
         )
         assert callable(cuda_sync_guard)
         assert callable(SyncTimer)

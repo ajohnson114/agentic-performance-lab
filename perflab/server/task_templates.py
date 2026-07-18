@@ -511,8 +511,8 @@ def _tuning_template(name: str, fixed_params: dict[str, int | float] | None = No
     """Return tuning.yaml content."""
     lines = [
         f"# Tuning knobs for {name}",
-        f"# Fixed params (protected by contract) should not be changed by the agent.",
-        f"# Tunable params are fair game for optimization.",
+        "# Fixed params (protected by contract) should not be changed by the agent.",
+        "# Tunable params are fair game for optimization.",
         "",
     ]
 
@@ -904,7 +904,6 @@ def suggest_contract_from_bench(content: str, program_type: str) -> dict:
             suggestions["fixed_params"][p] = f"<fill in the value for {p}>"
 
     # Look for metric fields in the output JSON
-    json_field_pattern = r'["\'](\w+(?:\.\w+)*)["\']'
     # Find dict literal patterns that look like bench output
     output_patterns = re.findall(r'"(\w+)":\s*\{', content)
     metric_fields = [f for f in output_patterns if f not in ("meta",)]

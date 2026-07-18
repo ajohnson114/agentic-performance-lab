@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import pytest
+
 from perflab.optimizers.prompt import (
-    PromptContext,
-    _classify_bound,
-    _build_optimization_playbook,
     _BOUND_ACTIONS,
+    PromptContext,
+    _build_optimization_playbook,
+    _classify_bound,
 )
 
 

@@ -5,20 +5,28 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
+from perflab.analyzers.bench_stats import compute_bench_stats, extract_repeated_values
 from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds, diagnose_bottlenecks
-from perflab.analyzers.build_flags import recommend_build_flags
+from perflab.analyzers.diff_flamegraph import compute_diff_stacks, generate_diff_svg
 from perflab.analyzers.gpu_attribution import compute_attribution_ranking
 from perflab.analyzers.hlo_attribution import compute_hlo_attribution
 from perflab.analyzers.metrics_rollup import compute_run_summary
-from perflab.analyzers.bench_stats import compute_bench_stats, extract_repeated_values
-from perflab.analyzers.diff_flamegraph import compute_diff_stacks, generate_diff_svg
-from perflab.analyzers.profile_diff import compute_profile_diff, compute_hotspot_diff
+from perflab.analyzers.profile_diff import compute_hotspot_diff, compute_profile_diff
 from perflab.analyzers.vectorization import check_vectorization_from_perf_annotate
-from perflab.reporting.dashboard_html import GlanceData, ProfilerData, write_dashboard_html
-from perflab.reporting.plots import compute_pareto_frontier, plot_metric_history, plot_pareto_frontier
+from perflab.reporting.dashboard_html import (
+    AnalysisData,
+    GlanceData,
+    ProfilerData,
+    write_dashboard_html,
+)
+from perflab.reporting.plots import (
+    compute_pareto_frontier,
+    plot_metric_history,
+    plot_pareto_frontier,
+)
 from perflab.reporting.report_md import write_report_md
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -64,7 +72,7 @@ def _build_microarch_for_dashboard(
     try:
         from perflab.analyzers.microarch import build_microarch_summary
         return build_microarch_summary(bench_data or {}, final_summaries)
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort dashboard section, must not abort report generation
         logger.warning("Microarch summary build failed", exc_info=True)
         return None
 
@@ -346,7 +354,7 @@ def generate_reports(p: ReportParams) -> dict:
     if nsys_final.get("cpu_gpu_correlations"):
         try:
             gpu_attrib = compute_attribution_ranking(nsys_final)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
             logger.warning("GPU attribution computation failed", exc_info=True)
 
     # --- HLO attribution (JAX/TPU) ---
@@ -355,7 +363,7 @@ def generate_reports(p: ReportParams) -> dict:
     if jax_final.get("hlo_ops"):
         try:
             hlo_attrib = compute_hlo_attribution(jax_final, jax_final)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
             logger.warning("HLO attribution computation failed", exc_info=True)
 
     # --- Profile diff (baseline vs final) ---
@@ -364,11 +372,11 @@ def generate_reports(p: ReportParams) -> dict:
     if baseline_summaries and final_summaries:
         try:
             profile_diff = compute_profile_diff(baseline_summaries, final_summaries, metric_mode)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
             logger.warning("Profile diff computation failed", exc_info=True)
         try:
             hotspot_diff = compute_hotspot_diff(baseline_summaries, final_summaries)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
             logger.warning("Hotspot diff computation failed", exc_info=True)
 
     # --- Differential flame graph ---
@@ -382,7 +390,7 @@ def generate_reports(p: ReportParams) -> dict:
                     diffs, diff_svg,
                     title=f"Differential Flame Graph — {task_name}",
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
             logger.warning("Differential flame graph generation failed", exc_info=True)
 
     # --- Vectorization analysis ---
@@ -411,7 +419,10 @@ def generate_reports(p: ReportParams) -> dict:
     build_flag_recs = None
     if build_cmd:
         try:
-            from perflab.analyzers.build_flags import recommend_build_flags, recommend_flags_from_profiling
+            from perflab.analyzers.build_flags import (
+                recommend_build_flags,
+                recommend_flags_from_profiling,
+            )
             all_recs = []
             cpu_isa = (report_system_info or {}).get("cpu_isa")
             if cpu_isa:
@@ -430,7 +441,7 @@ def generate_reports(p: ReportParams) -> dict:
                     deduped.append(r)
             if deduped:
                 build_flag_recs = deduped
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
             logger.warning("Build flag recommendation failed", exc_info=True)
 
     # --- Build profiler data for dashboard embedding ---
@@ -476,7 +487,7 @@ def generate_reports(p: ReportParams) -> dict:
         )
         if perfetto_path:
             profiler_data.perfetto_trace_path = perfetto_path
-    except Exception:
+    except Exception:  # noqa: BLE001 -- best-effort report section, must not abort the whole report
         logger.warning("Perfetto trace export failed", exc_info=True)
 
     # --- Hardware mismatch detection ---
@@ -499,85 +510,87 @@ def generate_reports(p: ReportParams) -> dict:
         optimization_summary=optimization_summary_text,
         glance=glance,
         profiler=profiler_data,
+        analysis=AnalysisData(
+            bottleneck_diagnoses=[
+                {
+                    "rank": d.rank,
+                    "bottleneck": d.bottleneck,
+                    "root_cause": d.root_cause,
+                    "confidence": d.confidence,
+                    "suggested_actions": d.suggested_actions,
+                }
+                for d in final_diags
+            ] if final_diags else None,
+            gpu_attribution=[
+                {
+                    "rank": a.rank,
+                    "name": a.name,
+                    "category": a.category,
+                    "gpu_pct": a.gpu_pct,
+                    "gpu_time_ms": a.gpu_time_ms,
+                    "diagnosis": a.diagnosis,
+                    "suggestions": a.suggestions,
+                }
+                for a in gpu_attrib
+            ] if gpu_attrib else None,
+            profile_diff=[
+                {
+                    "metric": d.metric,
+                    "before": d.before,
+                    "after": d.after,
+                    "delta_pct": d.delta_pct,
+                    "direction": d.direction,
+                }
+                for d in profile_diff
+            ] if profile_diff else None,
+            build_flag_recs=[
+                {
+                    "flag": r.flag,
+                    "reason": r.reason,
+                    "impact": r.impact,
+                    "category": r.category,
+                }
+                for r in build_flag_recs
+            ] if build_flag_recs else None,
+            hotspot_diff=[
+                {
+                    "function": s.function,
+                    "before_pct": s.before_pct,
+                    "after_pct": s.after_pct,
+                    "delta_pct": s.delta_pct,
+                    "status": s.status,
+                }
+                for s in hotspot_diff
+            ] if hotspot_diff else None,
+            history=history,
+            tma_data=final_summaries.get("linux_perf", {}).get("tma"),
+            tma_level2_data=final_summaries.get("linux_perf", {}).get("tma_level2"),
+            power_data=final_summaries.get("power"),
+            vectorization=vectorization_data,
+            gpu_memory=final_summaries.get("power", {}).get("gpu_memory"),
+            thread_sched=final_summaries.get("thread_sched"),
+            ebpf_data=final_summaries.get("ebpf"),
+            lock_contention_data=final_summaries.get("lock_contention"),
+            hlo_attribution=[
+                {
+                    "op": e.op,
+                    "count": e.count,
+                    "pct_of_ops": e.pct_of_ops,
+                    "category": e.category,
+                    "estimated_device_pct": e.estimated_device_pct,
+                    "diagnosis": e.diagnosis,
+                    "suggestions": e.suggestions,
+                }
+                for e in hlo_attrib.entries
+            ] if hlo_attrib else None,
+            user_actions=user_actions,
+            microarch_summary=_build_microarch_for_dashboard(final_summaries, _bench_data_for_microarch),
+            torch_flops=final_summaries.get("torch_profiler", {}),
+        ),
         system_info=report_system_info,
         hardware_mismatch=hw_mismatch,
-        bottleneck_diagnoses=[
-            {
-                "rank": d.rank,
-                "bottleneck": d.bottleneck,
-                "root_cause": d.root_cause,
-                "confidence": d.confidence,
-                "suggested_actions": d.suggested_actions,
-            }
-            for d in final_diags
-        ] if final_diags else None,
-        gpu_attribution=[
-            {
-                "rank": a.rank,
-                "name": a.name,
-                "category": a.category,
-                "gpu_pct": a.gpu_pct,
-                "gpu_time_ms": a.gpu_time_ms,
-                "diagnosis": a.diagnosis,
-                "suggestions": a.suggestions,
-            }
-            for a in gpu_attrib
-        ] if gpu_attrib else None,
-        profile_diff=[
-            {
-                "metric": d.metric,
-                "before": d.before,
-                "after": d.after,
-                "delta_pct": d.delta_pct,
-                "direction": d.direction,
-            }
-            for d in profile_diff
-        ] if profile_diff else None,
-        build_flag_recs=[
-            {
-                "flag": r.flag,
-                "reason": r.reason,
-                "impact": r.impact,
-                "category": r.category,
-            }
-            for r in build_flag_recs
-        ] if build_flag_recs else None,
-        hotspot_diff=[
-            {
-                "function": s.function,
-                "before_pct": s.before_pct,
-                "after_pct": s.after_pct,
-                "delta_pct": s.delta_pct,
-                "status": s.status,
-            }
-            for s in hotspot_diff
-        ] if hotspot_diff else None,
-        history=history,
-        tma_data=final_summaries.get("linux_perf", {}).get("tma"),
-        tma_level2_data=final_summaries.get("linux_perf", {}).get("tma_level2"),
-        power_data=final_summaries.get("power"),
         pareto_png_rel=pareto_png_rel,
         bench_stats_warning=bench_stats_warning,
-        vectorization=vectorization_data,
-        gpu_memory=final_summaries.get("power", {}).get("gpu_memory"),
-        thread_sched=final_summaries.get("thread_sched"),
-        ebpf_data=final_summaries.get("ebpf"),
-        lock_contention_data=final_summaries.get("lock_contention"),
-        hlo_attribution=[
-            {
-                "op": e.op,
-                "count": e.count,
-                "pct_of_ops": e.pct_of_ops,
-                "category": e.category,
-                "estimated_device_pct": e.estimated_device_pct,
-                "diagnosis": e.diagnosis,
-                "suggestions": e.suggestions,
-            }
-            for e in hlo_attrib.entries
-        ] if hlo_attrib else None,
-        user_actions=user_actions,
-        microarch_summary=_build_microarch_for_dashboard(final_summaries, _bench_data_for_microarch),
-        torch_flops=final_summaries.get("torch_profiler", {}),
     )
     (run_dir / "report.json").write_text(
         json.dumps(report_data, indent=2), encoding="utf-8"

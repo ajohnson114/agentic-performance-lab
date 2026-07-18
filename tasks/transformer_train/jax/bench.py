@@ -12,10 +12,8 @@ from pathlib import Path
 from statistics import median
 
 import jax
-import jax.numpy as jnp
 import optax
 import yaml
-
 from model import (
     cross_entropy_loss,
     init_transformer,

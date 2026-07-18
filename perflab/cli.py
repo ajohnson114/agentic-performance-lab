@@ -1,18 +1,28 @@
 from __future__ import annotations
-import dataclasses
-import logging
-import sys
-import typer
-import os
-import json
-import yaml
-from perflab.roofline_peaks import infer_peaks, list_cuda_gpus, list_metal_gpus, cache_path, selection_hints
-from pathlib import Path
 
-from perflab.task_spec import TaskSpec
-from perflab.orchestrator import profile_only, optimize
-from perflab.doctor import run_doctor
+import dataclasses
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import typer
+import yaml
+
 from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds
+from perflab.doctor import run_doctor
+from perflab.llm.config import DEFAULT_MODEL, PROVIDER_DEFAULT_MODELS
+from perflab.orchestrator import optimize, profile_only
+from perflab.roofline_peaks import (
+    cache_path,
+    infer_peaks,
+    list_cuda_gpus,
+    list_metal_gpus,
+    selection_hints,
+)
+from perflab.task_spec import TaskSpec
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -167,17 +177,27 @@ def doctor(
         raise typer.Exit(code=1)
 
 
-_PROVIDER_DEFAULTS = {
-    "openai": "gpt-5.2",
-    "anthropic": "claude-opus-4-6",
-    "ollama": "llama3.2",
-}
+_PROVIDER_DEFAULTS = PROVIDER_DEFAULT_MODELS
 
 
 @app.command()
-def init():
+def init(
+    scrub_key: bool = typer.Option(
+        False, "--scrub-key",
+        help="Remove a legacy api_key from the config file and exit (no interactive setup)",
+    ),
+):
     """Interactive first-run setup for LLM configuration."""
     config_path = Path.home() / ".config" / "perflab" / "config.yaml"
+
+    if scrub_key:
+        from perflab.llm.config import scrub_api_key
+        if scrub_api_key(config_path):
+            typer.echo(f"Removed api_key from {config_path}.")
+            typer.echo("Set it via: export PERFLAB_API_KEY=sk-...")
+        else:
+            typer.echo(f"No api_key found in {config_path} -- nothing to do.")
+        raise typer.Exit(code=0)
 
     if config_path.exists():
         overwrite = typer.confirm(f"Config already exists at {config_path}. Overwrite?", default=False)
@@ -221,22 +241,22 @@ def init():
             typer.echo(f"\nNote: the '{sdk_pkg}' package is not installed.")
             typer.echo(f'  Install it with:  pip install -e ".[{provider}]"')
 
+    # api_key is intentionally never written to config_data -- it is only ever
+    # read from the PERFLAB_API_KEY env var (see perflab/llm/config.py).
     config_data = {
         "llm": {
             "provider": provider,
             "model": model,
         }
     }
-    if api_key:
-        config_data["llm"]["api_key"] = api_key
     if api_base:
         config_data["llm"]["api_base"] = api_base
 
     # Validate model with a live API call before writing config
     typer.echo("\nValidating model...")
     try:
-        from perflab.llm.config import LLMConfig, create_provider
         from perflab.llm.base import Message
+        from perflab.llm.config import LLMConfig, create_provider
 
         test_config = LLMConfig(
             provider=provider,
@@ -252,16 +272,22 @@ def init():
         typer.echo("  Model validated successfully.")
     except ImportError:
         typer.echo("  Skipped (SDK not installed).")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 -- best-effort validation call against an arbitrary LLM provider
         err_msg = str(exc)
         typer.echo(f"  Model validation failed: {err_msg}")
         if not typer.confirm("Save this configuration anyway?", default=False):
             typer.echo("Aborted.")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
 
     from perflab.llm.config import _secure_write
     _secure_write(config_path, yaml.dump(config_data, default_flow_style=False))
     typer.echo(f"\nConfig written to {config_path} (permissions: owner read/write only)")
+
+    if api_key:
+        typer.echo(
+            "\nAPI keys are never stored on disk. Add this to your shell profile:\n"
+            "  export PERFLAB_API_KEY=sk-...  (the key you just entered)"
+        )
 
     typer.echo(
         "\nTip: If you're using an MCP client (Claude Desktop, Cursor), the optimize_task\n"
@@ -272,7 +298,11 @@ def init():
 @app.command(name="show-config")
 def show_config():
     """Show the resolved PerfLab configuration (all layers merged)."""
-    from perflab.config import load_config, DEFAULT_CONFIG_TEMPLATE, _USER_CONFIG_PATH, _find_project_config
+    from perflab.config import (
+        _USER_CONFIG_PATH,
+        _find_project_config,
+        load_config,
+    )
 
     cfg = load_config(force_reload=True)
     typer.echo("Resolved PerfLab configuration")
@@ -280,13 +310,13 @@ def show_config():
     typer.echo(f"User config:    {_USER_CONFIG_PATH}" + (" (found)" if _USER_CONFIG_PATH.exists() else " (not found)"))
     project = _find_project_config()
     typer.echo(f"Project config: {project or '(not found)'}")
-    typer.echo(f"Priority: env vars > project > user > defaults\n")
+    typer.echo("Priority: env vars > project > user > defaults\n")
 
     import json
     typer.echo(json.dumps(cfg.to_dict(), indent=2))
 
-    typer.echo(f"\nTo create a config file:  perflab init")
-    typer.echo(f"Full template: perflab show-config --template")
+    typer.echo("\nTo create a config file:  perflab init")
+    typer.echo("Full template: perflab show-config --template")
 
 
 @app.command(name="show-config-template")
@@ -330,7 +360,8 @@ def ci_check(
     baseline_file: str = typer.Option(None, "--baseline-file", help="Path to baseline JSON file"),
 ):
     """Run a CI regression check against a saved baseline."""
-    from perflab.ci import run_ci_check, save_baseline as save_bl
+    from perflab.ci import run_ci_check
+    from perflab.ci import save_baseline as save_bl
 
     task_file = Path(task_yaml)
     task = TaskSpec.load(task_file)
@@ -371,6 +402,29 @@ def ci_check(
         raise typer.Exit(code=1)
 
 
+def _read_task_yaml_isolation(task_file: Path) -> tuple[str | None, bool]:
+    """Read `isolation.level` and `constraints.network` directly from task.yaml.
+
+    Read via a raw yaml.safe_load rather than through TaskSpec/Constraints
+    (perflab/task_spec.py) because that module is being restructured by a
+    parallel, unrelated fix right now -- reading raw avoids colliding with
+    it. Once that lands, promote these into proper TaskSpec fields (with
+    schema validation and `perflab show-task` visibility) instead of this
+    shim.
+    """
+    try:
+        data = yaml.safe_load(task_file.read_text(encoding="utf-8")) or {}
+    except (yaml.YAMLError, OSError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    isolation_data = data.get("isolation")
+    level = isolation_data.get("level") if isinstance(isolation_data, dict) else None
+    constraints_data = data.get("constraints")
+    network = bool(constraints_data.get("network", False)) if isinstance(constraints_data, dict) else False
+    return level, network
+
+
 @app.command()
 def agent(
     task_yaml: str = typer.Argument(..., help="Path to task YAML"),
@@ -380,10 +434,15 @@ def agent(
     no_early_stop: bool = typer.Option(False, "--no-early-stop", help="Disable early stopping / convergence detection"),
     fast_screen: bool = typer.Option(True, "--fast-screen/--no-fast-screen", help="Use fast benchmark screening for candidates"),
     max_time: int = typer.Option(3600, "--max-time", help="Wall-clock budget in seconds"),
+    isolation: str = typer.Option(
+        None, "--isolation",
+        help="Sandbox candidate execution: none|restricted|strict (default: config/none)",
+    ),
 ):
     """Run the agentic LLM-driven optimizer with beam search."""
-    from perflab.optimizers.agent import AgentConfig, run_agent
     from perflab.llm.config import LLMConfig
+    from perflab.optimizers.agent import AgentConfig, run_agent
+    from perflab.tools.isolation import IsolationPolicy, default_level_for_host, resolve_level
 
     task_file = Path(task_yaml)
     task = TaskSpec.load(task_file)
@@ -394,7 +453,7 @@ def agent(
             "Error: LLM is not configured. No API key or model found.\n\n"
             "Run 'perflab init' for interactive setup, or set environment variables:\n"
             "  export PERFLAB_LLM_PROVIDER=openai\n"
-            "  export PERFLAB_LLM_MODEL=gpt-5.2\n"
+            f"  export PERFLAB_LLM_MODEL={DEFAULT_MODEL}\n"
             "  export PERFLAB_API_KEY=sk-...\n\n"
             "If you're using an MCP client, the optimize_task tool can use your\n"
             "client's LLM directly without an API key."
@@ -406,6 +465,29 @@ def agent(
     global_cfg = load_config()
     ga = global_cfg.agent  # global agent defaults
 
+    # Isolation (Fix 2b): CLI flag > task.yaml `isolation.level` > perflab.yaml/
+    # user config > compiled-in default ("none"). The resolved policy is passed
+    # through AgentConfig into every candidate benchmark/correctness subprocess
+    # (perflab/optimizers/phases/{prescreen,evaluate,autotune}.py and the
+    # baseline pipeline, so sandbox overhead cancels out of speedup comparisons).
+    task_isolation_level, task_network = _read_task_yaml_isolation(task_file)
+    isolation_level = resolve_level(isolation, task_isolation_level, global_cfg.isolation.level)
+    isolation_policy: IsolationPolicy | None = None
+    if isolation_level == "none":
+        typer.echo("Candidate code runs unsandboxed on this host (isolation: none).")
+    else:
+        isolation_policy = IsolationPolicy(level=isolation_level, network=task_network)
+        if default_level_for_host() == "none":
+            # bwrap unavailable (non-Linux, or user namespaces disabled):
+            # wrap_command will fall back per-call, so say it loudly up front.
+            typer.echo(
+                f"WARNING: isolation '{isolation_level}' requested, but this host "
+                "cannot sandbox (bwrap unavailable or not Linux). Candidate code "
+                "will run UNSANDBOXED (rlimits/env-allowlist only)."
+            )
+        else:
+            typer.echo(f"Isolation: {isolation_level} (bwrap sandbox active for candidate runs).")
+
     config = AgentConfig(
         n_candidates=candidates or task.agent.n_candidates or ga.n_candidates,
         top_k=task.agent.top_k,
@@ -413,6 +495,7 @@ def agent(
         early_stop=not no_early_stop,
         fast_screen=fast_screen,
         max_wall_time_s=max_time or ga.max_wall_time_s,
+        isolation=isolation_policy,
     )
 
     result = run_agent(task, task_file, config, llm_config, expert_suggestion=suggest)
@@ -473,7 +556,7 @@ def compare(
         result = store.compare_runs(run_a, run_b)
     except FileNotFoundError as exc:
         typer.echo(str(exc))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
     # Header: task and metric context
     if result.get("task_name"):
@@ -603,8 +686,8 @@ def _fmt_val(val: object) -> str:
 
 def _show_section(
     title: str,
-    effective: object,
-    defaults: object,
+    effective: Any,
+    defaults: Any,
     yaml_key: str,
 ) -> None:
     """Print one task config section, highlighting overrides."""
@@ -625,7 +708,10 @@ def show_task(
 ):
     """Show effective configuration for a task, highlighting overrides."""
     from perflab.task_spec import (
-        Constraints, ContractSpec, AgentSpec, BenchmarkSpec,
+        AgentSpec,
+        BenchmarkSpec,
+        Constraints,
+        ContractSpec,
     )
 
     task = TaskSpec.load(Path(task_yaml))
@@ -689,7 +775,7 @@ def show_task(
         if task.roofline.peak_fp16_tflops:
             typer.echo(f"  {'peak_fp16_tflops':<30s} {task.roofline.peak_fp16_tflops}")
         if task.roofline.dtype_peaks:
-            typer.echo(f"  dtype_peaks:")
+            typer.echo("  dtype_peaks:")
             for k, v in task.roofline.dtype_peaks.items():
                 typer.echo(f"    {k:<28s} {v}")
         typer.echo()
@@ -729,7 +815,7 @@ def show_task(
                 else:
                     typer.echo("  Sweep: not configured (add `sweep:` section for auto-tuning)")
                 typer.echo()
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort tuning.yaml display, skip on any parse issue
             pass
 
     # Analysis thresholds — count overrides

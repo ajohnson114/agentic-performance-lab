@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.request
 import urllib.error
+import urllib.request
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Iterator, Sequence
 from urllib.parse import urlparse
 
 from perflab.llm.base import CompletionResult, Message
+from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 # Allowed hosts for Ollama API to prevent SSRF.
 _OLLAMA_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -45,7 +46,7 @@ class OllamaProvider:
     """Raw HTTP calls to Ollama REST API (no SDK dependency)."""
 
     name: str = "ollama"
-    model: str = "llama3.2"
+    model: str = PROVIDER_DEFAULT_MODELS["ollama"]
     api_base: str = "http://localhost:11434"
 
     def __post_init__(self) -> None:
@@ -59,7 +60,7 @@ class OllamaProvider:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200
-        except Exception:
+        except Exception:  # noqa: BLE001 -- best-effort availability probe, any failure means unavailable
             return False
 
     def complete(
