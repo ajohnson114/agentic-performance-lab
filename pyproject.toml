@@ -51,6 +51,7 @@ select = ["E", "F", "I", "UP", "B", "BLE"]   # BLE flags blind excepts -- see Fi
 ignore = ["E501"]                              # long lines exist in prompts/tables
 
 [tool.mypy]
-python_version = "3.10"
+# No python_version pin: mypy targets the running interpreter, so each CI matrix
+# job checks its own version. A pin below 3.12 chokes on numpy>=2.3 stubs (PEP 695).
 ignore_missing_imports = true                  # torch/jax/triton are optional extras
 check_untyped_defs = true

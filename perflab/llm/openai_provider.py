@@ -25,10 +25,9 @@ class OpenAIProvider:
 
     def _client(self):
         import openai
-        kwargs = {"api_key": self.api_key}
         if self.api_base:
-            kwargs["base_url"] = self.api_base
-        return openai.OpenAI(**kwargs)
+            return openai.OpenAI(api_key=self.api_key, base_url=self.api_base)
+        return openai.OpenAI(api_key=self.api_key)
 
     def complete(
         self,

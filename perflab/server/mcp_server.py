@@ -8,7 +8,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from fastmcp import Context, FastMCP
 
@@ -1185,7 +1185,7 @@ async def optimize_task(
     iters: int = 8,
     candidates: int = 4,
     suggest: str | None = None,
-    ctx: Context = None,
+    ctx: Context | None = None,
 ) -> dict:
     """Run optimization using the client's own LLM via MCP sampling (no API key needed).
 
@@ -1203,6 +1203,9 @@ async def optimize_task(
     from perflab.optimizers.agent import AgentConfig, run_agent
     from perflab.optimizers.progress import ListProgress
     from perflab.task_spec import TaskSpec
+
+    if ctx is None:
+        return {"error": "No MCP context available. This tool must be invoked by an MCP client."}
 
     # Pre-flight: verify sampling works
     try:
@@ -1232,9 +1235,13 @@ async def optimize_task(
 
             sampling_msgs = []
             for m in messages:
+                # System content arrives via system_prompt, so anything else maps to user
+                role: Literal["user", "assistant"] = (
+                    "assistant" if m.role == "assistant" else "user"
+                )
                 sampling_msgs.append(
                     SamplingMessage(
-                        role=m.role,
+                        role=role,
                         content=TextContent(type="text", text=m.content),
                     )
                 )
@@ -1245,7 +1252,7 @@ async def optimize_task(
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            return result.text
+            return result.text or ""
 
         provider = MCPSamplingProvider(
             name="mcp-sampling",
