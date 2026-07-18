@@ -186,16 +186,15 @@ def _diagnose_match_failure(
 
         # Find first differing line
         diff_lines: list[str] = []
-        # zip() strict= needs Python 3.10+ (this codebase still runs on 3.9); these are
-        # intentionally allowed to differ in length (that's what the diagnostics below detect).
-        for _i, (expected, found) in enumerate(
-            zip(search_preview, best_window[:preview_n])  # noqa: B905
-        ):
+        # strict=False: the window can be shorter than the preview near end-of-file;
+        # length mismatches are exactly what the diagnostics below report.
+        for expected, found in zip(search_preview, best_window[:preview_n], strict=False):
             if expected != found:
                 diff_lines.append(f"  EXPECTED: {expected!r}")
                 diff_lines.append(f"  FOUND:    {found!r}")
-                # Find column of first difference
-                for col, (a, b) in enumerate(zip(expected, found)):  # noqa: B905
+                # strict=False: lines may differ in length; the for-else reports the
+                # prefix case when no differing column is found.
+                for col, (a, b) in enumerate(zip(expected, found, strict=False)):
                     if a != b:
                         diff_lines.append(f"  {'':>10}{' ' * col}^ difference at column {col}")
                         break

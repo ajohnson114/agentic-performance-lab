@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from perflab.analyzers.metrics_rollup import calc_speedup
 from perflab.memory.run_store import RunStore, load_profiler_summaries
 from perflab.optimizers.history import make_history_entry
-from perflab.optimizers.progress import fmt_elapsed
+from perflab.optimizers.progress import fmt_elapsed, usage_input_tokens, usage_output_tokens
 from perflab.reporting.generate import ReportParams, generate_reports
 from perflab.task_spec import TaskSpec
 
@@ -185,8 +185,8 @@ def run(ctx: AgentContext) -> None:
             )
             ctx.total_llm_calls += 1
             ctx.total_llm_latency += summary_latency
-            ctx.total_input_tokens += summary_usage.get("input_tokens") or summary_usage.get("prompt_tokens", 0)
-            ctx.total_output_tokens += summary_usage.get("output_tokens") or summary_usage.get("completion_tokens", 0)
+            ctx.total_input_tokens += usage_input_tokens(summary_usage)
+            ctx.total_output_tokens += usage_output_tokens(summary_usage)
             if optimization_summary_text:
                 (rp.run_dir / "optimization_summary.md").write_text(
                     optimization_summary_text, encoding="utf-8",

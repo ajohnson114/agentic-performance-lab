@@ -112,6 +112,25 @@ class TestYamlOverlay:
         assert cfg.agent.n_candidates == 10
         assert cfg.agent.max_iters == 12  # default preserved
 
+    def test_invalid_values_degrade_to_defaults(self):
+        # A typo'd value must be skipped with a warning, not abort config
+        # load (and thereby every CLI command)
+        cfg = PerfLabConfig()
+        _overlay_yaml(cfg, {
+            "llm": {"temperature": "abc", "model": "custom"},
+            "benchmark": {"warmup": "not-a-number"},
+            "agent": {"max_iters": "nope", "n_candidates": 9},
+            "ollama": {"allowed_ports": ["x"]},
+            "mps": {"device_index": "zero"},
+        })
+        assert cfg.llm.temperature == 0.7          # bad value skipped
+        assert cfg.llm.model == "custom"           # good sibling still applied
+        assert cfg.benchmark.warmup == 3
+        assert cfg.agent.max_iters == 12
+        assert cfg.agent.n_candidates == 9
+        assert cfg.ollama.allowed_ports == []
+        assert cfg.mps.device_index is None
+
 
 # ---------------------------------------------------------------------------
 # Env var overlay

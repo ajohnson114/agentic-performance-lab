@@ -250,6 +250,7 @@ def run_ci_check(
     task: TaskSpec,
     baseline_path: Path | None = None,
     ncu_summary: dict | None = None,
+    tolerance: float | None = None,
 ) -> CICheckResult:
     """Run benchmark and compare against baseline for regression.
 
@@ -264,9 +265,13 @@ def run_ci_check(
     If ncu_summary is provided, it is compared against the baseline's
     NCU data. If not provided, attempts to find NCU data from the most
     recent run in the run store.
+
+    tolerance (a fraction, e.g. 0.15 = 15%) overrides the task's
+    regression_tolerance — for noisy environments like shared CI runners
+    where the task's locally-tuned tolerance would flake.
     """
     bp = baseline_path or _default_baseline_path(task)
-    tol = task.constraints.regression_tolerance
+    tol = tolerance if tolerance is not None else task.constraints.regression_tolerance
     metric_name = task.benchmark.metric.name
     metric_mode = task.benchmark.metric.mode
     sec = task.benchmark.secondary_metric

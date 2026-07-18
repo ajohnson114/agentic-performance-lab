@@ -418,6 +418,24 @@ class TestRunCICheckMaximize:
         result = run_ci_check(task)
         assert result.passed is True
 
+    @patch("perflab.ci._run_bench_full", return_value={"tflops": {"median": 0.90}})
+    def test_tolerance_override_relaxes_task_tolerance(self, mock_bench, tmp_path):
+        # 10% regression: fails at the task's 5% tolerance, passes when the
+        # caller overrides with 15% (the --tolerance CI flag path)
+        task = _make_task(tmp_path, metric_mode="maximize", regression_tolerance=0.05)
+        _write_baseline(tmp_path / "baseline.json", 1.0)
+        result = run_ci_check(task, tolerance=0.15)
+        assert result.passed is True
+        assert result.tolerance_pct == pytest.approx(15.0)
+
+    @patch("perflab.ci._run_bench_full", return_value={"tflops": {"median": 0.97}})
+    def test_tolerance_override_can_tighten(self, mock_bench, tmp_path):
+        # 3% regression: passes at the task's 5%, fails when tightened to 1%
+        task = _make_task(tmp_path, metric_mode="maximize", regression_tolerance=0.05)
+        _write_baseline(tmp_path / "baseline.json", 1.0)
+        result = run_ci_check(task, tolerance=0.01)
+        assert result.passed is False
+
 
 # ---------------------------------------------------------------------------
 # run_ci_check — primary only (minimize)

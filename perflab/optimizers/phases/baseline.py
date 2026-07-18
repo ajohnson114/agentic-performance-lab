@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 from typing import TYPE_CHECKING
@@ -58,11 +57,8 @@ def run(ctx: AgentContext) -> None:
     # System info capture
     sysinfo: dict = {}
     try:
-        from perflab.tools.sysinfo import collect_system_info, warn_if_noisy
-        sysinfo = collect_system_info()
-        (rp.run_dir / "system_info.json").write_text(
-            json.dumps(sysinfo, indent=2), encoding="utf-8"
-        )
+        from perflab.tools.sysinfo import capture_system_info, warn_if_noisy
+        sysinfo = capture_system_info(rp.run_dir)
         for warning in warn_if_noisy():
             progress.on_message(f"[agent] WARNING: {warning}")
     except Exception as exc:  # noqa: BLE001 -- best-effort system info capture, must not block the run

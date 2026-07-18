@@ -16,6 +16,8 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 
+from perflab.tools.symbols import kernel_base_name, mangled_base_name
+
 # 2048 chars: keeps compiler summary under ~500 tokens to avoid consuming the LLM's context budget
 _MAX_SUMMARY_CHARS = 2048
 
@@ -680,13 +682,9 @@ def _fuzzy_kernel_match(name_a: str, name_b: str) -> bool:
     b = name_b.lower()
     if a == b or a in b or b in a:
         return True
-    # Extract base name: strip leading _Z\d+, template args, namespaces
+    # Extract base name: strip leading _Z<len> mangle prefix, template args, namespaces
     def _base(s: str) -> str:
-        # Demangle prefix: _Z<len><name>...
-        m = re.match(r"_Z\d+(\w+)", s)
-        if m:
-            s = m.group(1)
-        return s.split("::")[-1].split("<")[0].split("(")[0].lower()
+        return kernel_base_name(mangled_base_name(s) or s).lower()
     base_a = _base(name_a)
     base_b = _base(name_b)
     return bool(base_a and base_b and (base_a in base_b or base_b in base_a))

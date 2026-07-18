@@ -7,7 +7,29 @@ from pathlib import Path
 
 import pytest
 
-from perflab.memory.run_store import RunStore
+from perflab.memory.run_store import RunStore, validate_run_id
+
+# ── validate_run_id ───────────────────────────────────────────────
+
+class TestValidateRunId:
+    def test_plain_segment_passes(self):
+        assert validate_run_id("20260718-120000-ab12") == "20260718-120000-ab12"
+
+    @pytest.mark.parametrize("bad", ["", ".", "..", "../x", "a/b", "/etc/passwd"])
+    def test_traversal_shapes_raise(self, bad):
+        with pytest.raises(ValueError):
+            validate_run_id(bad)
+
+    def test_get_run_rejects_traversal(self, tmp_path: Path):
+        store = RunStore(tmp_path)
+        with pytest.raises(ValueError):
+            store.get_run("../outside")
+
+    def test_update_meta_rejects_traversal(self, tmp_path: Path):
+        store = RunStore(tmp_path)
+        with pytest.raises(ValueError):
+            store.update_meta("../../somewhere", {"status": "x"})
+
 
 # ── RunStore.new_run ──────────────────────────────────────────────
 

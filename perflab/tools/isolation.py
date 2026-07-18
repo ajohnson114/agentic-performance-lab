@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 IsolationLevel = Literal["none", "restricted", "strict"]
@@ -93,6 +95,48 @@ def resolve_level(
     without invoking Typer.
     """
     return normalize_level(cli_level or task_level or config_level)
+
+
+def read_task_isolation(task_file: Path) -> tuple[str | None, bool]:
+    """Read ``isolation.level`` and ``constraints.network`` from a task.yaml.
+
+    Read via raw yaml.safe_load rather than through TaskSpec/Constraints;
+    promoting these to proper TaskSpec fields (with schema validation and
+    ``perflab show-task`` visibility) is a documented follow-up.
+    """
+    try:
+        data = yaml.safe_load(task_file.read_text(encoding="utf-8")) or {}
+    except (yaml.YAMLError, OSError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    isolation_data = data.get("isolation")
+    level = isolation_data.get("level") if isinstance(isolation_data, dict) else None
+    constraints_data = data.get("constraints")
+    network = bool(constraints_data.get("network", False)) if isinstance(constraints_data, dict) else False
+    return level, network
+
+
+def resolve_policy(
+    task_file: Path,
+    config_level: str | None,
+    cli_level: str | None = None,
+) -> IsolationPolicy | None:
+    """Resolve the effective sandbox policy: CLI flag > task.yaml > config.
+
+    Returns None when the resolved level is "none". Shared by ``perflab
+    agent`` and the MCP server's agent tools so every entrypoint that runs
+    candidate code applies the same policy — the MCP tools previously built
+    AgentConfig without isolation, silently downgrading a task.yaml that
+    asked for a sandbox.
+
+    Raises ValueError (from normalize_level) on an invalid level string.
+    """
+    task_level, network = read_task_isolation(task_file)
+    level = resolve_level(cli_level, task_level, config_level)
+    if level == "none":
+        return None
+    return IsolationPolicy(level=level, network=network)
 
 
 @dataclass

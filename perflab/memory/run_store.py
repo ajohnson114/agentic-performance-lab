@@ -15,6 +15,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def validate_run_id(run_id: str) -> str:
+    """Reject run_ids that are not a single plain path segment.
+
+    run_id is joined onto runs_root and reaches these methods from CLI
+    arguments and MCP clients — a value like "../../etc" would read or
+    write outside the runs directory.
+    """
+    if not run_id or run_id in (".", "..") or run_id != Path(run_id).name:
+        raise ValueError(f"Invalid run_id: {run_id!r} (must be a plain directory name)")
+    return run_id
+
+
 @dataclass
 class RunPaths:
     run_id: str
@@ -152,9 +165,10 @@ class RunStore:
     def get_run(self, run_id: str) -> dict:
         """Load full run data: meta, report, bench, profiler summaries.
 
-        Raises FileNotFoundError if the run directory does not exist.
+        Raises ValueError on a malformed run_id, FileNotFoundError if the
+        run directory does not exist.
         """
-        run_dir = self.runs_root / run_id
+        run_dir = self.runs_root / validate_run_id(run_id)
         if not run_dir.exists():
             raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
@@ -268,7 +282,7 @@ class RunStore:
 
     def update_meta(self, run_id: str, updates: dict) -> None:
         """Merge updates into the run's meta.json."""
-        meta_path = self.runs_root / run_id / "meta.json"
+        meta_path = self.runs_root / validate_run_id(run_id) / "meta.json"
         meta: dict = {}
         if meta_path.exists():
             try:

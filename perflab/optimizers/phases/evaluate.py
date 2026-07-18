@@ -308,8 +308,10 @@ def accept_best(
     shutil.rmtree(backup_dir, ignore_errors=True)
     progress.on_message("[agent]   No improving candidate this iteration")
     best_desc = scored[0].description if scored else "no valid candidates"
-    best_val = scored[0].value if scored else ctx.best_value
-    reject_val = best_val or ctx.best_value
+    # Explicit None check: a genuine 0.0 metric value must be recorded, not
+    # silently replaced by ctx.best_value.
+    best_val = scored[0].value if scored else None
+    reject_val = best_val if best_val is not None else ctx.best_value
     ctx.history.append(make_history_entry(
         it, f"no improvement ({best_desc})", reject_val, ctx.baseline_val,
         accepted=False,

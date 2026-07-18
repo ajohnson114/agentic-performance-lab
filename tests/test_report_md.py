@@ -73,6 +73,25 @@ class TestWriteReportMd:
         assert "Bottleneck diagnosis" in text
         assert "Low SM util" in text
 
+    def test_llm_text_cannot_break_table_cells(self, tmp_path: Path):
+        # notes/root_cause are LLM-derived; literal '|' and newlines must not
+        # add table columns or split rows
+        p = tmp_path / "report.md"
+        data = _minimal_data(
+            rows=[{"iter": 1, "value": 1.0, "accepted": True,
+                   "notes": "used a | pipe\nand a newline"}],
+            bottleneck_diagnoses=[
+                {"rank": 1, "bottleneck": "x|y", "root_cause": "a\nb", "confidence": "high"},
+            ],
+        )
+        write_report_md(p, data)
+        for line in p.read_text().splitlines():
+            if line.startswith("|") and "pipe" in line:
+                assert line.count("|") == line.count("\\|") + 5  # 4-col row: 5 bare pipes
+            if line.startswith("|") and "x" in line and "y" in line:
+                assert "x\\|y" in line
+        assert "a b" in p.read_text()  # newline flattened, row not split
+
     def test_early_stop_section(self, tmp_path: Path):
         p = tmp_path / "report.md"
         data = _minimal_data(early_stop_reason="5 consecutive failures")

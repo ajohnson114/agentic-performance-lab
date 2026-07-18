@@ -21,10 +21,32 @@ class ListProgress:
         self.messages.append(message)
 
 
+def _usage_count(usage: dict, key: str, fallback_key: str) -> int:
+    """Read a token count, preferring `key` and falling back to `fallback_key`.
+
+    Uses explicit None checks: a provider may legitimately report 0 tokens,
+    which `usage.get(key) or usage.get(fallback_key, 0)` would misread as missing.
+    """
+    val = usage.get(key)
+    if val is None:
+        val = usage.get(fallback_key)
+    return val if val is not None else 0
+
+
+def usage_input_tokens(usage: dict) -> int:
+    """Input/prompt token count from a provider usage dict."""
+    return _usage_count(usage, "input_tokens", "prompt_tokens")
+
+
+def usage_output_tokens(usage: dict) -> int:
+    """Output/completion token count from a provider usage dict."""
+    return _usage_count(usage, "output_tokens", "completion_tokens")
+
+
 def fmt_usage(usage: dict) -> str:
     """Format token usage as 'in=1234, out=567, total=1801'."""
-    inp = usage.get("input_tokens") or usage.get("prompt_tokens", 0)
-    out = usage.get("output_tokens") or usage.get("completion_tokens", 0)
+    inp = usage_input_tokens(usage)
+    out = usage_output_tokens(usage)
     total = inp + out
     return f"in={inp}, out={out}, total={total}"
 

@@ -383,6 +383,20 @@ class TestCreateTaskTool:
         assert "error" in result
         assert "already exists" in result["error"]
 
+    def test_rejects_path_traversal_names(self, tmp_path):
+        from perflab.server.mcp_server import create_task
+
+        for bad in ("../evil", "a/b", "..", ".", ".hidden", "/abs/path", ""):
+            result = create_task(name=bad, program_type="python", tasks_root=str(tmp_path))
+            assert "error" in result, f"name={bad!r} should be rejected"
+
+        result = create_task(
+            name="ok", program_type="python", category="../outside",
+            tasks_root=str(tmp_path),
+        )
+        assert "error" in result
+        assert not (tmp_path.parent / "outside").exists()
+
     def test_custom_category(self, tmp_path):
         from perflab.server.mcp_server import create_task
 
@@ -586,3 +600,33 @@ class TestSuggestThresholdsTool:
 
         result = suggest_thresholds("ruby")
         assert "error" in result
+
+
+@needs_fastmcp
+class TestAgentIsolationResolution:
+    """The MCP agent tools must honor task.yaml/config isolation (the CLI
+    already did; the server previously built AgentConfig without it)."""
+
+    def test_task_yaml_level_reaches_policy(self, tmp_path, monkeypatch):
+        import perflab.config
+        from perflab.config import PerfLabConfig
+        from perflab.server.mcp_server import _resolve_isolation
+
+        monkeypatch.setattr(perflab.config, "load_config", lambda: PerfLabConfig())
+        task_file = tmp_path / "task.yaml"
+        task_file.write_text("isolation:\n  level: restricted\n", encoding="utf-8")
+
+        policy = _resolve_isolation(task_file)
+        assert policy is not None
+        assert policy.level == "restricted"
+
+    def test_defaults_to_no_policy(self, tmp_path, monkeypatch):
+        import perflab.config
+        from perflab.config import PerfLabConfig
+        from perflab.server.mcp_server import _resolve_isolation
+
+        monkeypatch.setattr(perflab.config, "load_config", lambda: PerfLabConfig())
+        task_file = tmp_path / "task.yaml"
+        task_file.write_text("name: t\n", encoding="utf-8")
+
+        assert _resolve_isolation(task_file) is None

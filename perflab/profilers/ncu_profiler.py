@@ -9,6 +9,7 @@ from pathlib import Path
 
 from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
+from perflab.tools.symbols import demangle
 
 logger = logging.getLogger(__name__)
 
@@ -168,22 +169,10 @@ def _demangle_kernel_name(mangled: str) -> str:
     """Best-effort demangling of C++ kernel names.
 
     Tries c++filt if available, otherwise extracts the base name from
-    the mangled symbol.
+    the mangled symbol. Cached in perflab.tools.symbols, so repeated
+    kernels do not respawn c++filt.
     """
-    if shutil.which("c++filt"):
-        try:
-            res = run_cmd(["c++filt", mangled], cwd=Path("."))
-            if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()
-        except (OSError, ValueError):
-            pass
-
-    # Fallback: extract name between _Z<len> prefix and parameter types
-    import re
-    m = re.match(r"_Z\d+(\w+)", mangled)
-    if m:
-        return m.group(1)
-    return mangled
+    return demangle(mangled, base_name_fallback=True)
 
 
 def classify_sass_instructions(sass_text: str) -> dict:

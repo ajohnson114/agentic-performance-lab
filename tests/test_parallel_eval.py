@@ -177,7 +177,7 @@ class TestParallelPrescreen:
 
         # Block that tries to edit a non-allowed file
         blocks = [SearchReplaceBlock(file_path="tests.py", search="x", replace="y")]
-        result = _prescreen_candidate(0, blocks, "test", task, ws, 1)
+        result = _prescreen_candidate(0, blocks, "test", task, ws)
         assert result["passed"] is False
         assert result["error"]["type"] == "validation"
 
@@ -202,7 +202,7 @@ class TestParallelPrescreen:
         )
 
         blocks = [SearchReplaceBlock(file_path="source.py", search="x = 1", replace="x = 2")]
-        result = _prescreen_candidate(0, blocks, "change x", task, ws, 1)
+        result = _prescreen_candidate(0, blocks, "change x", task, ws)
         assert result["passed"] is True
         assert result["error"] is None
 

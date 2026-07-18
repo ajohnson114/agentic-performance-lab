@@ -213,6 +213,17 @@ class AgentEventLog:
             "flags_source": flags_source,
         })
 
+    def auto_tune_sweep(
+        self, iteration: int, candidates_tried: int,
+        best_value: float, best_knobs: dict, improvement: float,
+    ) -> None:
+        self._write("auto_tune_sweep", iteration, {
+            "candidates_tried": candidates_tried,
+            "best_value": best_value,
+            "best_knobs": best_knobs,
+            "improvement": improvement,
+        })
+
     def roofline_detected(
         self, peak_tflops: float, peak_mem_bw_gbs: float,
         source: str, device: str,
@@ -278,6 +289,15 @@ def replay_events(run_dir: Path) -> str:
 
         elif et == "candidate_accepted":
             lines.append(f"{iter_str}  >>> ACCEPTED candidate {ev['candidate_index']}: value={ev['value']:.6g}, delta={ev['delta']:+.6g}, speedup={ev['speedup']:.2f}x")
+
+        elif et == "auto_tune_sweep":
+            lines.append(
+                f"{iter_str}  Auto-tune sweep: {ev.get('candidates_tried', 0)} candidates tried, "
+                f"best={ev.get('best_value', 0):.6g} (improvement {ev.get('improvement', 0):+.6g})"
+            )
+            knobs = ev.get("best_knobs") or {}
+            if knobs:
+                lines.append(f"    Best knobs: {', '.join(f'{k}={v}' for k, v in knobs.items())}")
 
         elif et == "error_feedback":
             n = ev.get("error_count", 0)

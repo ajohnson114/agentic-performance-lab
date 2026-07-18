@@ -65,15 +65,23 @@ def _echo_run_links(run_dir: Path) -> None:
         typer.echo(f"Dashboard: {dashboard_uri}")
 
 
+def _load_task(task_yaml: str) -> TaskSpec:
+    """Load a task file with a clean CLI error instead of a raw traceback."""
+    task_file = Path(task_yaml)
+    if not task_file.exists():
+        typer.echo(f"Error: task file not found: {task_file}")
+        raise typer.Exit(code=2)
+    return TaskSpec.load(task_file)
+
+
 @app.command()
 def profile(task_yaml: str):
     """Run correctness + benchmark + generate profiles (no code/knob search loop)."""
-    task_file = Path(task_yaml)
-    task = TaskSpec.load(task_file)
+    task = _load_task(task_yaml)
     run_dir = profile_only(task)
     _echo_run_links(run_dir)
 
-@app.command()
+@app.command(name="optimize")
 def optimize_cmd(
     task_yaml: str,
     iters: int = typer.Option(None, help="Max optimization iterations (overrides task.yaml max_iters)"),
@@ -84,13 +92,9 @@ def optimize_cmd(
     Define a ``sweep`` section in tuning.yaml to specify the search space.
     Without a sweep section, falls back to the legacy hardcoded knob sweep.
     """
-    task_file = Path(task_yaml)
-    task = TaskSpec.load(task_file)
+    task = _load_task(task_yaml)
     run_dir = optimize(task, iters=iters, max_trials=max_trials)
     _echo_run_links(run_dir)
-
-# Friendly alias
-app.command(name="optimize")(optimize_cmd)
 
 
 @app.command()
@@ -358,13 +362,16 @@ def ci_check(
     task_yaml: str = typer.Argument(..., help="Path to task YAML"),
     save_baseline: bool = typer.Option(False, "--save-baseline", help="Run benchmark and save as baseline"),
     baseline_file: str = typer.Option(None, "--baseline-file", help="Path to baseline JSON file"),
+    tolerance: float = typer.Option(
+        None, "--tolerance",
+        help="Override the task's regression tolerance (fraction, e.g. 0.15 = 15%) — for noisy CI runners",
+    ),
 ):
     """Run a CI regression check against a saved baseline."""
     from perflab.ci import run_ci_check
     from perflab.ci import save_baseline as save_bl
 
-    task_file = Path(task_yaml)
-    task = TaskSpec.load(task_file)
+    task = _load_task(task_yaml)
     bp = Path(baseline_file) if baseline_file else None
 
     if save_baseline:
@@ -372,7 +379,7 @@ def ci_check(
         typer.echo(f"Baseline saved to {saved}")
         raise typer.Exit(code=0)
 
-    result = run_ci_check(task, bp)
+    result = run_ci_check(task, bp, tolerance=tolerance)
     typer.echo(json.dumps(result.to_dict(), indent=2))
 
     # Surface advisory warnings
@@ -402,29 +409,6 @@ def ci_check(
         raise typer.Exit(code=1)
 
 
-def _read_task_yaml_isolation(task_file: Path) -> tuple[str | None, bool]:
-    """Read `isolation.level` and `constraints.network` directly from task.yaml.
-
-    Read via a raw yaml.safe_load rather than through TaskSpec/Constraints
-    (perflab/task_spec.py) because that module is being restructured by a
-    parallel, unrelated fix right now -- reading raw avoids colliding with
-    it. Once that lands, promote these into proper TaskSpec fields (with
-    schema validation and `perflab show-task` visibility) instead of this
-    shim.
-    """
-    try:
-        data = yaml.safe_load(task_file.read_text(encoding="utf-8")) or {}
-    except (yaml.YAMLError, OSError):
-        return None, False
-    if not isinstance(data, dict):
-        return None, False
-    isolation_data = data.get("isolation")
-    level = isolation_data.get("level") if isinstance(isolation_data, dict) else None
-    constraints_data = data.get("constraints")
-    network = bool(constraints_data.get("network", False)) if isinstance(constraints_data, dict) else False
-    return level, network
-
-
 @app.command()
 def agent(
     task_yaml: str = typer.Argument(..., help="Path to task YAML"),
@@ -442,10 +426,10 @@ def agent(
     """Run the agentic LLM-driven optimizer with beam search."""
     from perflab.llm.config import LLMConfig
     from perflab.optimizers.agent import AgentConfig, run_agent
-    from perflab.tools.isolation import IsolationPolicy, default_level_for_host, resolve_level
+    from perflab.tools.isolation import default_level_for_host, resolve_policy
 
     task_file = Path(task_yaml)
-    task = TaskSpec.load(task_file)
+    task = _load_task(task_yaml)
     llm_config = LLMConfig.load()
 
     if not llm_config.is_configured():
@@ -470,23 +454,19 @@ def agent(
     # through AgentConfig into every candidate benchmark/correctness subprocess
     # (perflab/optimizers/phases/{prescreen,evaluate,autotune}.py and the
     # baseline pipeline, so sandbox overhead cancels out of speedup comparisons).
-    task_isolation_level, task_network = _read_task_yaml_isolation(task_file)
-    isolation_level = resolve_level(isolation, task_isolation_level, global_cfg.isolation.level)
-    isolation_policy: IsolationPolicy | None = None
-    if isolation_level == "none":
+    isolation_policy = resolve_policy(task_file, global_cfg.isolation.level, cli_level=isolation)
+    if isolation_policy is None:
         typer.echo("Candidate code runs unsandboxed on this host (isolation: none).")
+    elif default_level_for_host() == "none":
+        # bwrap unavailable (non-Linux, or user namespaces disabled):
+        # wrap_command will fall back per-call, so say it loudly up front.
+        typer.echo(
+            f"WARNING: isolation '{isolation_policy.level}' requested, but this host "
+            "cannot sandbox (bwrap unavailable or not Linux). Candidate code "
+            "will run UNSANDBOXED (rlimits/env-allowlist only)."
+        )
     else:
-        isolation_policy = IsolationPolicy(level=isolation_level, network=task_network)
-        if default_level_for_host() == "none":
-            # bwrap unavailable (non-Linux, or user namespaces disabled):
-            # wrap_command will fall back per-call, so say it loudly up front.
-            typer.echo(
-                f"WARNING: isolation '{isolation_level}' requested, but this host "
-                "cannot sandbox (bwrap unavailable or not Linux). Candidate code "
-                "will run UNSANDBOXED (rlimits/env-allowlist only)."
-            )
-        else:
-            typer.echo(f"Isolation: {isolation_level} (bwrap sandbox active for candidate runs).")
+        typer.echo(f"Isolation: {isolation_policy.level} (bwrap sandbox active for candidate runs).")
 
     config = AgentConfig(
         n_candidates=candidates or task.agent.n_candidates or ga.n_candidates,

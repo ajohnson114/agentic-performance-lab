@@ -39,14 +39,14 @@ _HIGHER_IS_BETTER = {
     "ipc", "cpus_utilized",
     "tma.retiring_pct",
     # nsys
-    "gpu_active_pct", "cuda_kernel_time_ms",
+    "gpu_active_pct",
     # ncu
     "sm_utilization_pct", "achieved_occupancy_pct", "achieved_bw_gbs",
     "memory_throughput_pct", "compute_throughput_pct",
     "tensor_core_utilization_pct", "branch_efficiency_pct",
     "l1_hit_rate", "l2_hit_rate",
     # torch_profiler
-    "total_flops", "total_tflops", "cpu_vs_gpu.ratio",
+    "cpu_vs_gpu.ratio",
     # jax
     "mxu_utilization_pct", "device_fraction", "hlo_cost_tflops",
 }
@@ -60,12 +60,16 @@ _LOWER_IS_BETTER = {
     "tma_level2.memory_bound_pct", "tma_level2.core_bound_pct",
     "tma_level2.l1_bound_pct", "tma_level2.l2_bound_pct",
     "tma_level2.l3_bound_pct", "tma_level2.dram_bound_pct",
-    # nsys
+    # nsys — kernel time is total device time spent for a fixed workload, so
+    # reductions are speedups (it was previously misfiled as higher-is-better,
+    # which labeled genuine kernel-time wins "regressed" in the LLM context)
     "avg_kernel_gap_us", "api_overhead_ms", "memcpy_time_ms", "total_sync_ms",
+    "cuda_kernel_time_ms",
     # ncu
     "bank_conflicts", "sectors_per_request", "dominant_stall_pct",
-    # torch_profiler
-    "sync_count", "total_sync_time_us",
+    # torch_profiler — total_flops/total_tflops are op counts for a fixed
+    # task, not rates: doing the same work with fewer operations is a win
+    "sync_count", "total_sync_time_us", "total_flops", "total_tflops",
     "memory.total_allocations", "memory.peak_memory_mb",
     # memray
     "peak_memory_mb", "total_allocated_mb", "total_allocations",

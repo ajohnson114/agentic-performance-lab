@@ -51,6 +51,20 @@ class TestComputeProfileDiff:
         gap_delta = next(d for d in deltas if d.metric == "nsys.avg_kernel_gap_us")
         assert gap_delta.direction == "improved"
 
+    def test_kernel_time_reduction_is_improvement(self):
+        prev = {"nsys": {"cuda_kernel_time_ms": 120.0}}
+        curr = {"nsys": {"cuda_kernel_time_ms": 60.0}}
+        deltas = compute_profile_diff(prev, curr, "maximize")
+        kt_delta = next(d for d in deltas if d.metric == "nsys.cuda_kernel_time_ms")
+        assert kt_delta.direction == "improved"
+
+    def test_flop_count_reduction_is_improvement(self):
+        prev = {"torch_profiler": {"total_tflops": 4.0}}
+        curr = {"torch_profiler": {"total_tflops": 2.0}}
+        deltas = compute_profile_diff(prev, curr, "maximize")
+        fl_delta = next(d for d in deltas if d.metric == "torch_profiler.total_tflops")
+        assert fl_delta.direction == "improved"
+
 
 class TestSignificance:
     def test_high_significance(self):
@@ -283,12 +297,14 @@ class TestTorchProfilerDiff:
         assert ratio[0].after == 1.5
 
     def test_flops_diff(self):
+        # total_tflops is an op count for a fixed workload, not a rate:
+        # executing 4x the FLOPs for the same task is extra work, not a win
         prev = {"torch_profiler": {"total_tflops": 0.5}}
         curr = {"torch_profiler": {"total_tflops": 2.0}}
         deltas = compute_profile_diff(prev, curr)
         flops = [d for d in deltas if d.metric == "torch_profiler.total_tflops"]
         assert len(flops) == 1
-        assert flops[0].direction == "improved"
+        assert flops[0].direction == "regressed"
 
 
 class TestJaxMetricDiff:

@@ -8,20 +8,24 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# SIMD instruction mnemonics by ISA
+# SIMD instruction mnemonics by ISA. Packed forms only: scalar SSE/AVX ops
+# (movss/addss/vmovsd, ... — "ss"/"sd" = single element) say nothing about
+# vectorization and previously produced false "SIMD present" verdicts.
 _SSE_RE = re.compile(r"\b(movaps|movups|addps|mulps|subps|divps|xorps|andps|"
-                     r"movapd|addpd|mulpd|subpd|divpd|maxps|minps|"
-                     r"movss|addss|mulss|cvtss|cvtsd|ucomiss|shufps)\b", re.I)
+                     r"movapd|movupd|addpd|mulpd|subpd|divpd|maxps|minps|"
+                     r"shufps)\b", re.I)
 _AVX_RE = re.compile(r"\b(vmovaps|vmovups|vaddps|vmulps|vsubps|vfmadd|vfmsub|"
                      r"vfnmadd|vfnmsub|vmovapd|vaddpd|vmulpd|vsubpd|"
                      r"vbroadcast|vperm|vblend|vzeroall|vzeroupper|"
-                     r"vmovsd|vmovss|vxorps|vandps|vorps)\b", re.I)
+                     r"vxorps|vandps|vorps)\b", re.I)
 _AVX512_RE = re.compile(r"\b(zmm\d+|vmovaps\s.*zmm|vaddps\s.*zmm|"
                         r"vmulps\s.*zmm|vfmadd\d+ps\s.*zmm)\b", re.I)
-_NEON_RE = re.compile(r"\b(fmla|fmul|fadd|fsub|fdiv|ld1|st1|"
-                      r"dup|ins|mov\s+v\d|movi\s+v\d|"
-                      r"addv|faddp|fmaxnm|fminnm|"
-                      r"shl|ushr|sshr|and\s+v\d|orr\s+v\d)\b", re.I)
+# AArch64 mnemonics like fadd/and/shl/mov also exist in scalar form, so the
+# ambiguous group only counts when the operand is a vector register (v0.4s);
+# ld1-4/st1-4/addv/faddp are inherently vector.
+_NEON_RE = re.compile(r"\b(?:fmla|fmul|fadd|fsub|fdiv|fmaxnm|fminnm|"
+                      r"dup|ins|movi?|shl|ushr|sshr|and|orr)\s+v\d|"
+                      r"\b(?:ld[1-4]|st[1-4]|addv|faddp)\b", re.I)
 
 
 @dataclass
@@ -54,6 +58,12 @@ def check_vectorization_from_perf_annotate(annotate_text: str) -> VectorizationS
 
     func_header_re = re.compile(r"Source code & Disassembly of\s+(\S+)")
     pct_line_re = re.compile(r"^\s*([\d.]+)\s+:")
+    # Disassembly lines carry "<addr>: <insn>" after the percent column
+    # (e.g. "  45.20 :  14: vmovaps %ymm0, (%rax)"). Interleaved source
+    # lines have only the bare percent colon — matching mnemonics against
+    # them counted source tokens like `and`/`shl` as SIMD and inflated the
+    # simd_ratio denominator.
+    asm_line_re = re.compile(r"^\s*(?:[\d.]+\s+)?:\s*[0-9a-fA-F]+:\s+(.+)$")
 
     current_func = None
     simd_count = 0
@@ -102,15 +112,10 @@ def check_vectorization_from_perf_annotate(annotate_text: str) -> VectorizationS
             except ValueError:
                 pass
 
-        # Check for assembly instructions (lines with hex addresses or mnemonics)
-        stripped = line.strip()
-        if not stripped or stripped.startswith(";") or stripped.startswith("#"):
+        am = asm_line_re.match(line)
+        if am is None:
             continue
-
-        # Look for assembly-like lines (contain : followed by mnemonic)
-        asm_part = stripped.split(":", 1)[-1].strip() if ":" in stripped else stripped
-        if not asm_part:
-            continue
+        asm_part = am.group(1)
 
         total_asm_lines += 1
 

@@ -24,6 +24,8 @@ import bisect
 import logging
 from dataclasses import dataclass, field
 
+from perflab.tools.symbols import kernel_base_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -160,6 +162,9 @@ def compute_attribution_ranking(
     # (No torch-trace index: separate run + clock domain, see docstring.)
     nvtx_temporal = _build_nvtx_temporal_index(nvtx_ranges)
     pyspy_temporal = _build_pyspy_temporal_index(pyspy_summary)
+    # Bisect keys, hoisted: the matchers are called once per kernel below.
+    nvtx_starts = [s for s, _, _ in nvtx_temporal]
+    pyspy_starts = [s for s, _, _ in pyspy_temporal]
 
     # Build kernel → correlation timestamp lookup for temporal matching
     kernel_timestamps: dict[str, list[tuple[int, int]]] = {}
@@ -206,13 +211,13 @@ def compute_attribution_ranking(
         # Strategy 3: Temporal NVTX matching (if no framework_op yet)
         if framework_op is None and nvtx_temporal:
             timestamps = kernel_timestamps.get(name, [])
-            framework_op = _match_kernel_to_nvtx_temporal(timestamps, nvtx_temporal)
+            framework_op = _match_kernel_to_nvtx_temporal(timestamps, nvtx_temporal, nvtx_starts)
 
         # Strategy 4: Py-spy temporal join (Python function during launch)
         pyspy_caller: str | None = None
         if pyspy_temporal:
             timestamps = kernel_timestamps.get(name, [])
-            pyspy_caller = _match_kernel_to_pyspy_temporal(timestamps, pyspy_temporal)
+            pyspy_caller = _match_kernel_to_pyspy_temporal(timestamps, pyspy_temporal, pyspy_starts)
             # Use py-spy caller if we don't have one from call chain
             if caller_function is None and pyspy_caller:
                 caller_function = pyspy_caller
@@ -305,6 +310,8 @@ def enrich_with_framework_context(
     """
     # Build temporal index from NVTX ranges
     nvtx_temporal = _build_nvtx_temporal_index(nvtx_ranges) if nvtx_ranges else []
+    # Bisect keys, hoisted: the matcher is called once per edge below.
+    nvtx_starts = [s for s, _, _ in nvtx_temporal]
 
     # Build kernel → timestamps lookup from correlations
     kernel_timestamps: dict[str, list[tuple[int, int]]] = {}
@@ -320,7 +327,7 @@ def enrich_with_framework_context(
         # Strategy 1: Temporal NVTX matching (preferred)
         if nvtx_temporal:
             timestamps = kernel_timestamps.get(edge.kernel_name, [])
-            temporal_match = _match_kernel_to_nvtx_temporal(timestamps, nvtx_temporal)
+            temporal_match = _match_kernel_to_nvtx_temporal(timestamps, nvtx_temporal, nvtx_starts)
             if temporal_match:
                 edge.framework_op = temporal_match
                 continue
@@ -463,6 +470,7 @@ def _build_pyspy_temporal_index(
 def _find_best_enclosing(
     query: int,
     index: list[tuple[int, int, str]],
+    starts: list[int] | None = None,
 ) -> str | None:
     """Find the shortest interval in *index* that contains *query*.
 
@@ -471,13 +479,18 @@ def _find_best_enclosing(
     exit: once the gap ``query - start`` exceeds the current best duration,
     no earlier interval can be shorter, so we stop.
 
+    *starts* is the list of interval start times (element 0 of each tuple);
+    callers that query the same index repeatedly should precompute it once
+    and pass it in to avoid rebuilding it per query.
+
     O(log n) bisect + typically O(1-3) backward scan for non-overlapping
     intervals; O(k) for k nested intervals (rare, and k is usually small).
     """
     if not index:
         return None
 
-    starts = [s for s, _, _ in index]
+    if starts is None:
+        starts = [s for s, _, _ in index]
     pos = bisect.bisect_right(starts, query)
 
     best_name: str | None = None
@@ -501,6 +514,7 @@ def _find_best_enclosing(
 def _match_kernel_to_nvtx_temporal(
     kernel_timestamps: list[tuple[int, int]],
     nvtx_index: list[tuple[int, int, str]],
+    starts: list[int] | None = None,
 ) -> str | None:
     """Find the NVTX range that temporally contains a kernel launch.
 
@@ -513,12 +527,13 @@ def _match_kernel_to_nvtx_temporal(
     cpu_start, _ = kernel_timestamps[0]
     if cpu_start <= 0:
         return None
-    return _find_best_enclosing(cpu_start, nvtx_index)
+    return _find_best_enclosing(cpu_start, nvtx_index, starts)
 
 
 def _match_kernel_to_pyspy_temporal(
     kernel_timestamps: list[tuple[int, int]],
     pyspy_index: list[tuple[int, int, str]],
+    starts: list[int] | None = None,
 ) -> str | None:
     """Find the Python function that was on the CPU when a kernel was launched.
 
@@ -531,7 +546,7 @@ def _match_kernel_to_pyspy_temporal(
     cpu_start, _ = kernel_timestamps[0]
     if cpu_start <= 0:
         return None
-    return _find_best_enclosing(cpu_start, pyspy_index)
+    return _find_best_enclosing(cpu_start, pyspy_index, starts)
 
 
 # ---------------------------------------------------------------------------
@@ -548,8 +563,8 @@ def _fuzzy_match(cpu_func: str, kernel_name: str) -> bool:
         return True
 
     # Extract base name (strip template args, namespaces)
-    cpu_base = cpu_lower.split("::")[-1].split("<")[0].split("(")[0]
-    kernel_base = kernel_lower.split("::")[-1].split("<")[0].split("(")[0]
+    cpu_base = kernel_base_name(cpu_lower)
+    kernel_base = kernel_base_name(kernel_lower)
 
     if cpu_base and kernel_base and (cpu_base in kernel_base or kernel_base in cpu_base):
         return True
@@ -566,7 +581,8 @@ def _nvtx_matches_kernel(nvtx_name: str, kernel_name: str) -> bool:
     # These are not directly matchable by name, but temporal overlap is used
     # For now, check direct substring match
     nvtx_base = nvtx_lower.replace("aten::", "").replace("torch.", "")
-    kernel_base = kernel_lower.split("::")[-1].split("<")[0]
+    # NVTX matching has never stripped "(...)" params; keep that behavior.
+    kernel_base = kernel_base_name(kernel_lower, strip_params=False)
 
     return nvtx_base in kernel_base or kernel_base in nvtx_base
 
@@ -696,7 +712,7 @@ def _match_kernel(
         return None
 
     target_lower = target_name.lower()
-    target_base = target_lower.split("::")[-1].split("<")[0].split("(")[0]
+    target_base = kernel_base_name(target_lower)
 
     best: dict | None = None
     best_score = 0
@@ -706,7 +722,7 @@ def _match_kernel(
         if not cname:
             continue
         cname_lower = cname.lower()
-        cname_base = cname_lower.split("::")[-1].split("<")[0].split("(")[0]
+        cname_base = kernel_base_name(cname_lower)
 
         score = 0
         # Exact match

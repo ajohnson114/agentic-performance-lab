@@ -101,6 +101,46 @@ def test_llm_request_without_budget(tmp_path: Path):
     assert "prompt_token_budget" not in ev
 
 
+# -- auto_tune_sweep ----------------------------------------------------------
+
+def test_auto_tune_sweep_event(tmp_path: Path):
+    log = AgentEventLog(run_dir=tmp_path)
+    log.auto_tune_sweep(
+        iteration=2,
+        candidates_tried=8,
+        best_value=123.4,
+        best_knobs={"BLOCK_SIZE": 128, "num_warps": 4},
+        improvement=3.4,
+    )
+
+    events = _read_events(tmp_path)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["event_type"] == "auto_tune_sweep"
+    assert ev["iteration"] == 2
+    assert ev["candidates_tried"] == 8
+    assert ev["best_value"] == 123.4
+    assert ev["best_knobs"] == {"BLOCK_SIZE": 128, "num_warps": 4}
+    assert ev["improvement"] == 3.4
+
+
+def test_replay_events_auto_tune_sweep(tmp_path: Path):
+    log = AgentEventLog(run_dir=tmp_path)
+    log.auto_tune_sweep(
+        iteration=2,
+        candidates_tried=8,
+        best_value=123.4,
+        best_knobs={"BLOCK_SIZE": 128},
+        improvement=3.4,
+    )
+
+    output = replay_events(tmp_path)
+    assert "Auto-tune sweep" in output
+    assert "8 candidates" in output
+    assert "123.4" in output
+    assert "BLOCK_SIZE=128" in output
+
+
 # -- replay_events with error_feedback ----------------------------------------
 
 def test_replay_events_error_feedback(tmp_path: Path):

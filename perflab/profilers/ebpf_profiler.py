@@ -8,7 +8,7 @@ Requires: bpftrace (Linux kernel 4.15+)
 """
 from __future__ import annotations
 
-import os
+import platform
 import re
 import shutil
 import subprocess
@@ -17,18 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from perflab.profilers.base import ProfileResult, run_bench_under
-
-# One-liner bpftrace scripts for common patterns
-_SYSCALL_LATENCY_SCRIPT = r"""
-tracepoint:raw_syscalls:sys_enter { @start[tid] = nsecs; }
-tracepoint:raw_syscalls:sys_exit /@start[tid]/ {
-    @syscall_ns[args->id] = hist(nsecs - @start[tid]);
-    @total_calls[args->id] = count();
-    delete(@start[tid]);
-}
-interval:s:1 { print(@total_calls); }
-END { print(@syscall_ns); print(@total_calls); }
-"""
 
 _IO_LATENCY_SCRIPT = r"""
 tracepoint:syscalls:sys_enter_read { @read_start[tid] = nsecs; }
@@ -54,8 +42,11 @@ class EbpfProfiler:
     name: str = "ebpf"
 
     def is_available(self) -> bool:
-        # Only available on Linux with bpftrace
-        if os.uname().sysname != "Linux":
+        # Only available on Linux with bpftrace. Attaching probes needs root,
+        # and run() invokes bpftrace via `sudo -n`, so sudo must exist too.
+        if platform.system() != "Linux":
+            return False
+        if shutil.which("sudo") is None:
             return False
         return shutil.which("bpftrace") is not None
 
@@ -150,6 +141,9 @@ def _parse_bpftrace_output(text: str) -> dict:
     return result
 
 
+_SUFFIX_MULTIPLIER = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
+
+
 def _parse_histogram(text: str, var_name: str) -> dict | None:
     """Parse a bpftrace hist() output into percentile estimates."""
     # Find the histogram section
@@ -161,12 +155,13 @@ def _parse_histogram(text: str, var_name: str) -> dict | None:
     buckets: list[tuple[int, int, int]] = []
     total = 0
     for line in m.group(1).splitlines():
-        # Format: [low, high)  count |@@@@|
-        bm = re.match(r"\s*\[(\d+)(?:K|M|G)?,\s*(\d+)(?:K|M|G)?\)\s+(\d+)", line)
+        # Format: [low, high)  count |@@@@|  where bounds may carry a
+        # binary-magnitude suffix, e.g. [1K, 2K) means [1024, 2048).
+        bm = re.match(r"\s*\[(\d+)([KMG]?),\s*(\d+)([KMG]?)\)\s+(\d+)", line)
         if bm:
-            low = int(bm.group(1))
-            high = int(bm.group(2))
-            count = int(bm.group(3))
+            low = int(bm.group(1)) * _SUFFIX_MULTIPLIER[bm.group(2)]
+            high = int(bm.group(3)) * _SUFFIX_MULTIPLIER[bm.group(4)]
+            count = int(bm.group(5))
             buckets.append((low, high, count))
             total += count
 

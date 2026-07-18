@@ -9,6 +9,7 @@ import re
 import shutil
 import threading
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from perflab.profilers.base import ProfileResult, run_bench_under
@@ -110,8 +111,13 @@ class PowerProfiler:
         return ProfileResult(name=self.name, artifacts=artifacts, summary=summary)
 
 
+@lru_cache(maxsize=1)
 def _has_rapl() -> bool:
-    """Check if RAPL energy events are available via perf."""
+    """Check if RAPL energy events are available via perf.
+
+    Cached: called from both is_available() and run(), and ``perf list``
+    spawns a subprocess.
+    """
     if shutil.which("perf") is None:
         return False
     res = run_cmd(["perf", "list"], timeout_s=5)

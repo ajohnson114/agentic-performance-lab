@@ -51,3 +51,19 @@ class TestParseHistogram:
         text = "@read_ns:\n\nSome other text"
         result = _parse_histogram(text, "@read_ns")
         assert result is None
+
+    def test_suffixed_buckets_use_binary_multipliers(self):
+        # bpftrace hist() bounds carry binary-magnitude suffixes:
+        # [1K, 2K) means [1024, 2048), not [1, 2).
+        text = """@read_ns:
+[512, 1K)  10
+[1K, 2K)  60
+[2K, 4K)  20
+[8M, 16M)  10
+"""
+        result = _parse_histogram(text, "@read_ns")
+        assert result is not None
+        assert result["total_count"] == 100
+        assert result["p50_ns"] == (1024 + 2048) // 2
+        assert result["p90_ns"] == (2048 + 4096) // 2
+        assert result["p99_ns"] == ((8 << 20) + (16 << 20)) // 2

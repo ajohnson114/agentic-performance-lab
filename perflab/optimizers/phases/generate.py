@@ -13,7 +13,13 @@ from perflab.analyzers.user_actions import extract_build_suggestions
 from perflab.memory.run_store import load_profiler_summaries
 from perflab.optimizers.event_log import AgentEventLog
 from perflab.optimizers.patch import SearchReplaceBlock, read_source_files
-from perflab.optimizers.progress import AgentProgress, fmt_elapsed, fmt_usage
+from perflab.optimizers.progress import (
+    AgentProgress,
+    fmt_elapsed,
+    fmt_usage,
+    usage_input_tokens,
+    usage_output_tokens,
+)
 from perflab.optimizers.prompt import PromptContext, build_prompt, parse_candidates
 from perflab.task_spec import TaskSpec
 
@@ -439,10 +445,12 @@ def _build_roofline_context(
     return roofline_dict
 
 
-def build_iteration_prompt(ctx: AgentContext) -> list:
+def build_iteration_prompt(ctx: AgentContext) -> tuple[list, list[dict] | None]:
     """Build prompt messages for one iteration.
 
-    Reads from ctx and returns the messages list.
+    Reads from ctx and returns (messages, build_flag_recommendations) — the
+    structured flag dicts are returned alongside the messages so callers can
+    log them without scraping the rendered prompt text.
     Side effect: updates ctx.prev_summaries for the next iteration's profile diff.
     """
     task = ctx.task
@@ -573,7 +581,7 @@ def build_iteration_prompt(ctx: AgentContext) -> list:
     )
     messages = build_prompt(prompt_ctx)
     ctx.prev_summaries = profiler_summaries
-    return messages
+    return messages, build_flag_dicts
 
 
 def run(ctx: AgentContext) -> GenerateResult:
@@ -590,22 +598,12 @@ def run(ctx: AgentContext) -> GenerateResult:
     event_log = ctx.event_log
     it = ctx.iteration
 
-    messages = build_iteration_prompt(ctx)
+    messages, build_flag_recs = build_iteration_prompt(ctx)
 
     # Log build flag state for this iteration
     if task.build:
         try:
-            build_cmd_current = task.build.cmd
-            # Extract flag recommendations from the prompt (they're embedded in the messages)
-            flag_recs_for_log: list[dict] = []
-            for msg in messages:
-                if "Build flag" in msg.content and "flag" in msg.content.lower():
-                    # Extract just the flag names mentioned
-                    import re as _re
-                    flag_matches = _re.findall(r"`(-\S+)`", msg.content)
-                    flag_recs_for_log = [{"flag": f} for f in flag_matches[:10]]
-                    break
-            event_log.build_flags_state(it, build_cmd_current, flag_recs_for_log)
+            event_log.build_flags_state(it, task.build.cmd, build_flag_recs or [])
         except Exception:  # noqa: BLE001 -- best-effort event log entry, must not block the LLM call
             logger.warning("Failed to log build flags state", exc_info=True)
 
@@ -644,12 +642,12 @@ def run(ctx: AgentContext) -> GenerateResult:
     llm_latency = time.monotonic() - llm_t0
     ctx.total_llm_calls += 1
     ctx.total_llm_latency += llm_latency
-    ctx.total_input_tokens += result.usage.get("input_tokens") or result.usage.get("prompt_tokens", 0)
-    ctx.total_output_tokens += result.usage.get("output_tokens") or result.usage.get("completion_tokens", 0)
+    ctx.total_input_tokens += usage_input_tokens(result.usage)
+    ctx.total_output_tokens += usage_output_tokens(result.usage)
     progress.on_message(f"[agent] LLM response ({fmt_elapsed(llm_latency)}): {len(result.content)} chars, tokens: {fmt_usage(result.usage)}")
 
     # Parse candidates (with reasoning)
-    parsed = parse_candidates(result.content, config.n_candidates)
+    parsed = parse_candidates(result.content)
     candidate_blocks = [blocks for _, blocks in parsed]
     candidate_reasoning = [reasoning for reasoning, _ in parsed]
 

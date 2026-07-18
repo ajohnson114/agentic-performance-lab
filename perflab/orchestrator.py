@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import time
@@ -38,13 +37,9 @@ def profile_only(task: TaskSpec) -> Path:
 
     run_store = RunStore(task.out_dir)
     rp = run_store.new_run(task.name, program_type=task.program_type)
-    # Capture system info
     try:
-        from perflab.tools.sysinfo import collect_system_info
-        sysinfo = collect_system_info()
-        (rp.run_dir / "system_info.json").write_text(
-            json.dumps(sysinfo, indent=2), encoding="utf-8"
-        )
+        from perflab.tools.sysinfo import capture_system_info
+        capture_system_info(rp.run_dir)
     except Exception:  # noqa: BLE001 -- best-effort system info capture, must not abort the profiling run
         logger.warning("Failed to collect system info", exc_info=True)
 
@@ -94,13 +89,9 @@ def optimize(task: TaskSpec, iters: int | None = None, max_trials: int | None = 
     rp = run_store.new_run(task.name, program_type=task.program_type)
     artifacts_dir = rp.run_dir / "artifacts"
 
-    # Capture system info
     try:
-        from perflab.tools.sysinfo import collect_system_info
-        sysinfo = collect_system_info()
-        (rp.run_dir / "system_info.json").write_text(
-            json.dumps(sysinfo, indent=2), encoding="utf-8"
-        )
+        from perflab.tools.sysinfo import capture_system_info
+        capture_system_info(rp.run_dir)
     except Exception:  # noqa: BLE001 -- best-effort system info capture, must not abort the optimize run
         logger.warning("Failed to collect system info", exc_info=True)
 
@@ -166,8 +157,10 @@ def optimize(task: TaskSpec, iters: int | None = None, max_trials: int | None = 
                 # Revert for next trial
                 save_knobs(knobs_path, {k: v for k, v in current_knobs.items() if k != "sweep"})
 
-            # Write the winning knobs and confirm with a full re-benchmark
-            save_knobs(knobs_path, best_knobs)
+            # Write the winning knobs and confirm with a full re-benchmark.
+            # Keep the sweep: section — optimize must not permanently rewrite
+            # the user's tuning.yaml into legacy (no-sweep) mode.
+            save_knobs(knobs_path, {**best_knobs, "sweep": current_knobs["sweep"]})
             if best_iter > 0:
                 try:
                     confirm_result = run_pipeline(
@@ -188,11 +181,16 @@ def optimize(task: TaskSpec, iters: int | None = None, max_trials: int | None = 
                 accepted_any = False
                 for cand in candidates:
                     save_knobs(knobs_path, cand.new_knobs)
-                    iter_result = run_pipeline(
-                        task, rp.run_dir, artifacts_dir,
-                        save_logs=True, validate_contract_spec=True,
-                    )
-                    vi = metric_value(iter_result.bench, task.benchmark.metric.name)
+                    try:
+                        iter_result = run_pipeline(
+                            task, rp.run_dir, artifacts_dir,
+                            save_logs=True, validate_contract_spec=True,
+                        )
+                        vi = metric_value(iter_result.bench, task.benchmark.metric.name)
+                    except Exception as exc:  # noqa: BLE001 -- a single bad candidate must not abort the run (mirrors the sweep path above)
+                        rows.append(IterationRow(iter=it, value=rows[-1].value, accepted=False, notes=f"{cand.description} (error: {exc})"))
+                        save_knobs(knobs_path, current_knobs)
+                        continue
 
                     if is_improvement(vi, best_value, task.benchmark.metric.mode, task.constraints.regression_tolerance):
                         best_value = vi

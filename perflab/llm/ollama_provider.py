@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Sequence
@@ -13,6 +14,38 @@ from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 # Allowed hosts for Ollama API to prevent SSRF.
 _OLLAMA_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+# Socket-level timeout for completion/stream calls. urllib applies it to
+# connect and to each blocking read — for stream() that bounds the gap
+# between chunks, not the whole stream. Generous because a cold model load
+# can stall the first token for minutes on modest hardware; without any
+# timeout a hung Ollama server wedges the agent loop forever.
+_REQUEST_TIMEOUT_S = 600
+
+# There is no SDK doing retries for us (unlike anthropic/openai), so retry
+# transient failures here: sleep this long between attempts, one extra attempt
+# per entry.
+_RETRY_DELAYS_S = (1.0, 4.0)
+
+
+def _urlopen_with_retry(req: urllib.request.Request, timeout: float):
+    """urlopen, retrying URLError (timeouts, refused connections) and HTTP 5xx.
+
+    HTTPError subclasses URLError so it must be caught first; 4xx means the
+    request itself is bad and is never retried. urlopen raises HTTPError for
+    non-2xx, so callers' in-context status checks are a belt-and-suspenders
+    second path.
+    """
+    for delay in _RETRY_DELAYS_S:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+        except urllib.error.URLError:
+            pass
+        time.sleep(delay)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def _validate_ollama_url(api_base: str) -> None:
@@ -94,7 +127,7 @@ class OllamaProvider:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req) as resp:
+        with _urlopen_with_retry(req, _REQUEST_TIMEOUT_S) as resp:
             if resp.status != 200:
                 raise RuntimeError(
                     f"Ollama API returned HTTP {resp.status}: {resp.read().decode('utf-8', errors='replace')[:500]}"
@@ -147,7 +180,7 @@ class OllamaProvider:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req) as resp:
+        with _urlopen_with_retry(req, _REQUEST_TIMEOUT_S) as resp:
             if resp.status != 200:
                 raise RuntimeError(
                     f"Ollama API returned HTTP {resp.status}: {resp.read().decode('utf-8', errors='replace')[:500]}"

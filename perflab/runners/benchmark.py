@@ -161,6 +161,13 @@ def run_benchmark(
         cmd_args, cwd=cwd, env=run_env if run_env else None,
         timeout_s=300, rlimit_as_bytes=rlimit, env_mode="allowlist",
     )
+    # A nonzero exit is a failed run even if a bench.json exists — without
+    # this, a bench that writes results and then crashes (or a candidate that
+    # writes bench.json and exits nonzero) would count as a clean run.
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Benchmark exited with code {res.returncode}. Stdout/stderr:\n{res.stdout}\n{res.stderr}"
+        )
     if not bench_path.exists():
         raise FileNotFoundError(f"Benchmark did not create {bench_path}. Stdout/stderr:\n{res.stdout}\n{res.stderr}")
 

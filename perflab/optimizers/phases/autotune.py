@@ -111,12 +111,13 @@ def _auto_tune_sweep(
         # reprofile that follows this phase.
         if best_sweep_knobs is not None:
             save_knobs(knobs_path, {**best_sweep_knobs, "sweep": original_knobs["sweep"]})
-            event_log._write("auto_tune_sweep", iteration, {
-                "candidates_tried": len(candidates),
-                "best_value": best_sweep_value,
-                "best_knobs": best_sweep_knobs,
-                "improvement": best_sweep_value - current_best,
-            })
+            event_log.auto_tune_sweep(
+                iteration,
+                candidates_tried=len(candidates),
+                best_value=best_sweep_value,
+                best_knobs=best_sweep_knobs,
+                improvement=best_sweep_value - current_best,
+            )
             progress.on_message(
                 f"[agent] Auto-tune: found better params ({best_sweep_value:.6g} vs {current_best:.6g})"
             )

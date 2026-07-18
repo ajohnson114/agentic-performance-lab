@@ -1,14 +1,28 @@
 """System information collection for reproducible benchmarks."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
 import subprocess
 import warnings
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def capture_system_info(run_dir: Path) -> dict[str, Any]:
+    """Collect system info and persist it as <run_dir>/system_info.json.
+
+    Callers wrap this in their own try/except — capture is best-effort and
+    must never abort a run, but how failures are surfaced (logger vs. agent
+    progress messages) differs per entrypoint.
+    """
+    info = collect_system_info()
+    (run_dir / "system_info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    return info
 
 
 def collect_system_info() -> dict[str, Any]:

@@ -20,7 +20,6 @@ def _prescreen_candidate(
     reasoning: str,
     task: TaskSpec,
     ws: Path,
-    it: int,
     isolation: IsolationPolicy | None = None,
 ) -> dict:
     """Prescreen a candidate: validate patch + build + correctness (no benchmark).
@@ -125,7 +124,6 @@ def run(
 
     task = ctx.task
     ws = ctx.ws
-    it = ctx.iteration
     progress = ctx.progress
 
     n = len(candidate_blocks)
@@ -141,7 +139,7 @@ def run(
         for ci, blocks in enumerate(candidate_blocks):
             reasoning = candidate_reasoning[ci] if ci < len(candidate_reasoning) else ""
             future = executor.submit(
-                _prescreen_candidate, ci, blocks, reasoning, task, ws, it,
+                _prescreen_candidate, ci, blocks, reasoning, task, ws,
                 ctx.config.isolation,
             )
             futures[future] = ci

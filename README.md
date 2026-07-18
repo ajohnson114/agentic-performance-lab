@@ -168,7 +168,7 @@ What the resulting code is allowed to do when it runs, controlled by `--isolatio
 
 - **`--isolation=none`** (default) — no sandboxing; candidate code runs with your user's full privileges
 - **`--isolation=restricted`** — Bubblewrap (`bwrap`) sandboxing on Linux: network namespace unshared unless `task.yaml` sets `network: true`, filesystem access scoped to the workspace, GPU devices dev-bound explicitly
-- **`--isolation=strict`** — tighter variant of the above for less-trusted code
+- **`--isolation=strict`** — reserved for a seccomp syscall-denial layer on top of `restricted`; **today it behaves exactly like `restricted` plus a logged warning** — the BPF filter is not shipped yet (see DESIGN.md). On non-Linux hosts both `restricted` and `strict` fall back to `none` with an explicit warning.
 - **Resource limits** — memory, process, and file descriptor caps (Linux), applied regardless of isolation level
 
 ### Output validation

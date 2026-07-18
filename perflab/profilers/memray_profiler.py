@@ -78,6 +78,22 @@ class MemrayProfiler:
         )
 
 
+def _size_to_mb(value: float, unit: str, *, assume_bytes: bool = False) -> float:
+    """Convert a memray size (value + unit string) to MB.
+
+    Unknown units are treated as raw bytes when *assume_bytes* is set
+    (allocator tables report byte counts), otherwise as MB (summary lines).
+    """
+    u = unit.upper()
+    if u == "GB":
+        return value * 1024
+    if u == "MB":
+        return value
+    if u == "KB":
+        return value / 1024
+    return value / (1024 * 1024) if assume_bytes else value
+
+
 def _parse_memray_stats(text: str) -> dict:
     """Parse memray stats output to extract key metrics."""
     result: dict = {}
@@ -90,30 +106,12 @@ def _parse_memray_stats(text: str) -> dict:
     # Total memory allocated
     m = re.search(r"Total memory allocated:\s*([\d.]+)\s*(\w+)", text)
     if m:
-        val = float(m.group(1))
-        unit = m.group(2).upper()
-        if unit == "GB":
-            result["total_allocated_mb"] = val * 1024
-        elif unit == "MB":
-            result["total_allocated_mb"] = val
-        elif unit == "KB":
-            result["total_allocated_mb"] = val / 1024
-        else:
-            result["total_allocated_mb"] = val
+        result["total_allocated_mb"] = _size_to_mb(float(m.group(1)), m.group(2))
 
     # Peak memory
     m = re.search(r"Peak memory.*?:\s*([\d.]+)\s*(\w+)", text)
     if m:
-        val = float(m.group(1))
-        unit = m.group(2).upper()
-        if unit == "GB":
-            result["peak_memory_mb"] = val * 1024
-        elif unit == "MB":
-            result["peak_memory_mb"] = val
-        elif unit == "KB":
-            result["peak_memory_mb"] = val / 1024
-        else:
-            result["peak_memory_mb"] = val
+        result["peak_memory_mb"] = _size_to_mb(float(m.group(1)), m.group(2))
 
     # Top allocators (function-level)
     top_allocators: list[dict] = []
@@ -128,16 +126,7 @@ def _parse_memray_stats(text: str) -> dict:
         re.MULTILINE,
     )
     for m in alloc_re.finditer(text):
-        size_val = float(m.group(2))
-        size_unit = m.group(3).upper()
-        if size_unit == "GB":
-            size_mb = size_val * 1024
-        elif size_unit == "MB":
-            size_mb = size_val
-        elif size_unit == "KB":
-            size_mb = size_val / 1024
-        else:
-            size_mb = size_val / (1024 * 1024)
+        size_mb = _size_to_mb(float(m.group(2)), m.group(3), assume_bytes=True)
         top_allocators.append({
             "function": m.group(5).strip(),
             "location": m.group(6).strip(),
@@ -161,16 +150,9 @@ def _parse_memray_stats(text: str) -> dict:
                     for i, p in enumerate(parts):
                         size_m = re.match(r"([\d.]+)(GB|MB|KB|B)", p, re.IGNORECASE)
                         if size_m:
-                            size_val = float(size_m.group(1))
-                            unit = size_m.group(2).upper()
-                            if unit == "GB":
-                                size_mb = size_val * 1024
-                            elif unit == "MB":
-                                size_mb = size_val
-                            elif unit == "KB":
-                                size_mb = size_val / 1024
-                            else:
-                                size_mb = size_val / (1024 * 1024)
+                            size_mb = _size_to_mb(
+                                float(size_m.group(1)), size_m.group(2), assume_bytes=True
+                            )
                             func = " ".join(parts[:i]) or parts[-1]
                             top_allocators.append({
                                 "function": func,

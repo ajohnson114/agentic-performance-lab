@@ -147,6 +147,19 @@ def _find_project_config() -> Path | None:
     return None
 
 
+def _safe_set(obj: object, attr: str, raw: object, cast) -> None:
+    """Set obj.attr to cast(raw), warning instead of crashing on a bad value.
+
+    A typo in perflab.yaml (e.g. ``temperature: abc``) must degrade to the
+    default, not abort every command at config-load time. Mirrors the per-key
+    ValueError guards in _overlay_env.
+    """
+    try:
+        setattr(obj, attr, cast(raw))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid config value %s=%r in perflab.yaml", attr, raw)
+
+
 def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
     """Overlay a parsed YAML dict onto a PerfLabConfig instance."""
     if not isinstance(data, dict):
@@ -156,14 +169,14 @@ def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
     if isinstance(llm, dict):
         for key in ("provider", "model", "api_base", "temperature", "max_tokens"):
             if key in llm:
-                setattr(cfg.llm, key, type(getattr(cfg.llm, key))(llm[key]))
+                _safe_set(cfg.llm, key, llm[key], type(getattr(cfg.llm, key)))
 
     bench = data.get("benchmark", {})
     if isinstance(bench, dict):
         if "warmup" in bench:
-            cfg.benchmark.warmup = int(bench["warmup"])
+            _safe_set(cfg.benchmark, "warmup", bench["warmup"], int)
         if "repeats" in bench:
-            cfg.benchmark.repeats = int(bench["repeats"])
+            _safe_set(cfg.benchmark, "repeats", bench["repeats"], int)
 
     prof = data.get("profiler", {})
     if isinstance(prof, dict):
@@ -180,20 +193,21 @@ def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
             cfg.mps.device_match = str(mps["device_match"] or "")
         if "device_index" in mps:
             val = mps["device_index"]
-            cfg.mps.device_index = int(val) if val is not None else None
+            _safe_set(cfg.mps, "device_index", val, lambda v: int(v) if v is not None else None)
 
     ollama = data.get("ollama", {})
     if isinstance(ollama, dict):
         if "allow_remote" in ollama:
             cfg.ollama.allow_remote = bool(ollama["allow_remote"])
         if "allowed_ports" in ollama:
-            cfg.ollama.allowed_ports = [int(p) for p in (ollama["allowed_ports"] or [])]
+            _safe_set(cfg.ollama, "allowed_ports", ollama["allowed_ports"],
+                      lambda v: [int(p) for p in (v or [])])
 
     agent = data.get("agent", {})
     if isinstance(agent, dict):
         for key in ("n_candidates", "max_iters", "max_wall_time_s", "max_history", "prompt_token_budget"):
             if key in agent:
-                setattr(cfg.agent, key, int(agent[key]))
+                _safe_set(cfg.agent, key, agent[key], int)
         if "fast_screen" in agent:
             cfg.agent.fast_screen = bool(agent["fast_screen"])
 

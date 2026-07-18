@@ -55,6 +55,41 @@ class TestCheckFromAnnotate:
         assert summary.vectorized_count == 1
         assert summary.not_vectorized_count == 1
 
+    def test_scalar_sse_not_counted_as_simd(self):
+        # ss/sd-suffixed ops are single-element scalar math, not vectorization
+        text = (
+            "Percent |  Source code & Disassembly of scalar_fn\n"
+            "  45.20 :  14: movss (%rax), %xmm0\n"
+            "  12.00 :  15: addss %xmm1, %xmm0\n"
+            "   3.00 :  16: mulss %xmm2, %xmm0\n"
+        )
+        summary = check_vectorization_from_perf_annotate(text)
+        assert not summary.functions[0].has_simd
+
+    def test_scalar_neon_not_counted_as_simd(self):
+        # fadd/fmul on s/d registers are scalar; only v-register forms are SIMD
+        text = (
+            "Percent |  Source code & Disassembly of scalar_fn\n"
+            "  45.20 :  14: fadd s0, s1, s2\n"
+            "  10.00 :  15: fmul d0, d1, d2\n"
+        )
+        summary = check_vectorization_from_perf_annotate(text)
+        assert not summary.functions[0].has_simd
+
+    def test_source_lines_not_counted(self):
+        # Interleaved source lines (no "addr:" column) must not match
+        # mnemonic-like tokens or inflate the instruction denominator
+        text = (
+            "Percent |  Source code & Disassembly of loop_fn\n"
+            "         :      for (int i = 0; i < n and mask; i++) {\n"
+            "  40.00 :  10: vmulps %ymm0, %ymm1, %ymm2\n"
+        )
+        summary = check_vectorization_from_perf_annotate(text)
+        report = summary.functions[0]
+        assert report.total_instruction_count == 1
+        assert report.simd_isa == "avx"
+        assert report.simd_ratio == 1.0
+
     def test_avx512_detected(self):
         text = (
             "Percent |  Source code & Disassembly of kernel\n"

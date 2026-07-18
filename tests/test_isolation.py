@@ -37,12 +37,60 @@ from perflab.tools.isolation import (
     default_level_for_host,
     normalize_level,
     resolve_level,
+    resolve_policy,
     wrap_command,
 )
 
 # ---------------------------------------------------------------------------
 # 1a. Level normalization / resolution (pure functions)
 # ---------------------------------------------------------------------------
+
+
+class TestResolvePolicy:
+    """resolve_policy: the shared CLI/MCP task.yaml+config resolution."""
+
+    def _write_task(self, tmp_path, extra: str = "") -> Path:
+        p = tmp_path / "task.yaml"
+        p.write_text("name: t\n" + extra, encoding="utf-8")
+        return p
+
+    def test_none_everywhere_returns_no_policy(self, tmp_path):
+        assert resolve_policy(self._write_task(tmp_path), "none") is None
+
+    def test_task_yaml_level_wins_over_config(self, tmp_path):
+        task = self._write_task(tmp_path, "isolation:\n  level: restricted\n")
+        policy = resolve_policy(task, "none")
+        assert policy is not None
+        assert policy.level == "restricted"
+
+    def test_cli_level_wins_over_task_yaml(self, tmp_path):
+        task = self._write_task(tmp_path, "isolation:\n  level: restricted\n")
+        policy = resolve_policy(task, "none", cli_level="strict")
+        assert policy is not None
+        assert policy.level == "strict"
+
+    def test_config_level_used_when_task_silent(self, tmp_path):
+        policy = resolve_policy(self._write_task(tmp_path), "restricted")
+        assert policy is not None
+        assert policy.level == "restricted"
+
+    def test_network_flag_carried_from_constraints(self, tmp_path):
+        task = self._write_task(
+            tmp_path, "isolation:\n  level: restricted\nconstraints:\n  network: true\n"
+        )
+        policy = resolve_policy(task, "none")
+        assert policy is not None
+        assert policy.network is True
+
+    def test_invalid_level_raises(self, tmp_path):
+        task = self._write_task(tmp_path, "isolation:\n  level: banana\n")
+        with pytest.raises(ValueError):
+            resolve_policy(task, "none")
+
+    def test_missing_task_file_falls_back_to_config(self, tmp_path):
+        policy = resolve_policy(tmp_path / "does-not-exist.yaml", "restricted")
+        assert policy is not None
+        assert policy.level == "restricted"
 
 
 class TestNormalizeLevel:

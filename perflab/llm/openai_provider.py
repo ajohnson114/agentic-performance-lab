@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
-from perflab.llm.base import CompletionResult, Message
+from perflab.llm.base import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT_S, CompletionResult, Message
 from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 
@@ -25,9 +25,14 @@ class OpenAIProvider:
 
     def _client(self):
         import openai
+        kwargs: dict = {
+            "api_key": self.api_key,
+            "timeout": DEFAULT_TIMEOUT_S,
+            "max_retries": DEFAULT_MAX_RETRIES,
+        }
         if self.api_base:
-            return openai.OpenAI(api_key=self.api_key, base_url=self.api_base)
-        return openai.OpenAI(api_key=self.api_key)
+            kwargs["base_url"] = self.api_base
+        return openai.OpenAI(**kwargs)
 
     def complete(
         self,

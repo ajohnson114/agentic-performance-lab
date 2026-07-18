@@ -3,45 +3,14 @@ from __future__ import annotations
 import logging
 import re
 import shutil
-import subprocess
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
+from perflab.tools.symbols import demangle as _demangle
 
 logger = logging.getLogger(__name__)
-
-
-@lru_cache(maxsize=1)
-def _cxxfilt_available() -> bool:
-    """Return True if c++filt is on PATH."""
-    return shutil.which("c++filt") is not None
-
-
-@lru_cache(maxsize=512)
-def _demangle(name: str) -> str:
-    """Demangle a C++ symbol using c++filt if available.
-
-    Returns the original name unchanged when c++filt is not installed
-    or the symbol is not a mangled C++ name (``_Z`` prefix).
-    Results are cached so repeated calls for the same symbol avoid
-    spawning a subprocess.
-    """
-    if not name.startswith("_Z") or not _cxxfilt_available():
-        return name
-    try:
-        result = subprocess.run(
-            ["c++filt", name],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        demangled = result.stdout.strip()
-        return demangled if demangled else name
-    except (OSError, subprocess.TimeoutExpired):
-        return name
 
 
 @dataclass

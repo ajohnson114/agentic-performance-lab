@@ -4,6 +4,12 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+# Shared HTTP hardening for all providers: the timeout bounds a hung request so
+# the agent loop can't wedge, and retries let transient 429/5xx/network blips be
+# absorbed by the SDK instead of aborting an optimizer iteration.
+DEFAULT_TIMEOUT_S = 600.0
+DEFAULT_MAX_RETRIES = 3
+
 
 @dataclass
 class Message:

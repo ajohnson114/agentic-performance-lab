@@ -104,6 +104,12 @@ def _sanitize_env(env: dict[str, str] | None) -> dict[str, str]:
     for key in list(base):
         if any(key.startswith(prefix) for prefix in _SECRET_ENV_PREFIXES):
             del base[key]
+    # Force the C locale: the perf/tma/power/lock parsers assume period
+    # decimal separators and comma thousands separators. Under a comma-decimal
+    # locale (e.g. de_DE), perf prints "4002,12 msec" and comma-stripping
+    # would silently read it as 400212 — a 100x error. LC_ALL outranks every
+    # LANG/LC_* var; an explicit caller env may still override it.
+    base["LC_ALL"] = "C"
     if env:
         base.update(env)
     return base

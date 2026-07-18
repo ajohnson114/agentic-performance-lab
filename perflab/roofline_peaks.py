@@ -716,6 +716,10 @@ _MPS_HEURISTICS = {
     "M3": (4.1, 100.0),
     "M3 Pro": (6.2, 150.0),
     "M3 Max": (14.2, 300.0),
+    # M4 family per Apple's published specs (fp32 TFLOPS, memory bandwidth GB/s)
+    "M4": (4.26, 120.0),
+    "M4 Pro": (9.2, 273.0),
+    "M4 Max": (18.4, 546.0),
 }
 
 def infer_mps_peaks() -> Peaks | None:

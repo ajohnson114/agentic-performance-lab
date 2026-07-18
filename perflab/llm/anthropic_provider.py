@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
-from perflab.llm.base import CompletionResult, Message
+from perflab.llm.base import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT_S, CompletionResult, Message
 from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 
@@ -24,7 +24,11 @@ class AnthropicProvider:
 
     def _client(self):
         import anthropic
-        return anthropic.Anthropic(api_key=self.api_key)
+        return anthropic.Anthropic(
+            api_key=self.api_key,
+            timeout=DEFAULT_TIMEOUT_S,
+            max_retries=DEFAULT_MAX_RETRIES,
+        )
 
     @staticmethod
     def _split_messages(messages: Sequence[Message]) -> tuple[str, list[dict]]:

@@ -7,6 +7,15 @@ def write_report_md(report_path: Path, data: dict) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(_render(data), encoding="utf-8")
 
+
+def _cell(value: object) -> str:
+    """Escape a value for a Markdown table cell.
+
+    notes/bottleneck/root_cause carry LLM- and candidate-derived text; a
+    literal '|' or newline would break the table row it lands in.
+    """
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
 def _render(data: dict) -> str:
     lines = []
     lines.append(f"# PerfLab Report — {data.get('task_name','')}")
@@ -57,7 +66,7 @@ def _render(data: dict) -> str:
         lines.append("| Rank | Bottleneck | Root cause | Confidence |")
         lines.append("|---:|---|---|:---:|")
         for d in diags:
-            lines.append(f"| {d.get('rank', '?')} | {d.get('bottleneck', '')} | {d.get('root_cause', '')} | {d.get('confidence', '')} |")
+            lines.append(f"| {d.get('rank', '?')} | {_cell(d.get('bottleneck', ''))} | {_cell(d.get('root_cause', ''))} | {_cell(d.get('confidence', ''))} |")
         lines.append("")
 
     # Iterations table with before/after columns
@@ -73,13 +82,13 @@ def _render(data: dict) -> str:
             delta_str = f"{delta:+.6g}" if delta is not None else ""
             speedup_str = f"{speedup:.2f}x" if speedup is not None else ""
             accepted_str = "yes" if row["accepted"] else ""
-            lines.append(f"| {row['iter']} | {row['value']:.6g} | {delta_str} | {speedup_str} | {accepted_str} | {row.get('notes','')} |")
+            lines.append(f"| {row['iter']} | {row['value']:.6g} | {delta_str} | {speedup_str} | {accepted_str} | {_cell(row.get('notes',''))} |")
     else:
         lines.append("| iter | value | accepted | notes |")
         lines.append("|---:|---:|:---:|---|")
         for row in data.get("rows", []):
             accepted_str = "yes" if row["accepted"] else ""
-            lines.append(f"| {row['iter']} | {row['value']:.6g} | {accepted_str} | {row.get('notes','')} |")
+            lines.append(f"| {row['iter']} | {row['value']:.6g} | {accepted_str} | {_cell(row.get('notes',''))} |")
     lines.append("")
 
     # Run summary

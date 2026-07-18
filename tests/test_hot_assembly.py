@@ -68,27 +68,27 @@ class TestDemangle:
     def setup_method(self):
         # Clear caches between tests so mocks take effect
         _demangle.cache_clear()
-        from perflab.profilers.linux_perf import _cxxfilt_available
-        _cxxfilt_available.cache_clear()
+        from perflab.tools.symbols import cxxfilt_available
+        cxxfilt_available.cache_clear()
 
     def teardown_method(self):
         _demangle.cache_clear()
-        from perflab.profilers.linux_perf import _cxxfilt_available
-        _cxxfilt_available.cache_clear()
+        from perflab.tools.symbols import cxxfilt_available
+        cxxfilt_available.cache_clear()
 
     def test_returns_original_when_cxxfilt_unavailable(self):
-        with patch("perflab.profilers.linux_perf.shutil.which", return_value=None):
+        with patch("perflab.tools.symbols.shutil.which", return_value=None):
             assert _demangle("_Z6matmulPKfS0_Pfiii") == "_Z6matmulPKfS0_Pfiii"
 
     def test_returns_original_for_non_mangled_name(self):
-        with patch("perflab.profilers.linux_perf.shutil.which", return_value="/usr/bin/c++filt"):
+        with patch("perflab.tools.symbols.shutil.which", return_value="/usr/bin/c++filt"):
             assert _demangle("matmul") == "matmul"
 
     def test_demangles_mangled_name(self):
         mock_result = MagicMock()
         mock_result.stdout = "matmul(float const*, float const*, float*, int, int, int)\n"
-        with patch("perflab.profilers.linux_perf.shutil.which", return_value="/usr/bin/c++filt"), \
-             patch("perflab.profilers.linux_perf.subprocess.run", return_value=mock_result) as mock_run:
+        with patch("perflab.tools.symbols.shutil.which", return_value="/usr/bin/c++filt"), \
+             patch("perflab.tools.symbols.subprocess.run", return_value=mock_result) as mock_run:
             result = _demangle("_Z6matmulPKfS0_Pfiii")
             assert result == "matmul(float const*, float const*, float*, int, int, int)"
             mock_run.assert_called_once_with(
@@ -103,8 +103,8 @@ class TestDemangle:
         mock_result.stdout = "matmul(float const*, float const*, float*, int, int, int)\n"
         p = tmp_path / "perf_annotate.txt"
         p.write_text(SAMPLE_ANNOTATE_MANGLED)
-        with patch("perflab.profilers.linux_perf.shutil.which", return_value="/usr/bin/c++filt"), \
-             patch("perflab.profilers.linux_perf.subprocess.run", return_value=mock_result):
+        with patch("perflab.tools.symbols.shutil.which", return_value="/usr/bin/c++filt"), \
+             patch("perflab.tools.symbols.subprocess.run", return_value=mock_result):
             results = extract_hot_assembly(p)
             assert len(results) == 1
             assert results[0]["function"] == "matmul(float const*, float const*, float*, int, int, int)"

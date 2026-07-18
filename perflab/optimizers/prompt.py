@@ -1048,13 +1048,8 @@ def _build_optimization_playbook(
     return "\n".join(sections)
 
 
-def build_prompt(ctx: PromptContext) -> list[Message]:
-    """Assemble system + user messages from context."""
-    messages = [Message(role="system", content=SYSTEM_PROMPT)]
-
-    parts: list[str] = []
-
-    # Source files
+def _add_source_files(parts: list[str], ctx: PromptContext) -> None:
+    """Source files, allowed path patterns, and the workspace file list."""
     parts.append("## Source files (editable)\n")
     parts.append(f"Allowed path patterns: {ctx.allowed_paths}\n")
 
@@ -1069,7 +1064,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
     for path, content in ctx.source_files.items():
         parts.append(f"### FILE: {path}\n```\n{content}\n```\n")
 
-    # Data hints (from task.yaml — characteristics of the input data)
+
+def _add_data_hints(parts: list[str], ctx: PromptContext) -> None:
+    """Data characteristics hints from the task author (task.yaml)."""
     if ctx.data_hints:
         dh = ctx.data_hints
         parts.append("## Data characteristics (from task author)\n")
@@ -1114,7 +1111,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(f"- {hint}")
         parts.append("")
 
-    # Profiler summaries
+
+def _add_profiler_summaries(parts: list[str], ctx: PromptContext) -> None:
+    """Raw profiler summaries as JSON."""
     if ctx.profiler_summaries:
         parts.append("## Profiler summaries\n")
         for name, summary in ctx.profiler_summaries.items():
@@ -1122,10 +1121,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             parts.append(json.dumps(summary, indent=2))
             parts.append("\n```\n")
 
-    # GPU-aware profiler annotation
-    _add_profiler_context(parts, ctx)
 
-    # Build flag recommendations (early — easy wins)
+def _add_build_flag_recommendations(parts: list[str], ctx: PromptContext) -> None:
+    """Build flag recommendations (early — easy wins), incl. fast-math permission."""
     if ctx.build_flag_recommendations:
         parts.append("## Build flag recommendations\n")
         parts.append(
@@ -1157,13 +1155,17 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 )
         parts.append("")
 
-    # Compiler diagnostics
+
+def _add_compiler_diagnostics(parts: list[str], ctx: PromptContext) -> None:
+    """Compiler diagnostics summary."""
     if ctx.compiler_diagnostics:
         parts.append("## Compiler diagnostics\n")
         parts.append(ctx.compiler_diagnostics)
         parts.append("")
 
-    # Cross-referenced optimization insights
+
+def _add_cross_referenced_insights(parts: list[str], ctx: PromptContext) -> None:
+    """Optimization insights from compiler + profiler cross-reference."""
     if ctx.cross_referenced_insights:
         parts.append("## Optimization insights (compiler + profiler cross-reference)\n")
         for insight in ctx.cross_referenced_insights:
@@ -1174,7 +1176,10 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             parts.append(f"  Suggestion: {insight['suggestion']}")
         parts.append("")
 
-    # Unified kernel dossiers (attribution + NCU + SASS joined by kernel name)
+
+def _add_kernel_analysis(parts: list[str], ctx: PromptContext) -> None:
+    """Unified kernel dossiers (attribution + NCU + SASS joined by kernel name),
+    falling back to separate GPU attribution when no dossiers were built."""
     if ctx.kernel_dossiers:
         parts.append("## GPU kernel analysis (attribution + NCU metrics + SASS)\n")
         parts.append(
@@ -1369,7 +1374,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(f"  → {s}")
         parts.append("")
 
-    # HLO attribution for JAX/TPU (which XLA ops dominate device time)
+
+def _add_hlo_attribution(parts: list[str], ctx: PromptContext) -> None:
+    """HLO attribution for JAX/TPU (which XLA ops dominate device time)."""
     if ctx.hlo_attribution:
         parts.append("## XLA/HLO op attribution\n")
         parts.append(
@@ -1389,7 +1396,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(f"  → {s}")
         parts.append("")
 
-    # JAX HLO cost metrics (FLOPS and bytes for roofline)
+
+def _add_jax_cost_metrics(parts: list[str], ctx: PromptContext) -> None:
+    """JAX HLO cost metrics (FLOPS and bytes for roofline)."""
     jax_summary = ctx.profiler_summaries.get("jax", {})
     if jax_summary.get("hlo_cost_tflops"):
         parts.append(f"## XLA cost estimate: {jax_summary['hlo_cost_tflops']:.4f} TFLOPS")
@@ -1401,14 +1410,19 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(f"Arithmetic intensity: {ai:.1f} FLOP/byte")
         parts.append("")
 
-    # Host vs device time breakdown (JAX/TPU)
+
+def _add_host_device_split(parts: list[str], ctx: PromptContext) -> None:
+    """Host vs device time breakdown (JAX/TPU)."""
+    jax_summary = ctx.profiler_summaries.get("jax", {})
     if jax_summary.get("host_time_us") and jax_summary.get("device_time_us"):
         host_ms = jax_summary["host_time_us"] / 1000
         device_ms = jax_summary["device_time_us"] / 1000
         frac = jax_summary.get("device_fraction", 0)
         parts.append(f"## Host vs device time: host {host_ms:.1f} ms, device {device_ms:.1f} ms ({frac:.0%} on device)\n")
 
-    # Training phase breakdown (if available)
+
+def _add_training_phases(parts: list[str], ctx: PromptContext) -> None:
+    """Training phase breakdown (if available)."""
     phases = ctx.profiler_summaries.get("torch_profiler", {}).get("phases", [])
     if phases:
         parts.append("\n## Training phase breakdown\n")
@@ -1421,7 +1435,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             )
         parts.append("")
 
-    # PyTorch per-operator FLOPS (from with_flops=True)
+
+def _add_torch_flops(parts: list[str], ctx: PromptContext) -> None:
+    """PyTorch per-operator FLOPS (from with_flops=True)."""
     torch_summary = ctx.profiler_summaries.get("torch_profiler", {})
     if torch_summary.get("total_tflops"):
         parts.append(f"## PyTorch operator FLOPS: {torch_summary['total_tflops']:.4f} TFLOPS total\n")
@@ -1431,7 +1447,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(f"- {op['name']}: {op['pct']:.0f}% of FLOPS")
             parts.append("")
 
-    # Memory allocation hotspots (memray)
+
+def _add_memray_summary(parts: list[str], ctx: PromptContext) -> None:
+    """Memory allocation hotspots (memray)."""
     if ctx.memray_summary and ctx.memray_summary.get("top_allocators"):
         peak = ctx.memray_summary.get("peak_memory_mb", 0)
         total = ctx.memray_summary.get("total_allocated_mb", 0)
@@ -1443,7 +1461,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             parts.append(f"- `{a['function']}`{loc}: {a['size_mb']:.1f} MB{count}")
         parts.append("")
 
-    # Lock contention (perf lock + perf c2c)
+
+def _add_lock_contention(parts: list[str], ctx: PromptContext) -> None:
+    """Lock contention (perf lock + perf c2c)."""
     if ctx.lock_contention_summary:
         lock_stats = ctx.lock_contention_summary.get("lock_stats", {})
         c2c_stats = ctx.lock_contention_summary.get("c2c_stats", {})
@@ -1465,7 +1485,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append("→ Pad shared structures to cache line boundaries (64 bytes), use thread-local storage")
             parts.append("")
 
-    # GPU memory utilization
+
+def _add_gpu_memory(parts: list[str], ctx: PromptContext) -> None:
+    """GPU memory utilization."""
     if ctx.gpu_memory_summary:
         util_pct = ctx.gpu_memory_summary.get("utilization_pct", 0)
         peak_mb = ctx.gpu_memory_summary.get("max_used_mib", 0)
@@ -1479,7 +1501,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append("GPU memory pressure is moderate — monitor for OOM if batch size increases.")
             parts.append("")
 
-    # eBPF syscall/IO tracing
+
+def _add_ebpf_summary(parts: list[str], ctx: PromptContext) -> None:
+    """eBPF syscall/IO tracing."""
     if ctx.ebpf_summary:
         reads = ctx.ebpf_summary.get("read_syscalls", 0)
         writes = ctx.ebpf_summary.get("write_syscalls", 0)
@@ -1504,12 +1528,16 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                         parts.append(f"- {label}: p50={p50:.0f}us  p90={p90:.0f}us  p99={p99:.0f}us  ({lat.get('total_count', 0):,} calls)")
             parts.append("")
 
-    # Benchmark results
+
+def _add_bench_results(parts: list[str], ctx: PromptContext) -> None:
+    """Current benchmark results as JSON."""
     parts.append("## Current benchmark results\n```json\n")
     parts.append(json.dumps(ctx.bench_results, indent=2))
     parts.append("\n```\n")
 
-    # Device-specific guidance
+
+def _add_device_guidance(parts: list[str], ctx: PromptContext) -> None:
+    """Device-specific guidance (MPS pitfalls / CPU-only note)."""
     device = ctx.bench_results.get("meta", {}).get("device", "")
     if device == "mps":
         parts.append(
@@ -1533,17 +1561,17 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
         parts.append("**Note: This code runs on CPU only (no GPU).** Focus on vectorization, "
                       "batch processing, torch.compile, and reducing Python overhead.\n")
 
-    # Performance vs. peak
-    if ctx.roofline and ctx.bench_results:
-        _add_perf_vs_peak(parts, ctx)
 
-    # Roofline
+def _add_roofline_json(parts: list[str], ctx: PromptContext) -> None:
+    """Roofline analysis as JSON."""
     if ctx.roofline:
         parts.append("## Roofline analysis\n```json\n")
         parts.append(json.dumps(ctx.roofline, indent=2))
         parts.append("\n```\n")
 
-    # Bottleneck diagnosis
+
+def _add_bottleneck_diagnosis(parts: list[str], ctx: PromptContext) -> str | None:
+    """Bottleneck diagnosis table. Returns the primary bottleneck type (if any)."""
     primary_bottleneck: str | None = None
     if ctx.bottleneck_diagnoses:
         parts.append("## Bottleneck diagnosis\n")
@@ -1560,8 +1588,11 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
         # Extract primary bottleneck type for hint filtering
         if ctx.bottleneck_diagnoses:
             primary_bottleneck = ctx.bottleneck_diagnoses[0].get("bottleneck", "")
+    return primary_bottleneck
 
-    # Hot loop assembly snippets (from perf annotate)
+
+def _add_hot_assembly(parts: list[str], ctx: PromptContext) -> None:
+    """Hot loop assembly snippets (from perf annotate)."""
     if ctx.hot_loop_assembly:
         parts.append("## Hot loop assembly (from perf annotate)\n")
         parts.append(
@@ -1577,7 +1608,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             )
             parts.append(f"```asm\n{entry['snippet']}\n```\n")
 
-    # CUDA SASS disassembly (standalone — only when not already in kernel dossiers)
+
+def _add_cuda_sass(parts: list[str], ctx: PromptContext) -> None:
+    """CUDA SASS disassembly (standalone — only when not already in kernel dossiers)."""
     if ctx.cuda_sass and not ctx.kernel_dossiers:
         parts.append("## CUDA SASS disassembly (GPU assembly)\n")
         parts.append(
@@ -1594,7 +1627,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             )
             parts.append(f"```sass\n{entry['snippet']}\n```\n")
 
-    # Micro-architecture analysis (stability, ceiling, throttle, pipeline)
+
+def _add_microarch(parts: list[str], ctx: PromptContext) -> None:
+    """Micro-architecture analysis (stability, ceiling, throttle, pipeline)."""
     ma = ctx.microarch_summary
     if ma:
         parts.append("## Micro-architecture analysis\n")
@@ -1680,12 +1715,16 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             parts.append(throttle["assessment"])
             parts.append("")
 
-    # Optimization playbook (replaces standalone hardware guidance)
+
+def _add_playbook(parts: list[str], ctx: PromptContext, primary_bottleneck: str | None) -> None:
+    """Optimization playbook (replaces standalone hardware guidance)."""
     playbook = _build_optimization_playbook(ctx, primary_bottleneck)
     if playbook:
         parts.append(playbook)
 
-    # Expert suggestion
+
+def _add_expert_suggestion(parts: list[str], ctx: PromptContext) -> None:
+    """Expert suggestion."""
     if ctx.expert_suggestion:
         parts.append("## Expert suggestion\n")
         parts.append(
@@ -1693,18 +1732,24 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             f"Consider this in your optimization strategy.\n"
         )
 
-    # Profile diff from previous iteration
+
+def _add_profile_diff(parts: list[str], ctx: PromptContext) -> None:
+    """Profile changes from the previous iteration."""
     if ctx.profile_diff:
         parts.append("## Profile changes from previous iteration\n")
         parts.append(ctx.profile_diff)
         parts.append("")
 
-    # Prior run context (cross-run learning)
+
+def _add_prior_run_context(parts: list[str], ctx: PromptContext) -> None:
+    """Prior run context (cross-run learning)."""
     if ctx.prior_run_context:
         parts.append(ctx.prior_run_context)
         parts.append("")
 
-    # Error feedback from previous iteration
+
+def _add_error_feedback(parts: list[str], ctx: PromptContext) -> None:
+    """Error feedback from the previous iteration."""
     if ctx.last_errors:
         parts.append("## Errors from previous iteration\n")
         parts.append("The following errors occurred when evaluating candidates in the previous iteration.")
@@ -1722,8 +1767,10 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 ))
             parts.append("")
 
-    # History — keep last N entries to prevent prompt bloat; earlier iterations
-    # are rarely actionable and waste tokens.
+
+def _add_history(parts: list[str], ctx: PromptContext) -> None:
+    """Optimization history — keep last N entries to prevent prompt bloat;
+    earlier iterations are rarely actionable and waste tokens."""
     if ctx.history:
         parts.append("## Optimization history\n")
         display_history = ctx.history
@@ -1738,7 +1785,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
             )
         parts.append("")
 
-    # Promising alternatives — good-but-not-best candidates from last iteration
+
+def _add_promising_alternatives(parts: list[str], ctx: PromptContext) -> None:
+    """Promising alternatives — good-but-not-best candidates from last iteration."""
     if ctx.promising_alternatives:
         parts.append("## Promising alternatives from last iteration\n")
         parts.append(
@@ -1757,7 +1806,9 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(f"  Strategy: {alt['reasoning'][:200]}")
         parts.append("")
 
-    # Structured failure memory — what was tried and why it failed
+
+def _add_failure_memory(parts: list[str], ctx: PromptContext) -> None:
+    """Structured failure memory — what was tried and why it failed."""
     if ctx.failure_memory:
         parts.append("## Failed approaches (avoid repeating)\n")
         parts.append(
@@ -1782,12 +1833,60 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
                 parts.append(_sanitize_untrusted_text(str(fm["profiler_context"])))
         parts.append("")
 
-    # Request
+
+def _add_request(parts: list[str], ctx: PromptContext) -> None:
+    """The closing request for N diverse candidates."""
     parts.append(
         f"\nPlease propose {ctx.n_candidates} diverse optimization candidates. "
         f"Separate each with '--- CANDIDATE N ---' where N=1,2,...\n"
         f"For each candidate, explain your reasoning then provide the edit blocks."
     )
+
+
+def build_prompt(ctx: PromptContext) -> list[Message]:
+    """Assemble system + user messages from context.
+
+    Each ``_add_*`` helper renders one prompt section into ``parts`` (appending
+    nothing when its data is absent), in the order listed here.
+    """
+    messages = [Message(role="system", content=SYSTEM_PROMPT)]
+
+    parts: list[str] = []
+    _add_source_files(parts, ctx)
+    _add_data_hints(parts, ctx)
+    _add_profiler_summaries(parts, ctx)
+    _add_profiler_context(parts, ctx)  # GPU-aware profiler annotation
+    _add_build_flag_recommendations(parts, ctx)
+    _add_compiler_diagnostics(parts, ctx)
+    _add_cross_referenced_insights(parts, ctx)
+    _add_kernel_analysis(parts, ctx)
+    _add_hlo_attribution(parts, ctx)
+    _add_jax_cost_metrics(parts, ctx)
+    _add_host_device_split(parts, ctx)
+    _add_training_phases(parts, ctx)
+    _add_torch_flops(parts, ctx)
+    _add_memray_summary(parts, ctx)
+    _add_lock_contention(parts, ctx)
+    _add_gpu_memory(parts, ctx)
+    _add_ebpf_summary(parts, ctx)
+    _add_bench_results(parts, ctx)
+    _add_device_guidance(parts, ctx)
+    if ctx.roofline and ctx.bench_results:
+        _add_perf_vs_peak(parts, ctx)
+    _add_roofline_json(parts, ctx)
+    primary_bottleneck = _add_bottleneck_diagnosis(parts, ctx)
+    _add_hot_assembly(parts, ctx)
+    _add_cuda_sass(parts, ctx)
+    _add_microarch(parts, ctx)
+    _add_playbook(parts, ctx, primary_bottleneck)
+    _add_expert_suggestion(parts, ctx)
+    _add_profile_diff(parts, ctx)
+    _add_prior_run_context(parts, ctx)
+    _add_error_feedback(parts, ctx)
+    _add_history(parts, ctx)
+    _add_promising_alternatives(parts, ctx)
+    _add_failure_memory(parts, ctx)
+    _add_request(parts, ctx)
 
     messages.append(Message(role="user", content="\n".join(parts)))
 
@@ -2010,7 +2109,6 @@ def _add_perf_vs_peak(parts: list[str], ctx: PromptContext) -> None:
 
 def parse_candidates(
     response: str,
-    n_expected: int,
 ) -> list[tuple[str, list[SearchReplaceBlock]]]:
     """Split multi-candidate response on '--- CANDIDATE N ---' markers.
 

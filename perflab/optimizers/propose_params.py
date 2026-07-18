@@ -41,9 +41,7 @@ def generate_sweep_candidates(current_knobs: dict) -> list[KnobPatch]:
     value_lists = [sweep[k] for k in knob_names]
 
     # Validate: each value list must be a list
-    # value_lists is built directly from knob_names above, so they're always the same length;
-    # zip() strict= needs Python 3.10+ and this codebase still runs on 3.9.
-    for _name, vals in zip(knob_names, value_lists):  # noqa: B905
+    for _name, vals in zip(knob_names, value_lists, strict=True):
         if not isinstance(vals, list) or len(vals) == 0:
             return []
 
@@ -51,8 +49,7 @@ def generate_sweep_candidates(current_knobs: dict) -> list[KnobPatch]:
     for combo in itertools.product(*value_lists):
         new_knobs = {k: v for k, v in current_knobs.items() if k != "sweep"}
         desc_parts = []
-        # combo is a tuple from itertools.product(*value_lists), always len(knob_names) long.
-        for name, val in zip(knob_names, combo):  # noqa: B905
+        for name, val in zip(knob_names, combo, strict=True):
             new_knobs[name] = val
             desc_parts.append(f"{name}={val}")
 
