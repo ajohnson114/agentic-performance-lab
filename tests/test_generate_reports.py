@@ -183,6 +183,41 @@ class TestGenerateReports:
         assert '<div class="hardware-warning">' in html
         assert "detected GPU is" in html
 
+    def test_llm_estimated_cost_reaches_dashboard(self, tmp_path: Path):
+        run_dir = _make_run_dir(tmp_path)
+        generate_reports(_minimal_params(
+            run_dir,
+            llm_stats={
+                "model": "claude-opus-4-8",
+                "provider": "anthropic",
+                "total_calls": 3,
+                "total_input_tokens": 1_000_000,
+                "total_output_tokens": 200_000,
+                "total_llm_latency_s": 12.0,
+                "estimated_cost_usd": 10.0,
+            },
+        ))
+        html = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+        assert "Est. Cost" in html
+        assert "$10.00" in html
+
+    def test_llm_unknown_model_cost_shows_unknown_marker(self, tmp_path: Path):
+        run_dir = _make_run_dir(tmp_path)
+        generate_reports(_minimal_params(
+            run_dir,
+            llm_stats={
+                "model": "some-unpriced-model",
+                "provider": "openai",
+                "total_calls": 1,
+                "total_input_tokens": 100,
+                "total_output_tokens": 100,
+                "total_llm_latency_s": 1.0,
+                "estimated_cost_usd": None,
+            },
+        ))
+        html = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+        assert "n/a (unknown model pricing)" in html
+
     def test_no_artifacts_dir(self, tmp_path: Path):
         run_dir = tmp_path / "run-empty"
         run_dir.mkdir()

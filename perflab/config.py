@@ -100,12 +100,13 @@ class AgentSection:
 class IsolationSection:
     """OS-level sandboxing for candidate (LLM-authored) subprocess execution.
 
-    See perflab/tools/isolation.py for the "none" | "restricted" | "strict"
-    tiers. Default is "none" (current, unsandboxed behavior) -- the spec for
-    this feature requires an A/B benchmark-noise validation before
-    "restricted" can become the shipped default; see DESIGN.md.
+    See perflab/tools/isolation.py for the "auto" | "none" | "restricted" |
+    "strict" tiers. Default is "auto" (resolves to "restricted" on a host
+    with usable bwrap, else "none") as of 2026-07-19 -- CI (bwrap acceptance
+    tests plus a real-task ci-check run under "restricted") is the ongoing
+    validation mechanism; see DESIGN.md.
     """
-    level: str = "none"  # "none" | "restricted" | "strict"
+    level: str = "auto"  # "auto" | "none" | "restricted" | "strict"
 
 
 @dataclass
@@ -398,10 +399,15 @@ agent:
   prompt_token_budget: 0     # 0 = unlimited. Set to cap prompt size for small models
 
 isolation:
-  level: none                # "none" | "restricted" | "strict" -- sandbox candidate
-                              # (LLM-authored) subprocess execution on top of the
-                              # rlimit + env-allowlist protections that always apply.
-                              # none:       rlimits only (current behavior).
+  level: auto                # "auto" | "none" | "restricted" | "strict" -- sandbox
+                              # candidate (LLM-authored) subprocess execution on top
+                              # of the rlimit + env-allowlist protections that always
+                              # apply.
+                              # auto:       (default) restricted if this host has
+                              #             usable bwrap (Linux + working user
+                              #             namespaces), else none. See
+                              #             default_level_for_host().
+                              # none:       rlimits only, unsandboxed.
                               # restricted: Bubblewrap (Linux only) -- read-only bind
                               #             of /usr, /lib, the venv, and CUDA/driver
                               #             paths; read-write bind of the workspace

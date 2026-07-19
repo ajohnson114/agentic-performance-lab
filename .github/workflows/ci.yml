@@ -33,6 +33,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[all]" ruff mypy pytest
 
+      - name: Install bubblewrap (Linux only -- backs the "restricted"/"strict" OS-level isolation tests)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: Allow unprivileged user namespaces (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        # ubuntu-latest (24.04) restricts unprivileged user namespaces via
+        # AppArmor by default, which makes bwrap fail to create a sandbox
+        # (even though it's installed) unless this is relaxed for the runner.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Lint (ruff)
         run: ruff check .
 
@@ -41,6 +54,30 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+      - name: Verify bwrap + seccomp acceptance tests actually ran (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        # _bwrap_usable() probes bwrap for real and quietly downgrades to
+        # "none" (skipping TestBwrapAcceptance via its skipif) if the probe
+        # fails -- so a regression in the two steps above (or a future
+        # runner-image change that re-tightens AppArmor) would otherwise
+        # silently stop validating "restricted" isolation instead of failing
+        # the build. Same story for TestSeccompAcceptance, which additionally
+        # needs bwrap --seccomp support and is the only place the strict
+        # filter's real-kernel enforcement is exercised on x86_64 (the
+        # docker/ dev container covers aarch64). Assert both classes actually
+        # ran and passed, not skipped.
+        run: |
+          set -o pipefail
+          pytest tests/test_isolation.py -k "TestBwrapAcceptance or TestSeccompAcceptance" -q -rs | tee bwrap_acceptance_output.txt
+          if grep -q "^SKIPPED" bwrap_acceptance_output.txt; then
+            echo "::error::bwrap/seccomp acceptance tests were skipped -- bwrap (or its --seccomp support) is not usable on this runner (see the two steps above)"
+            exit 1
+          fi
+          grep -qE "[1-9][0-9]* passed" bwrap_acceptance_output.txt || {
+            echo "::error::No bwrap/seccomp acceptance tests were collected/passed"
+            exit 1
+          }
 
   # End-to-end smoke on a real task: exercises the correctness runner,
   # benchmark harness, contract validation, and regression check through the
@@ -71,3 +108,43 @@ jobs:
       # the task's locally-tuned 2% tolerance between back-to-back runs.
       - name: Regression check against fresh baseline
         run: perflab ci-check tasks/matmul/python/task.yaml --tolerance 0.5
+
+  # Confirms the wheel actually ships the bundled demo tasks as package data
+  # and that `perflab tasks` works against a real install with no repo
+  # checkout involved -- this job installs the built wheel into a fresh venv
+  # (not `pip install -e .` like the other jobs). No benchmarks run here;
+  # it only exercises packaging + the CLI's list/copy commands.
+  packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel . --no-deps -w dist
+
+      - name: Install wheel into a fresh venv
+        run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --upgrade pip
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+
+      - name: perflab tasks list
+        run: /tmp/wheel-venv/bin/perflab tasks list
+
+      - name: perflab tasks copy matmul/python
+        run: cd /tmp && /tmp/wheel-venv/bin/perflab tasks copy matmul/python
+
+      - name: Assert copied task contains task.yaml and bench.py
+        run: |
+          test -f /tmp/matmul/python/task.yaml
+          test -f /tmp/matmul/python/bench.py

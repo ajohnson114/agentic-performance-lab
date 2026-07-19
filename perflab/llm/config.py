@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -45,6 +45,32 @@ def _check_config_permissions(path: Path) -> None:
                 pass
     except OSError:
         pass
+
+
+def _parse_pricing_overrides(data: dict) -> dict[str, tuple[float, float]]:
+    """Parse the optional ``pricing:`` mapping from the llm config section.
+
+    Each value is a 2-element ``[input, output]`` list of USD-per-million-
+    token prices, e.g. ``pricing: {my-model: [1.5, 6.0]}`` -- merged over the
+    built-in table in perflab.llm.pricing (this override wins on conflicts).
+    Malformed entries are skipped with a warning rather than aborting config
+    load, mirroring perflab.config._safe_set's per-key tolerance.
+    """
+    raw = data.get("pricing")
+    if not isinstance(raw, dict):
+        return {}
+    overrides: dict[str, tuple[float, float]] = {}
+    for model, prices in raw.items():
+        try:
+            price_in, price_out = prices
+            overrides[str(model)] = (float(price_in), float(price_out))
+        except (TypeError, ValueError):
+            warnings.warn(
+                f"Ignoring invalid pricing override for {model!r} in config "
+                f"(expected [input_per_mtok, output_per_mtok]): {prices!r}",
+                stacklevel=2,
+            )
+    return overrides
 
 
 def _secure_write(path: Path, content: str) -> None:
@@ -91,6 +117,10 @@ class LLMConfig:
     api_base: str = ""
     temperature: float = 0.7
     max_tokens: int = 16000
+    # Optional per-model USD-per-million-token overrides, merged over the
+    # built-in table in perflab.llm.pricing (see estimate_cost_usd). Loaded
+    # from an optional `pricing:` mapping in the llm: config section.
+    pricing: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     @staticmethod
     def load(path: Path | None = None) -> LLMConfig:
@@ -132,6 +162,7 @@ class LLMConfig:
             api_base=str(data.get("api_base", defaults.api_base)),
             temperature=float(data.get("temperature", defaults.temperature)),
             max_tokens=int(data.get("max_tokens", defaults.max_tokens)),
+            pricing=_parse_pricing_overrides(data) if isinstance(data, dict) else {},
         )
 
         # Env var overrides

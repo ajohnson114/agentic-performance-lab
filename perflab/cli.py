@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.resources
 import json
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,13 @@ from perflab.roofline_peaks import (
 from perflab.task_spec import TaskSpec
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+tasks_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Browse and copy the demo tasks bundled with PerfLab.",
+)
+app.add_typer(tasks_app, name="tasks")
 
 
 @app.callback()
@@ -72,6 +81,87 @@ def _load_task(task_yaml: str) -> TaskSpec:
         typer.echo(f"Error: task file not found: {task_file}")
         raise typer.Exit(code=2)
     return TaskSpec.load(task_file)
+
+
+def _demo_tasks_root() -> Path:
+    """Resolve the bundled demo-tasks directory.
+
+    Works both from an installed wheel (perflab/demo_tasks/ ships as package
+    data) and from an editable install (perflab/demo_tasks/ is the real
+    directory on disk; tasks/ at the repo root is just a symlink to it).
+    """
+    return Path(str(importlib.resources.files("perflab") / "demo_tasks"))
+
+
+def _iter_bundled_tasks() -> list[tuple[str, Path]]:
+    """Return sorted (relative_name, task_yaml_path) pairs, e.g. ("matmul/python", ...)."""
+    root = _demo_tasks_root()
+    if not root.is_dir():
+        return []
+    pairs = [
+        (str(p.parent.relative_to(root)), p)
+        for p in root.rglob("task.yaml")
+    ]
+    return sorted(pairs, key=lambda pair: pair[0])
+
+
+# Copying a task skips generated/local artifacts that may exist next to task
+# sources in an editable install (compiled binaries, __pycache__, prior run
+# output) -- a fresh copy should only contain what a wheel install ships.
+_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "out", "*.pyc", "*.pyo", "*_bin")
+
+
+@tasks_app.command(name="list")
+def tasks_list_cmd():
+    """List demo tasks bundled with PerfLab."""
+    root = _demo_tasks_root()
+    bundled = _iter_bundled_tasks()
+    if not bundled:
+        typer.echo(f"Error: no bundled demo tasks found at {root}")
+        raise typer.Exit(code=1)
+
+    rows = []
+    for rel_name, task_yaml in bundled:
+        desc = rel_name
+        try:
+            spec = TaskSpec.load(task_yaml)
+            desc = f"{spec.name} ({spec.program_type})"
+        except Exception:  # noqa: BLE001 -- best-effort description, fall back to the path
+            pass
+        rows.append((rel_name, desc))
+
+    name_width = max(len(name) for name, _ in rows) + 2
+    typer.echo(f"Bundled demo tasks ({len(rows)}):\n")
+    for name, desc in rows:
+        typer.echo(f"  {name:<{name_width}} {desc}")
+    typer.echo("\nCopy one with: perflab tasks copy <name> [dest]")
+
+
+@tasks_app.command(name="copy")
+def tasks_copy_cmd(
+    name: str = typer.Argument(..., help="Bundled task name, e.g. matmul/python (see: perflab tasks list)"),
+    dest: str = typer.Argument(".", help="Destination directory (default: current directory)"),
+):
+    """Copy a bundled demo task into DEST/NAME."""
+    valid = _iter_bundled_tasks()
+    valid_names = [n for n, _ in valid]
+    if name not in valid_names:
+        typer.echo(f"Error: unknown task {name!r}. Valid tasks:")
+        for n in valid_names:
+            typer.echo(f"  {n}")
+        raise typer.Exit(code=1)
+
+    src = _demo_tasks_root() / name
+    target = Path(dest) / name
+    if target.exists():
+        typer.echo(f"Error: {target} already exists -- refusing to overwrite.")
+        raise typer.Exit(code=1)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, target, ignore=_COPY_IGNORE)
+
+    typer.echo(f"Copied {name} -> {target}/")
+    typer.echo(f"\nNext: perflab agent {target}/task.yaml")
 
 
 @app.command()
@@ -418,15 +508,28 @@ def agent(
     no_early_stop: bool = typer.Option(False, "--no-early-stop", help="Disable early stopping / convergence detection"),
     fast_screen: bool = typer.Option(True, "--fast-screen/--no-fast-screen", help="Use fast benchmark screening for candidates"),
     max_time: int = typer.Option(3600, "--max-time", help="Wall-clock budget in seconds"),
+    max_cost: float = typer.Option(
+        None, "--max-cost",
+        help="Stop the run once estimated LLM cost reaches this many USD (unlimited if unset)",
+    ),
     isolation: str = typer.Option(
         None, "--isolation",
-        help="Sandbox candidate execution: none|restricted|strict (default: config/none)",
+        help=(
+            "Sandbox candidate execution: auto|none|restricted|strict "
+            "(default: config, which defaults to auto -- restricted if this "
+            "host has usable bwrap, else none)"
+        ),
     ),
 ):
     """Run the agentic LLM-driven optimizer with beam search."""
     from perflab.llm.config import LLMConfig
     from perflab.optimizers.agent import AgentConfig, run_agent
-    from perflab.tools.isolation import default_level_for_host, resolve_policy
+    from perflab.tools.isolation import (
+        default_level_for_host,
+        read_task_isolation,
+        resolve_level,
+        resolve_policy,
+    )
 
     task_file = Path(task_yaml)
     task = _load_task(task_yaml)
@@ -444,26 +547,58 @@ def agent(
         )
         raise typer.Exit(code=1)
 
+    # Fail closed: --max-cost is a safety guarantee, not a best-effort hint --
+    # if the run's model has no known pricing, we cannot check the guard at
+    # all, so refuse to start rather than silently running un-metered.
+    if max_cost is not None:
+        from perflab.llm.pricing import is_known_model
+        if not is_known_model(llm_config.model, overrides=llm_config.pricing):
+            typer.echo(
+                f"Error: --max-cost was set but no pricing is known for model "
+                f"{llm_config.model!r}, so the cost guard cannot be enforced.\n\n"
+                "Add it under a 'pricing:' mapping in the llm: section of your "
+                "perflab config (see perflab/llm/config.py), or drop --max-cost "
+                "to run un-metered."
+            )
+            raise typer.Exit(code=1)
+
     # Resolution: CLI flags > task.yaml agent: > perflab.yaml agent: > AgentConfig defaults
     from perflab.config import load_config
     global_cfg = load_config()
     ga = global_cfg.agent  # global agent defaults
 
     # Isolation (Fix 2b): CLI flag > task.yaml `isolation.level` > perflab.yaml/
-    # user config > compiled-in default ("none"). The resolved policy is passed
-    # through AgentConfig into every candidate benchmark/correctness subprocess
-    # (perflab/optimizers/phases/{prescreen,evaluate,autotune}.py and the
-    # baseline pipeline, so sandbox overhead cancels out of speedup comparisons).
+    # user config > compiled-in default ("auto", as of 2026-07-19 -- see
+    # DESIGN.md). "auto" resolves to "restricted" if this host has usable
+    # bwrap, else "none" (default_level_for_host()). The resolved policy is
+    # passed through AgentConfig into every candidate benchmark/correctness
+    # subprocess (perflab/optimizers/phases/{prescreen,evaluate,autotune}.py
+    # and the baseline pipeline, so sandbox overhead cancels out of speedup
+    # comparisons).
+    task_level, _ = read_task_isolation(task_file)
+    requested_level = resolve_level(isolation, task_level, global_cfg.isolation.level)
     isolation_policy = resolve_policy(task_file, global_cfg.isolation.level, cli_level=isolation)
     if isolation_policy is None:
-        typer.echo("Candidate code runs unsandboxed on this host (isolation: none).")
+        if requested_level == "auto":
+            typer.echo(
+                "Isolation: none (auto -- bwrap unavailable on this host). "
+                "Candidate code runs unsandboxed."
+            )
+        else:
+            typer.echo("Candidate code runs unsandboxed on this host (isolation: none).")
     elif default_level_for_host() == "none":
-        # bwrap unavailable (non-Linux, or user namespaces disabled):
+        # bwrap unavailable (non-Linux, or user namespaces disabled): an
+        # explicit restricted/strict was requested despite that (never
+        # reachable via "auto", which would have resolved to "none" above) --
         # wrap_command will fall back per-call, so say it loudly up front.
         typer.echo(
             f"WARNING: isolation '{isolation_policy.level}' requested, but this host "
             "cannot sandbox (bwrap unavailable or not Linux). Candidate code "
             "will run UNSANDBOXED (rlimits/env-allowlist only)."
+        )
+    elif requested_level == "auto":
+        typer.echo(
+            f"Isolation: {isolation_policy.level} (auto -- bwrap sandbox active for candidate runs)."
         )
     else:
         typer.echo(f"Isolation: {isolation_policy.level} (bwrap sandbox active for candidate runs).")
@@ -476,6 +611,7 @@ def agent(
         fast_screen=fast_screen,
         max_wall_time_s=max_time or ga.max_wall_time_s,
         isolation=isolation_policy,
+        max_cost_usd=max_cost,
     )
 
     result = run_agent(task, task_file, config, llm_config, expert_suggestion=suggest)

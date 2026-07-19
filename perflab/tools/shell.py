@@ -172,12 +172,19 @@ def run_cmd(
     rlimit_nproc: int = 512,
     skip_preexec: bool = False,
     env_mode: str = "blocklist",
+    pass_fds: Sequence[int] = (),
 ) -> CmdResult:
     """Run a command and return the result.
 
     skip_preexec: If True, skip preexec_fn. Use this when calling from
     threads (e.g. ThreadPoolExecutor) because preexec_fn + fork() in a
     multithreaded process has undefined behavior (Python docs).
+
+    pass_fds: file descriptors the spawned command must inherit (currently
+    the seccomp filter memfd that isolation.wrap_command references by number
+    in a ``bwrap --seccomp FD`` argument). run_cmd takes ownership: every fd
+    here is closed in the parent once the subprocess has finished (or failed
+    to spawn), so callers open fresh fds per call and never reuse them.
 
     env_mode: "blocklist" (default) inherits the full environment minus a
     handful of known secret prefixes -- use for trusted tool invocations
@@ -203,29 +210,39 @@ def run_cmd(
 
     t0 = time.time()
     try:
-        p = subprocess.run(
-            list(cmd),
-            cwd=str(cwd) if cwd else None,
-            env=run_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            preexec_fn=preexec,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # subprocess.run has already killed the child before re-raising.
-        t1 = time.time()
-        _logger.warning(
-            "command timed out after %ss and was killed: %s", timeout_s, list(cmd),
-        )
-        stdout = _coerce_output(exc.stdout)
-        stderr = _coerce_output(exc.stderr)
-        msg = f"[perflab-timeout] command timed out after {timeout_s}s and was killed"
-        stderr = f"{stderr}\n{msg}" if stderr else msg
-        return CmdResult(
-            cmd=cmd, returncode=TIMEOUT_RETURNCODE, stdout=stdout, stderr=stderr,
-            duration_s=t1 - t0, rlimits_applied=None,
-        )
+        try:
+            p = subprocess.run(
+                list(cmd),
+                cwd=str(cwd) if cwd else None,
+                env=run_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                preexec_fn=preexec,
+                pass_fds=tuple(pass_fds),
+            )
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run has already killed the child before re-raising.
+            t1 = time.time()
+            _logger.warning(
+                "command timed out after %ss and was killed: %s", timeout_s, list(cmd),
+            )
+            stdout = _coerce_output(exc.stdout)
+            stderr = _coerce_output(exc.stderr)
+            msg = f"[perflab-timeout] command timed out after {timeout_s}s and was killed"
+            stderr = f"{stderr}\n{msg}" if stderr else msg
+            return CmdResult(
+                cmd=cmd, returncode=TIMEOUT_RETURNCODE, stdout=stdout, stderr=stderr,
+                duration_s=t1 - t0, rlimits_applied=None,
+            )
+    finally:
+        # Ownership contract (see docstring): pass_fds are closed here on
+        # every path -- normal exit, timeout return, and spawn failure alike.
+        for fd in pass_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     t1 = time.time()
 
     stdout, stderr = p.stdout, p.stderr

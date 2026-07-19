@@ -621,9 +621,12 @@ def stub_agent_env(tmp_path, monkeypatch):
 
 @needs_fastmcp
 class TestStartAgent:
-    def test_background_run_completes(self, stub_agent_env):
+    def test_background_run_completes(self, stub_agent_env, monkeypatch):
         from perflab.server.mcp_server import start_agent
 
+        # The shipped default is "auto", which resolves via bwrap availability —
+        # pin it so isolation == "none" holds on sandbox-capable Linux hosts too.
+        monkeypatch.setattr("perflab.tools.isolation._bwrap_usable", lambda: False)
         started = start_agent(stub_agent_env, iters=2, candidates=1)
         assert "job_id" in started
         assert started["status"] in ("starting", "running")

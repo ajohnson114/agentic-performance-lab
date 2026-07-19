@@ -170,13 +170,15 @@ def run_benchmark(
     run_start = _time.time()
 
     cmd_args = shlex.split(cmd)
+    spawn_fds: list[int] = []
     if isolation is not None:
         effective_policy = dataclasses.replace(isolation, workspace=cwd)
-        cmd_args = wrap_command(cmd_args, effective_policy)
+        cmd_args = wrap_command(cmd_args, effective_policy, extra_fds=spawn_fds)
 
     res = run_cmd(
         cmd_args, cwd=cwd, env=run_env if run_env else None,
         timeout_s=300, rlimit_as_bytes=rlimit, env_mode="allowlist",
+        pass_fds=spawn_fds,
     )
     # A nonzero exit is a failed run even if a bench.json exists — without
     # this, a bench that writes results and then crashes (or a candidate that

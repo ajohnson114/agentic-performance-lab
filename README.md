@@ -42,6 +42,8 @@ perflab replay   out/runs/…  # human-readable timeline of what the agent did
 
 ## Getting Started
 
+### From a clone
+
 ```bash
 pip install -e ".[openai]"                          # or .[anthropic], .[all]
 pip install -e ".[tasks-all]"                       # task dependencies (optional)
@@ -52,6 +54,20 @@ perflab agent   tasks/matmul/python/task.yaml        # LLM-driven optimization
 ```
 
 **One-shot setup for rented instances:** `./setup-h100.sh` (NVIDIA GPU) or `./setup-tpu-v5e.sh` (TPU VM).
+
+### Without cloning
+
+PerfLab isn't published to PyPI yet, so "pip install" today means installing the wheel built from this repo (once it's on PyPI, `pip install perflab` will work the same way). Every demo task ships inside the package, so you don't need the repo checked out to try one:
+
+```bash
+pip install .                                        # from a clone; add "perflab" once it's on PyPI
+perflab tasks list                                   # see what's bundled
+perflab tasks copy matmul/python .                    # copies ./matmul/python/ into the cwd
+perflab init                                         # configure LLM provider
+perflab agent matmul/python/task.yaml                # LLM-driven optimization
+```
+
+`perflab tasks copy` refuses to overwrite an existing directory, so it's safe to run from anywhere.
 
 | Platform | Recommended tasks |
 |----------|------------------|
@@ -123,6 +139,8 @@ All activity is logged to `agent_events.jsonl`. Use `perflab replay` to review.
 | Command | Purpose |
 |---------|---------|
 | `perflab init` | Interactive LLM provider setup |
+| `perflab tasks list` | List demo tasks bundled with the package |
+| `perflab tasks copy <name> [dest]` | Copy a bundled demo task (e.g. `matmul/python`) into `dest` |
 | `perflab profile <task.yaml>` | One-shot profiling (flame graphs, traces, hardware counters) |
 | `perflab optimize <task.yaml>` | Grid search over `tuning.yaml` knobs (no LLM required) |
 | `perflab agent <task.yaml>` | LLM-driven beam-search optimization |
@@ -149,6 +167,7 @@ All activity is logged to `agent_events.jsonl`. Use `perflab replay` to review.
 | `--iters` | 12 | Max agent iterations |
 | `--candidates` | 3 | Candidates per LLM call |
 | `--max-time` | 3600 | Wall-clock budget in seconds |
+| `--max-cost` | none (unlimited) | Stop once estimated LLM cost reaches this many USD; fails closed at startup if the model's pricing is unknown |
 | `--no-early-stop` | off | Disable convergence detection |
 | `--no-fast-screen` | off | Disable two-tier benchmarking |
 
@@ -171,9 +190,10 @@ What the agent is allowed to change:
 
 What the resulting code is allowed to do when it runs, controlled by `--isolation`:
 
-- **`--isolation=none`** (default) — no sandboxing; candidate code runs with your user's full privileges
+- **`--isolation=auto`** (default) — resolves to `restricted` if this host has usable bwrap (Linux + working user namespaces), else `none`. Accepted from the CLI flag, `task.yaml`, or config; explicit levels below always win over `auto` per the usual CLI > task.yaml > config precedence.
+- **`--isolation=none`** — no sandboxing; candidate code runs with your user's full privileges
 - **`--isolation=restricted`** — Bubblewrap (`bwrap`) sandboxing on Linux: network namespace unshared unless `task.yaml` sets `network: true` (in which case `/etc/resolv.conf`, `/etc/ssl/certs`, and `/etc/hosts` are also read-only bound, so DNS resolution and TLS verification work), filesystem access scoped to the workspace, GPU devices dev-bound explicitly
-- **`--isolation=strict`** — reserved for a seccomp syscall-denial layer on top of `restricted`; **today it behaves exactly like `restricted` plus a logged warning** — the BPF filter is not shipped yet (see DESIGN.md). On non-Linux hosts both `restricted` and `strict` fall back to `none` with an explicit warning.
+- **`--isolation=strict`** — `restricted` plus a seccomp syscall-denial layer: a classic-BPF filter compiled in-process (`perflab/tools/seccomp.py`, stdlib-only — no libseccomp dependency) and applied via `bwrap --seccomp`. It denies ptrace/process-memory access, the full mount family, `bpf`, kernel keyring, module/kexec loading, and namespace-manipulation syscalls with `EPERM` (x86_64 and aarch64; syscalls entering through a foreign ABI are killed). Falls back to `restricted`-equivalent with a logged warning if this bwrap build lacks `--seccomp` or the architecture has no filter table. On non-Linux hosts both `restricted` and `strict` fall back to `none` with an explicit warning.
 - **Resource limits** — memory, process, and file descriptor caps (Linux), applied regardless of isolation level
 
 ### Output validation
@@ -201,7 +221,7 @@ PerfLab also includes `perflab.harness`, a library of anti-gaming utilities for 
 
 ## Creating a Custom Task
 
-Copy `tasks/_sample/` and customize. A task needs: `task.yaml`, `bench.py`, `tests.py`, and source files.
+Copy `tasks/_sample/` and customize (or `perflab tasks copy _sample my_task` if you installed via pip without cloning). A task needs: `task.yaml`, `bench.py`, `tests.py`, and source files.
 
 ```yaml
 # task.yaml — minimal example

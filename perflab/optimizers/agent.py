@@ -12,6 +12,7 @@ from perflab.analyzers.compiler_diagnostics import CompilerDiagnostics
 from perflab.analyzers.metrics_rollup import improvement_factor
 from perflab.llm.base import LLMProvider
 from perflab.llm.config import LLMConfig, create_provider
+from perflab.llm.pricing import estimate_cost_usd
 from perflab.memory.run_store import RunPaths, RunStore
 from perflab.optimizers.convergence import ConvergenceDetector
 from perflab.optimizers.event_log import AgentEventLog
@@ -41,6 +42,12 @@ class AgentConfig:
     # Applied uniformly to baseline AND candidate benchmark/correctness runs
     # so sandbox overhead cancels out of speedup comparisons.
     isolation: IsolationPolicy | None = None
+    # Estimated-cost budget in USD (None = unlimited). Checked each iteration
+    # against AgentContext.total_estimated_cost_usd; the run stops gracefully
+    # (normal finalize/report) once the estimate reaches this limit. cli.py
+    # fails closed at startup if this is set but the configured model's
+    # pricing is unknown, rather than running un-metered.
+    max_cost_usd: float | None = None
 
 
 @dataclass
@@ -99,6 +106,11 @@ class AgentContext:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_llm_latency: float = 0.0
+    # Recomputed from total_input_tokens/total_output_tokens whenever they
+    # change (the price table is fixed for the run, so this is equivalent to
+    # summing per-call deltas). None when the configured model's pricing is
+    # unknown -- never a fabricated dollar figure.
+    total_estimated_cost_usd: float | None = None
     user_actions: list[dict] = field(default_factory=list)
     early_stop_reason: str | None = None
     convergence: ConvergenceDetector | None = None
@@ -122,6 +134,7 @@ class AgentContext:
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_llm_latency": self.total_llm_latency,
+            "total_estimated_cost_usd": self.total_estimated_cost_usd,
             "user_actions": self.user_actions,
             "early_stop_reason": self.early_stop_reason,
         }
@@ -186,6 +199,54 @@ def _collect_promising_alternatives(
         })
     alts.sort(key=lambda x: x["improvement"], reverse=True)
     return alts[:3]
+
+
+def _update_and_check_cost_limit(ctx: AgentContext, it: int) -> bool:
+    """Recompute cumulative estimated LLM cost and enforce --max-cost.
+
+    Mutates ctx.total_estimated_cost_usd from the running token totals --
+    the price table is fixed for the run, so recomputing from cumulative
+    totals is equivalent to summing per-call deltas. Returns True when
+    config.max_cost_usd is set and reached, after logging an event, a
+    progress message, and an early-stop history entry; the caller breaks the
+    iteration loop so finalize.run still produces a normal report.
+    """
+    ctx.total_estimated_cost_usd = estimate_cost_usd(
+        ctx.llm_config.model, ctx.total_input_tokens, ctx.total_output_tokens,
+        overrides=ctx.llm_config.pricing,
+    )
+    max_cost = ctx.config.max_cost_usd
+    if max_cost is None or ctx.total_estimated_cost_usd is None:
+        return False
+    if ctx.total_estimated_cost_usd < max_cost:
+        return False
+
+    reason = f"cost limit reached (est. ${ctx.total_estimated_cost_usd:.2f} >= ${max_cost:.2f})"
+    ctx.early_stop_reason = reason
+    ctx.progress.on_message(f"[agent] {reason}")
+    ctx.event_log.cost_limit_reached(it, ctx.total_estimated_cost_usd, max_cost)
+    ctx.history.append(make_history_entry(
+        it, f"early stop: {reason}", ctx.best_value, ctx.baseline_val,
+        accepted=False, mode=ctx.task.benchmark.metric.mode,
+    ))
+    return True
+
+
+def _write_state_snapshot(ctx: AgentContext, state_path: Path) -> None:
+    """Persist per-iteration optimization state as a run artifact.
+
+    Best-effort: write failures are logged, not raised, so a snapshot
+    problem never aborts the run. Called from every loop exit path (not just
+    the bottom of a fully-processed iteration) so state.json is never
+    skipped for exactly the iterations where the LLM misbehaved worst (e.g.
+    no candidates parsed).
+    """
+    try:
+        state_path.write_text(
+            json.dumps(ctx.to_dict(), indent=2), encoding="utf-8",
+        )
+    except (OSError, TypeError):
+        logger.warning("Failed to save iteration state", exc_info=True)
 
 
 def run_agent(
@@ -312,8 +373,15 @@ def _run_iteration_loop(
 
         # Build prompt, call LLM, and parse candidates
         gen_result = generate.run(ctx)
+
+        # Cost guard: recompute cumulative estimated cost from this iteration's
+        # (now-updated) token totals and stop gracefully if --max-cost is reached.
+        if _update_and_check_cost_limit(ctx, it):
+            break
+
         if gen_result.llm_failed:
             event_log.iteration_complete(it, ctx.best_value, False)
+            _write_state_snapshot(ctx, state_path)
             continue
         candidate_blocks = gen_result.candidate_blocks
         candidate_reasoning = gen_result.candidate_reasoning
@@ -332,6 +400,11 @@ def _run_iteration_loop(
             if ctx.convergence:
                 ctx.convergence.record_failure()
             event_log.iteration_complete(it, ctx.best_value, False)
+            # Snapshot state here too -- this branch used to `continue` before
+            # reaching the snapshot write at the bottom of the loop, so
+            # state.json was never written for exactly the iterations where
+            # the LLM misbehaved worst (no parseable candidates).
+            _write_state_snapshot(ctx, state_path)
             if finalize.maybe_early_stop(ctx, it):
                 break
             continue
@@ -435,12 +508,7 @@ def _run_iteration_loop(
 
         # Persist per-iteration optimization state as a run artifact for
         # debugging and post-hoc inspection.
-        try:
-            state_path.write_text(
-                json.dumps(ctx.to_dict(), indent=2), encoding="utf-8",
-            )
-        except (OSError, TypeError):
-            logger.warning("Failed to save iteration state", exc_info=True)
+        _write_state_snapshot(ctx, state_path)
 
         if finalize.maybe_early_stop(ctx, it):
             break

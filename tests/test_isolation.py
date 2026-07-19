@@ -12,6 +12,7 @@ Covers:
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import shutil
@@ -36,6 +37,7 @@ from perflab.tools.isolation import (
     IsolationPolicy,
     default_level_for_host,
     normalize_level,
+    resolve_effective_level,
     resolve_level,
     resolve_policy,
     wrap_command,
@@ -92,6 +94,50 @@ class TestResolvePolicy:
         assert policy is not None
         assert policy.level == "restricted"
 
+    def test_auto_from_config_resolves_to_restricted_when_bwrap_usable(self, tmp_path):
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=True):
+            policy = resolve_policy(self._write_task(tmp_path), "auto")
+        assert policy is not None
+        assert policy.level == "restricted"
+
+    def test_auto_from_config_resolves_to_none_when_bwrap_unusable(self, tmp_path):
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=False):
+            policy = resolve_policy(self._write_task(tmp_path), "auto")
+        assert policy is None
+
+    def test_auto_from_task_yaml_resolves_via_host(self, tmp_path):
+        task = self._write_task(tmp_path, "isolation:\n  level: auto\n")
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=True):
+            policy = resolve_policy(task, "none")
+        assert policy is not None
+        assert policy.level == "restricted"
+
+    def test_auto_from_cli_resolves_via_host(self, tmp_path):
+        task = self._write_task(tmp_path)
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=True):
+            policy = resolve_policy(task, "none", cli_level="auto")
+        assert policy is not None
+        assert policy.level == "restricted"
+
+    def test_explicit_none_from_cli_wins_over_auto_config_even_with_bwrap(self, tmp_path):
+        """Explicit "none" anywhere still behaves exactly as before -- it must
+        not be reinterpreted through "auto" just because config defaults to it."""
+        task = self._write_task(tmp_path)
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=True):
+            policy = resolve_policy(task, "auto", cli_level="none")
+        assert policy is None
+
+    def test_explicit_restricted_unaffected_by_bwrap_state(self, tmp_path):
+        """Explicit "restricted" is a request, not "auto" -- resolve_policy
+        must pass it through unchanged regardless of _bwrap_usable(); it's
+        wrap_command() (not resolve_policy) that downgrades it at launch time
+        if bwrap turns out to be unusable."""
+        task = self._write_task(tmp_path)
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=False):
+            policy = resolve_policy(task, "restricted")
+        assert policy is not None
+        assert policy.level == "restricted"
+
 
 class TestNormalizeLevel:
     def test_none_input_is_none_level(self):
@@ -102,10 +148,12 @@ class TestNormalizeLevel:
         assert normalize_level("none") == "none"
         assert normalize_level("restricted") == "restricted"
         assert normalize_level("strict") == "strict"
+        assert normalize_level("auto") == "auto"
 
     def test_case_and_whitespace_insensitive(self):
         assert normalize_level("  Restricted  ") == "restricted"
         assert normalize_level("STRICT") == "strict"
+        assert normalize_level("  Auto  ") == "auto"
 
     def test_invalid_level_raises(self):
         with pytest.raises(ValueError):
@@ -124,6 +172,27 @@ class TestResolveLevel:
 
     def test_all_unset_defaults_to_none(self):
         assert resolve_level(None, None, None) == "none"
+
+    def test_auto_passes_through_unresolved(self):
+        """resolve_level itself never expands "auto" -- that's
+        resolve_effective_level()'s job, so resolve_policy can decide
+        whether/how to report the pre-resolution request (e.g. the CLI echo)."""
+        assert resolve_level(None, None, "auto") == "auto"
+        assert resolve_level("auto", "restricted", "none") == "auto"
+
+
+class TestResolveEffectiveLevel:
+    def test_auto_resolves_to_restricted_when_bwrap_usable(self):
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=True):
+            assert resolve_effective_level("auto") == "restricted"
+
+    def test_auto_resolves_to_none_when_bwrap_unusable(self):
+        with patch.object(isolation_mod, "_bwrap_usable", return_value=False):
+            assert resolve_effective_level("auto") == "none"
+
+    def test_explicit_levels_pass_through_unchanged(self):
+        for lvl in ("none", "restricted", "strict"):
+            assert resolve_effective_level(lvl) == lvl
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +373,78 @@ class TestNetworkBindPaths:
             result = wrap_command(cmd, IsolationPolicy(level="strict", workspace=ws))
         assert result[0] == "/usr/bin/bwrap"
         assert "restricted" in caplog.text.lower()
+        assert "--seccomp" not in result
+
+    @contextlib.contextmanager
+    def _linux_bwrap_with_seccomp(self):
+        """Simulate a Linux host with usable, --seccomp-capable bwrap."""
+        with patch.object(isolation_mod.platform, "system", return_value="Linux"), \
+             patch.object(isolation_mod.shutil, "which", return_value="/usr/bin/bwrap"), \
+             patch.object(isolation_mod, "_bwrap_usable", return_value=True), \
+             patch.object(isolation_mod, "_bwrap_supports_seccomp", return_value=True), \
+             patch.object(isolation_mod, "_readonly_bind_paths", return_value=[]), \
+             patch.object(isolation_mod, "_nvidia_device_paths", return_value=[]):
+            yield
+
+    def test_strict_adds_seccomp_arg_and_registers_fd(self, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        fds: list[int] = []
+        with self._linux_bwrap_with_seccomp(), \
+             patch.object(isolation_mod.seccomp, "filter_memfd", return_value=42):
+            result = wrap_command(
+                ["python3", "bench.py"],
+                IsolationPolicy(level="strict", workspace=ws), extra_fds=fds,
+            )
+        assert fds == [42]
+        idx = result.index("--seccomp")
+        assert result[idx + 1] == "42"
+        # The seccomp args must come before the `--` separating bwrap options
+        # from the wrapped command.
+        assert idx < result.index("--")
+
+    def test_strict_without_extra_fds_skips_seccomp_and_warns(self, tmp_path, caplog):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        with self._linux_bwrap_with_seccomp():
+            result = wrap_command(
+                ["python3", "bench.py"], IsolationPolicy(level="strict", workspace=ws),
+            )
+        assert result[0] == "/usr/bin/bwrap"
+        assert "--seccomp" not in result
+        assert "cannot carry file descriptors" in caplog.text
+
+    def test_strict_filter_unavailable_skips_seccomp_and_warns(self, tmp_path, caplog):
+        from perflab.tools.seccomp import SeccompUnavailableError
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        fds: list[int] = []
+        with self._linux_bwrap_with_seccomp(), \
+             patch.object(
+                 isolation_mod.seccomp, "filter_memfd",
+                 side_effect=SeccompUnavailableError("no table for m68k"),
+             ):
+            result = wrap_command(
+                ["python3", "bench.py"],
+                IsolationPolicy(level="strict", workspace=ws), extra_fds=fds,
+            )
+        assert result[0] == "/usr/bin/bwrap"
+        assert "--seccomp" not in result
+        assert fds == []
+        assert "could not be prepared" in caplog.text
+
+    def test_restricted_never_adds_seccomp(self, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        fds: list[int] = []
+        with self._linux_bwrap_with_seccomp():
+            result = wrap_command(
+                ["python3", "bench.py"],
+                IsolationPolicy(level="restricted", workspace=ws), extra_fds=fds,
+            )
+        assert "--seccomp" not in result
+        assert fds == []
 
 
 class TestDefaultLevelForHost:
@@ -322,9 +463,12 @@ class TestDefaultLevelForHost:
 
 
 class TestIsolationConfig:
-    def test_default_is_none(self):
+    def test_default_is_auto(self):
+        """Shipped default flipped from "none" to "auto" on 2026-07-19 (owner
+        decision; see DESIGN.md) -- "auto" resolves via
+        default_level_for_host() rather than always being unsandboxed."""
         cfg = PerfLabConfig()
-        assert cfg.isolation.level == "none"
+        assert cfg.isolation.level == "auto"
 
     def test_yaml_overlay(self):
         cfg = PerfLabConfig()
@@ -353,13 +497,14 @@ class TestIsolationConfig:
     def test_to_dict_includes_isolation(self):
         cfg = PerfLabConfig()
         d = cfg.to_dict()
-        assert d["isolation"]["level"] == "none"
+        assert d["isolation"]["level"] == "auto"
 
     def test_template_documents_isolation(self):
         data = yaml.safe_load(DEFAULT_CONFIG_TEMPLATE)
-        assert data["isolation"]["level"] == "none"
+        assert data["isolation"]["level"] == "auto"
         assert "restricted" in DEFAULT_CONFIG_TEMPLATE
         assert "strict" in DEFAULT_CONFIG_TEMPLATE
+        assert "auto" in DEFAULT_CONFIG_TEMPLATE
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +552,7 @@ class TestRunBenchmarkIsolationWiring:
         policy = IsolationPolicy(level="restricted", workspace=stale_workspace)
 
         captured = {}
-        def fake_wrap_command(cmd, pol):
+        def fake_wrap_command(cmd, pol, extra_fds=None):
             captured["policy"] = pol
             return cmd
 
@@ -435,7 +580,7 @@ class TestRunCorrectnessIsolationWiring:
         policy = IsolationPolicy(level="restricted", workspace=stale_workspace)
 
         captured = {}
-        def fake_wrap_command(cmd, pol):
+        def fake_wrap_command(cmd, pol, extra_fds=None):
             captured["policy"] = pol
             return cmd
 
@@ -453,7 +598,7 @@ class TestRunCorrectnessIsolationWiring:
         policy = IsolationPolicy(level="restricted", workspace=tmp_workspace.parent / "stale")
 
         calls = []
-        def fake_wrap_command(cmd, pol):
+        def fake_wrap_command(cmd, pol, extra_fds=None):
             calls.append(pol)
             return cmd
 
@@ -464,8 +609,10 @@ class TestRunCorrectnessIsolationWiring:
 
         assert res.returncode == 0
         assert warnings == []
-        assert len(calls) == 1  # wrap_command applies once; same wrapped args reused for both runs
-        assert calls[0].workspace == tmp_workspace
+        # One wrap per spawn: a wrapped argv can reference a single-use seccomp
+        # fd under strict, so the determinism re-run must re-wrap, never reuse.
+        assert len(calls) == 2
+        assert all(pol.workspace == tmp_workspace for pol in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -729,3 +876,172 @@ class TestAgentLoopIsolationWiring:
         )
         assert captured["correctness"] is policy
         assert captured["benchmark"] is policy
+
+
+# ---------------------------------------------------------------------------
+# 6. run_cmd pass_fds ownership (fd plumbing that carries strict's seccomp
+#    filter memfd into the bwrap child)
+# ---------------------------------------------------------------------------
+
+
+class TestRunCmdPassFds:
+    def _pipe_read_end(self):
+        r, w = os.pipe()
+        os.close(w)
+        return r
+
+    def test_pass_fds_closed_after_successful_run(self):
+        from perflab.tools.shell import run_cmd
+
+        fd = self._pipe_read_end()
+        res = run_cmd(["python3", "-c", "pass"], skip_preexec=True, pass_fds=[fd])
+        assert res.returncode == 0
+        with pytest.raises(OSError):
+            os.fstat(fd)  # closed by run_cmd (ownership contract)
+
+    def test_pass_fds_closed_when_spawn_fails(self):
+        from perflab.tools.shell import run_cmd
+
+        fd = self._pipe_read_end()
+        with pytest.raises(FileNotFoundError):
+            run_cmd(["/nonexistent-perflab-binary"], skip_preexec=True, pass_fds=[fd])
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+    def test_child_inherits_pass_fd(self):
+        from perflab.tools.shell import run_cmd
+
+        r, w = os.pipe()
+        os.write(w, b"seccomp-prog")
+        os.close(w)
+        res = run_cmd(
+            ["python3", "-c", f"import os,sys; sys.stdout.write(os.read({r}, 100).decode())"],
+            skip_preexec=True, pass_fds=[r],
+        )
+        assert res.returncode == 0, res.stderr
+        assert res.stdout == "seccomp-prog"
+
+
+# ---------------------------------------------------------------------------
+# 7. seccomp acceptance: real kernel enforcement of the strict filter through
+#    bwrap. Linux-only, needs usable bwrap with --seccomp (CI's x86_64 ubuntu
+#    runners; docker/README.md's dev container covers aarch64 locally).
+# ---------------------------------------------------------------------------
+
+_SECCOMP_UNAVAILABLE = (
+    _BWRAP_MISSING or not isolation_mod._bwrap_supports_seccomp()
+)
+
+# ptrace(PTRACE_TRACEME, 0, 0, 0): succeeds unprivileged on a stock kernel
+# (Yama restricts attach, not traceme), so it cleanly discriminates "filter
+# absent" (rc 0) from "filter denies" (rc -1, errno EPERM).
+_PTRACE_TRACEME_PROBE = (
+    "import ctypes, sys;"
+    "libc = ctypes.CDLL(None, use_errno=True);"
+    "rc = libc.ptrace(0, 0, 0, 0);"
+    "print(rc, ctypes.get_errno());"
+    "sys.exit(0)"
+)
+
+
+def _run_wrapped(cmd: list[str], policy: IsolationPolicy) -> subprocess.CompletedProcess:
+    """wrap_command + spawn with the same fd contract run_cmd honors."""
+    fds: list[int] = []
+    wrapped = wrap_command(cmd, policy, extra_fds=fds)
+    try:
+        return subprocess.run(
+            wrapped, capture_output=True, text=True, timeout=30, pass_fds=tuple(fds),
+        )
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+@pytest.mark.skipif(_SECCOMP_UNAVAILABLE, reason="bwrap with --seccomp not usable here")
+class TestSeccompAcceptance:
+    def test_strict_denies_ptrace_with_eperm(self, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        policy = IsolationPolicy(level="strict", workspace=ws, network=False)
+        result = _run_wrapped(["python3", "-c", _PTRACE_TRACEME_PROBE], policy)
+        assert result.returncode == 0, result.stderr
+        rc, errno_val = result.stdout.split()
+        assert (rc, errno_val) == ("-1", "1"), (
+            f"expected ptrace denied with EPERM under strict, got rc={rc} errno={errno_val}"
+        )
+
+    def test_restricted_does_not_deny_ptrace(self, tmp_path):
+        """Control for the strict test: same probe, no seccomp layer."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        policy = IsolationPolicy(level="restricted", workspace=ws, network=False)
+        result = _run_wrapped(["python3", "-c", _PTRACE_TRACEME_PROBE], policy)
+        assert result.returncode == 0, result.stderr
+        rc, _ = result.stdout.split()
+        assert rc == "0", f"ptrace unexpectedly failed without the filter: {result.stdout}"
+
+    def test_strict_denies_unshare_and_mount(self, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        policy = IsolationPolicy(level="strict", workspace=ws, network=False)
+        probe = (
+            "import ctypes;"
+            "libc = ctypes.CDLL(None, use_errno=True);"
+            "rc1 = libc.unshare(0x10000000);"       # CLONE_NEWUSER
+            "e1 = ctypes.get_errno();"
+            "rc2 = libc.mount(None, b'/', None, 0, None);"
+            "e2 = ctypes.get_errno();"
+            "print(rc1, e1, rc2, e2)"
+        )
+        result = _run_wrapped(["python3", "-c", probe], policy)
+        assert result.returncode == 0, result.stderr
+        rc1, e1, rc2, e2 = result.stdout.split()
+        assert (rc1, e1) == ("-1", "1"), f"unshare not denied with EPERM: {result.stdout}"
+        assert (rc2, e2) == ("-1", "1"), f"mount not denied with EPERM: {result.stdout}"
+
+    def test_strict_leaves_benign_code_working(self, tmp_path):
+        """Python startup issues hundreds of syscalls; a filter that
+        over-blocks would break this long before candidate code runs."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        policy = IsolationPolicy(level="strict", workspace=ws, network=False)
+        script = ws / "work.py"
+        script.write_text(
+            "import json, subprocess, tempfile\n"
+            "with tempfile.TemporaryFile() as f: f.write(b'x')\n"
+            "out = subprocess.run(['python3', '-c', 'print(6*7)'],"
+            " capture_output=True, text=True)\n"
+            "print(json.dumps({'child': out.stdout.strip()}))\n"
+        )
+        result = _run_wrapped(["python3", str(script)], policy)
+        assert result.returncode == 0, result.stderr
+        assert '"child": "42"' in result.stdout
+
+    def test_run_correctness_twice_under_strict(self, tmp_path):
+        """End-to-end through the runner: both spawns get their own filter fd
+        (a reused wrapped argv would hand run 2 a closed/consumed fd)."""
+        from perflab.runners.correctness import run_correctness_twice
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "tests.py").write_text("import sys; sys.exit(0)\n")
+        policy = IsolationPolicy(level="strict", workspace=ws, network=False)
+        res, warnings = run_correctness_twice("python3 tests.py", cwd=ws, isolation=policy)
+        assert res.returncode == 0, res.stderr
+        assert warnings == []
+
+    def test_run_benchmark_under_strict(self, tmp_path):
+        from perflab.runners.benchmark import run_benchmark
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "out").mkdir()
+        (ws / "bench.py").write_text(
+            "import json, pathlib\n"
+            "pathlib.Path('out/bench.json').write_text("
+            "json.dumps({'ok': True, 'throughput': {'median': 1.0}}))\n"
+        )
+        policy = IsolationPolicy(level="strict", workspace=ws, network=False)
+        res, bench = run_benchmark("python3 bench.py", cwd=ws, isolation=policy)
+        assert res.returncode == 0, res.stderr
+        assert bench["ok"] is True

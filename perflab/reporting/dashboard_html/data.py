@@ -30,6 +30,7 @@ class GlanceData:
     llm_total_input_tokens: int = 0
     llm_total_output_tokens: int = 0
     llm_total_latency_s: float = 0.0
+    llm_estimated_cost_usd: float | None = None
 
 
 @dataclass

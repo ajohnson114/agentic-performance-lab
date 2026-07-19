@@ -7,6 +7,7 @@ few negative paths.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
@@ -145,3 +146,59 @@ class TestNegativeCases:
     def test_profile_missing_argument_is_usage_error(self) -> None:
         result = runner.invoke(app, ["profile"])
         assert result.exit_code == 2
+
+
+class TestAgentMaxCostFailClosed:
+    """--max-cost must fail closed at startup when the configured model's
+    pricing is unknown, rather than running the (expensive) agent un-metered.
+    This exits before load_config()/isolation resolution/run_agent are ever
+    reached, so it stays a cheap CLI-parsing-level test."""
+
+    def test_unknown_model_pricing_exits_before_running(
+        self, tmp_path: Path, sample_task_yaml: Path,
+    ) -> None:
+        env = {
+            "PERFLAB_LLM_PROVIDER": "openai",
+            "PERFLAB_LLM_MODEL": "totally-unpriced-model-xyz",
+            "PERFLAB_API_KEY": "sk-test",
+        }
+        # Point LLMConfig.load() at a config file that doesn't exist, so this
+        # test never depends on (or is polluted by) a real ~/.config/perflab
+        # file on the machine running it.
+        with patch.dict("os.environ", env, clear=True), \
+                patch("perflab.llm.config._DEFAULT_CONFIG_PATH", tmp_path / "config.yaml"):
+            result = runner.invoke(
+                app, ["agent", str(sample_task_yaml), "--max-cost", "5.0"],
+            )
+
+        assert result.exit_code == 1
+        assert "no pricing is known" in result.output
+        assert "totally-unpriced-model-xyz" in result.output
+
+    def test_no_max_cost_does_not_trigger_pricing_check(
+        self, tmp_path: Path, sample_task_yaml: Path,
+    ) -> None:
+        # Same unpriced model, but --max-cost is not passed -- the pricing
+        # check must not fire at all (it's gated on --max-cost being set).
+        # run_agent itself is stubbed out so this stays a cheap CLI test.
+        env = {
+            "PERFLAB_LLM_PROVIDER": "openai",
+            "PERFLAB_LLM_MODEL": "totally-unpriced-model-xyz",
+            "PERFLAB_API_KEY": "sk-test",
+        }
+        from perflab.optimizers.agent import AgentResult
+
+        fake_result = AgentResult(
+            best_value=1.0, best_iter=0, baseline_value=1.0, history=[],
+            run_dir=tmp_path,
+        )
+        with patch.dict("os.environ", env, clear=True), \
+                patch("perflab.llm.config._DEFAULT_CONFIG_PATH", tmp_path / "config.yaml"), \
+                patch("perflab.optimizers.agent.run_agent", return_value=fake_result):
+            result = runner.invoke(
+                # Force isolation=none so this test doesn't depend on
+                # bwrap-detection behavior on the host running it.
+                app, ["agent", str(sample_task_yaml), "--isolation", "none"],
+            )
+
+        assert "no pricing is known" not in result.output

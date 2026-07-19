@@ -71,6 +71,79 @@ class TestApiKeyNeverLoadedFromFile:
         assert cfg.api_key == "sk-from-env"
 
 
+class TestPricingOverrides:
+    def test_pricing_override_parsed_from_llm_section(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({
+            "llm": {
+                "provider": "openai",
+                "model": "gpt-5.2",
+                "pricing": {"my-custom-model": [1.5, 6.0]},
+            },
+        }))
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.pricing == {"my-custom-model": (1.5, 6.0)}
+
+    def test_pricing_override_flat_config_style(self, tmp_path):
+        # LLMConfig.load() supports a flat (non-nested-under-llm) config file
+        # too -- pricing should parse the same way in that shape.
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({
+            "provider": "openai",
+            "pricing": {"another-model": [2.0, 8.0]},
+        }))
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.pricing == {"another-model": (2.0, 8.0)}
+
+    def test_no_pricing_section_yields_empty_dict(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.pricing == {}
+
+    def test_malformed_pricing_entry_skipped_with_warning(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({
+            "llm": {
+                "pricing": {
+                    "good-model": [1.0, 2.0],
+                    "bad-model": "not-a-pair",
+                },
+            },
+        }))
+
+        with patch.dict("os.environ", {}, clear=True):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                cfg = LLMConfig.load(config_path)
+
+        assert cfg.pricing == {"good-model": (1.0, 2.0)}
+        assert any("bad-model" in str(w.message) for w in caught)
+
+    def test_pricing_override_used_by_estimate_cost_usd(self, tmp_path):
+        from perflab.llm.pricing import estimate_cost_usd
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({
+            "llm": {"pricing": {"my-model": [1.0, 4.0]}},
+        }))
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        cost = estimate_cost_usd("my-model", 1_000_000, 1_000_000, overrides=cfg.pricing)
+        assert cost == 5.0
+
+
 class TestScrubApiKey:
     def test_removes_key_and_rewrites_file(self, tmp_path):
         config_path = tmp_path / "config.yaml"

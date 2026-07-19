@@ -352,6 +352,7 @@ def generate_reports(p: ReportParams) -> dict:
         llm_total_input_tokens=llm_stats.get("total_input_tokens", 0) if llm_stats else 0,
         llm_total_output_tokens=llm_stats.get("total_output_tokens", 0) if llm_stats else 0,
         llm_total_latency_s=llm_stats.get("total_llm_latency_s", 0.0) if llm_stats else 0.0,
+        llm_estimated_cost_usd=llm_stats.get("estimated_cost_usd") if llm_stats else None,
     )
 
     # --- Wire TFLOPS + % of peak into at-a-glance ---

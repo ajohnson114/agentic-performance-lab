@@ -11,11 +11,20 @@ management contradicts the "local-first CLI" premise, and container
 cold-start would pollute the fast-screen timing tier (see DESIGN.md,
 "Two-tier benchmarking"). Instead, isolation here is a launch-time wrapper
 (Bubblewrap on Linux) around the same subprocess perflab would have run
-anyway -- cheap, optional, and (per the benchmark-noise A/B tracked in
-DESIGN.md) intended to add negligible steady-state overhead.
+anyway -- cheap, optional, and intended to add negligible steady-state
+overhead (validated in CI: see DESIGN.md for how the shipped "auto" default
+is exercised on every push).
 
 Levels:
-  none       -- current behavior (rlimits only). The compiled-in default.
+  auto       -- resolve to whatever default_level_for_host() decides:
+                'restricted' if this host has usable bwrap (Linux + working
+                user namespaces), else 'none'. The compiled-in default as of
+                2026-07-19 (see DESIGN.md) -- accepted from any source (CLI
+                flag, task.yaml, config) and resolved by resolve_policy()
+                before an IsolationPolicy is ever constructed, so nothing
+                downstream (wrap_command, IsolationPolicy.level) ever sees
+                the literal string 'auto'.
+  none       -- unsandboxed (rlimits only).
   restricted -- bwrap: read-only bind of /usr, /lib, the venv, and any
                 detected CUDA/driver paths; read-write bind of the calling
                 workspace only; --unshare-net unless network=True (in which
@@ -24,10 +33,13 @@ Levels:
                 --die-with-parent. Falls back to 'none' (with a logged
                 warning) if bwrap is missing, not on Linux, or user
                 namespaces are unusable.
-  strict     -- restricted + a seccomp filter denying ptrace/mount/bpf/keyctl,
-                if bwrap on this host supports --seccomp. perflab does not
-                ship a compiled BPF filter yet (see wrap_command docstring),
-                so strict currently behaves like restricted plus a warning.
+  strict     -- restricted + a seccomp syscall-denial filter (ptrace, the
+                mount family, bpf, keyctl, namespace manipulation, module
+                loading -- see perflab.tools.seccomp.DENIED_SYSCALL_NAMES),
+                compiled in-process and handed to ``bwrap --seccomp`` as an
+                inherited memfd. Falls back to restricted-equivalent (with a
+                warning) if this bwrap build lacks --seccomp or the filter
+                can't be built for this architecture.
 
 macOS has no bwrap. sandbox-exec exists but is deprecated, and a correct
 profile is a substantial undertaking on its own -- rather than ship a profile
@@ -51,11 +63,19 @@ from typing import Literal, cast
 
 import yaml
 
+from perflab.tools import seccomp
+
 logger = logging.getLogger(__name__)
 
 IsolationLevel = Literal["none", "restricted", "strict"]
 
-_VALID_LEVELS: tuple[IsolationLevel, ...] = ("none", "restricted", "strict")
+# What a level string may resolve to *before* "auto" is expanded via
+# default_level_for_host(). normalize_level/resolve_level return this; by the
+# time an IsolationPolicy is constructed (resolve_policy), "auto" has always
+# been replaced with a concrete IsolationLevel.
+RequestedIsolationLevel = Literal["none", "restricted", "strict", "auto"]
+
+_VALID_LEVELS: tuple[RequestedIsolationLevel, ...] = ("none", "restricted", "strict", "auto")
 
 # Read-only paths bound into the sandbox so the interpreter, its native
 # extensions, and the shared library loader are visible without giving
@@ -89,28 +109,45 @@ _NETWORK_RO_BIND_CANDIDATES: tuple[str, ...] = (
 )
 
 
-def normalize_level(level: str | None) -> IsolationLevel:
-    """Validate and normalize a level string. None/'' -> 'none'."""
+def normalize_level(level: str | None) -> RequestedIsolationLevel:
+    """Validate and normalize a level string. None/'' -> 'none'.
+
+    Returns the *requested* level, which may be the literal string "auto" --
+    callers that need a concrete IsolationLevel (never "auto") should go
+    through resolve_effective_level() or resolve_policy().
+    """
     if not level:
         return "none"
     lvl = level.strip().lower()
     if lvl not in _VALID_LEVELS:
         raise ValueError(f"Invalid isolation level {level!r}; must be one of {_VALID_LEVELS}")
-    return cast(IsolationLevel, lvl)
+    return cast(RequestedIsolationLevel, lvl)
 
 
 def resolve_level(
     cli_level: str | None,
     task_level: str | None,
     config_level: str | None,
-) -> IsolationLevel:
-    """Resolve the effective isolation level: CLI flag > task.yaml > config.
+) -> RequestedIsolationLevel:
+    """Resolve the requested isolation level: CLI flag > task.yaml > config.
 
     Mirrors the resolution order already used for iters/candidates/etc. in
     ``perflab agent`` (perflab/cli.py). A pure function so it's testable
-    without invoking Typer.
+    without invoking Typer. May return "auto" -- see resolve_effective_level().
     """
     return normalize_level(cli_level or task_level or config_level)
+
+
+def resolve_effective_level(requested: RequestedIsolationLevel) -> IsolationLevel:
+    """Expand "auto" to a concrete level via default_level_for_host().
+
+    Every other requested level passes through unchanged. This is the single
+    place "auto" gets resolved -- resolve_policy() calls it so an
+    IsolationPolicy never carries the literal string "auto".
+    """
+    if requested == "auto":
+        return default_level_for_host()
+    return requested
 
 
 def read_task_isolation(task_file: Path) -> tuple[str | None, bool]:
@@ -140,16 +177,21 @@ def resolve_policy(
 ) -> IsolationPolicy | None:
     """Resolve the effective sandbox policy: CLI flag > task.yaml > config.
 
-    Returns None when the resolved level is "none". Shared by ``perflab
-    agent`` and the MCP server's agent tools so every entrypoint that runs
-    candidate code applies the same policy — the MCP tools previously built
-    AgentConfig without isolation, silently downgrading a task.yaml that
-    asked for a sandbox.
+    "auto" (from any of the three sources) is expanded to a concrete level via
+    resolve_effective_level()/default_level_for_host() before it ever reaches
+    an IsolationPolicy. Returns None when the resolved level is "none" --
+    which happens either because "none" was explicitly requested, or because
+    "auto" resolved to "none" on a host without usable bwrap. Shared by
+    ``perflab agent`` and the MCP server's agent tools so every entrypoint
+    that runs candidate code applies the same policy — the MCP tools
+    previously built AgentConfig without isolation, silently downgrading a
+    task.yaml that asked for a sandbox.
 
     Raises ValueError (from normalize_level) on an invalid level string.
     """
     task_level, network = read_task_isolation(task_file)
-    level = resolve_level(cli_level, task_level, config_level)
+    requested = resolve_level(cli_level, task_level, config_level)
+    level = resolve_effective_level(requested)
     if level == "none":
         return None
     return IsolationPolicy(level=level, network=network)
@@ -178,14 +220,16 @@ class IsolationPolicy:
 
 
 def default_level_for_host() -> IsolationLevel:
-    """The level the spec designates as default (Linux + usable bwrap).
+    """The level "auto" resolves to on this host: restricted if bwrap is
+    usable, else none.
 
-    Not currently wired in as the *actual* config default -- see DESIGN.md:
-    the spec requires an A/B benchmark-noise check (restricted vs. none on
-    tasks/matmul/cpp, confirming <1% median runtime delta) before flipping
-    the shipped default from 'none' to this. This function exists so that
-    check (and any future `perflab doctor`-style readiness report) has
-    something to call once that validation has actually been run.
+    Wired in as the actual config/CLI/task.yaml default as of 2026-07-19 --
+    ``IsolationSection.level`` defaults to "auto" (perflab/config.py) and
+    resolve_policy()/resolve_effective_level() call this to expand it. See
+    DESIGN.md for why the originally-planned one-off benchmark-noise A/B was
+    superseded by CI as the validation mechanism (bwrap acceptance tests plus
+    a real-task ci-check run under ``restricted``, both exercised on every
+    push). macOS (no bwrap) is unaffected: this always returns "none" there.
     """
     return "restricted" if _bwrap_usable() else "none"
 
@@ -271,23 +315,27 @@ def _resolve_python(cmd: list[str]) -> list[str]:
     return cmd
 
 
-def wrap_command(cmd: list[str], policy: IsolationPolicy) -> list[str]:
+def wrap_command(
+    cmd: list[str],
+    policy: IsolationPolicy,
+    extra_fds: list[int] | None = None,
+) -> list[str]:
     """Return ``cmd``, optionally prefixed with a bwrap invocation.
 
     Falls back to returning ``cmd`` unchanged whenever the requested level
     can't be honored on this host (non-Linux, bwrap missing/unusable), always
     logging why so the fallback isn't silent.
 
-    Strict's seccomp layer (deny ptrace/mount/bpf/keyctl) is intentionally
-    not implemented even when bwrap supports --seccomp: a correct filter
-    needs per-architecture syscall numbers and BPF program validation, which
-    needs either a libseccomp binding or hand-rolled bytecode -- neither is a
-    dependency of this project. Shipping a guessed filter risks silently
-    failing open on exactly the syscalls it's meant to deny, which is worse
-    than not having it (same reasoning as the macOS sandbox-exec omission
-    above). strict therefore currently runs with restricted's protections
-    plus a warning; adding a real filter is a follow-up once there's a
-    Linux+bwrap target to validate it against.
+    ``strict`` adds a seccomp syscall-denial filter (perflab.tools.seccomp)
+    via ``bwrap --seccomp FD``. The fd is a fresh memfd holding the compiled
+    BPF program; bwrap reads it in the child, so it must survive the spawn:
+    wrap_command appends it to ``extra_fds`` and the caller must hand those
+    fds to run_cmd's ``pass_fds`` (which forwards them to the subprocess and
+    closes them in the parent afterwards -- one wrap_command call per spawn,
+    never reuse a wrapped argv for a second run). A caller that passes
+    extra_fds=None is declaring it can't carry fds across the spawn, so the
+    seccomp layer is skipped with a warning rather than emitting a --seccomp
+    argument pointing at an fd the child will never see.
     """
     if policy.level == "none":
         return cmd
@@ -356,18 +404,37 @@ def wrap_command(cmd: list[str], policy: IsolationPolicy) -> list[str]:
         args += ["--bind", str(policy.run_output_dir), str(policy.run_output_dir)]
 
     if policy.level == "strict":
-        if _bwrap_supports_seccomp():
-            logger.warning(
-                "Isolation level 'strict' requested: this bwrap build "
-                "supports --seccomp but perflab does not yet ship a compiled "
-                "BPF filter -- running with 'restricted'-equivalent "
-                "protections only (no ptrace/mount/bpf/keyctl denial layer)."
-            )
-        else:
-            logger.warning(
-                "Isolation level 'strict' requested but this bwrap build has "
-                "no --seccomp support -- running with 'restricted'-equivalent "
-                "protections only."
-            )
+        args += _seccomp_args(extra_fds)
 
     return [*args, "--", *cmd]
+
+
+def _seccomp_args(extra_fds: list[int] | None) -> list[str]:
+    """bwrap args for strict's seccomp layer, or [] (with a warning) when it
+    can't be applied. Appends the filter fd to extra_fds on success -- see
+    wrap_command's docstring for the fd lifetime contract."""
+    if not _bwrap_supports_seccomp():
+        logger.warning(
+            "Isolation level 'strict' requested but this bwrap build has "
+            "no --seccomp support -- running with 'restricted'-equivalent "
+            "protections only."
+        )
+        return []
+    if extra_fds is None:
+        logger.warning(
+            "Isolation level 'strict' requested but this caller cannot carry "
+            "file descriptors across the spawn (extra_fds=None) -- running "
+            "with 'restricted'-equivalent protections only."
+        )
+        return []
+    try:
+        fd = seccomp.filter_memfd()
+    except (seccomp.SeccompUnavailableError, OSError) as exc:
+        logger.warning(
+            "Isolation level 'strict' requested but the seccomp filter could "
+            "not be prepared (%s) -- running with 'restricted'-equivalent "
+            "protections only.", exc,
+        )
+        return []
+    extra_fds.append(fd)
+    return ["--seccomp", str(fd)]

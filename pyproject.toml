@@ -42,6 +42,20 @@ filterwarnings = [
 where = ["."]
 include = ["perflab*"]
 
+# demo_tasks/ ships the bundled example tasks (tasks/ at the repo root is a
+# symlink to perflab/demo_tasks/). It has no __init__.py -- it's not a Python
+# package, just data -- so packages.find above never picks it up. Instead we
+# attach it as package-data on the "perflab" package, globbing by extension so
+# only source files ship: no __pycache__/, out/ run artifacts, or compiled
+# matmul_bin binaries from local runs sneak into the wheel.
+[tool.setuptools.package-data]
+perflab = [
+  "demo_tasks/**/*.yaml",
+  "demo_tasks/**/*.py",
+  "demo_tasks/**/*.cpp",
+  "demo_tasks/**/*.cu",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -55,3 +69,8 @@ ignore = ["E501"]                              # long lines exist in prompts/tab
 # job checks its own version. A pin below 3.12 chokes on numpy>=2.3 stubs (PEP 695).
 ignore_missing_imports = true                  # torch/jax/triton are optional extras
 check_untyped_defs = true
+# demo_tasks/ (formerly repo-root tasks/) holds standalone example scripts, not
+# library code -- CI's `mypy perflab` only swept them in because they now live
+# on disk under perflab/ for packaging (see [tool.setuptools.package-data]).
+# They were never mypy-checked before the move and aren't held to the same bar.
+exclude = ["^perflab/demo_tasks/"]

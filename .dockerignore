@@ -1,0 +1,15 @@
+# Keep the docker/ dev-image build context small: exclude the local venv
+# (multi-GB with torch), git history, and generated artifacts. The image
+# installs its own dependencies into /opt/venv.
+.venv
+.git
+__pycache__
+*.pyc
+*.egg-info
+.mypy_cache
+.pytest_cache
+.ruff_cache
+runs/
+out/
+dist/
+build/

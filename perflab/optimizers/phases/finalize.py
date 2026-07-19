@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING
 
 from perflab.analyzers.metrics_rollup import improvement_factor
+from perflab.llm.pricing import estimate_cost_usd
 from perflab.memory.run_store import RunStore, load_profiler_summaries
 from perflab.optimizers.history import make_history_entry
 from perflab.optimizers.progress import fmt_elapsed, usage_input_tokens, usage_output_tokens
@@ -160,7 +161,9 @@ def run(ctx: AgentContext, status: str = "completed") -> None:
     """Finalize phase: optimization summary, reports, and run-completion bookkeeping.
 
     Runs after the iteration loop exits. Mutates ctx.total_llm_calls/latency/
-    tokens (from the optimization-summary LLM call). ``status`` is recorded in
+    tokens (from the optimization-summary LLM call) and re-derives
+    ctx.total_estimated_cost_usd from the resulting totals so the final
+    report reflects the summary call's cost too. ``status`` is recorded in
     the run meta -- run_agent passes "failed" when finalizing after a crash so
     partial runs aren't reported as completed.
     """
@@ -189,6 +192,10 @@ def run(ctx: AgentContext, status: str = "completed") -> None:
             ctx.total_llm_latency += summary_latency
             ctx.total_input_tokens += usage_input_tokens(summary_usage)
             ctx.total_output_tokens += usage_output_tokens(summary_usage)
+            ctx.total_estimated_cost_usd = estimate_cost_usd(
+                llm_config.model, ctx.total_input_tokens, ctx.total_output_tokens,
+                overrides=llm_config.pricing,
+            )
             if optimization_summary_text:
                 (rp.run_dir / "optimization_summary.md").write_text(
                     optimization_summary_text, encoding="utf-8",
@@ -207,6 +214,7 @@ def run(ctx: AgentContext, status: str = "completed") -> None:
         "total_input_tokens": ctx.total_input_tokens,
         "total_output_tokens": ctx.total_output_tokens,
         "total_llm_latency_s": ctx.total_llm_latency,
+        "estimated_cost_usd": ctx.total_estimated_cost_usd,
     }
     # Determine detected GPU name for hardware mismatch reporting
     detected_hw: str | None = None

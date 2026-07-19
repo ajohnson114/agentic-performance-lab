@@ -5,6 +5,8 @@ import base64
 import html as _html
 from pathlib import Path
 
+from perflab.llm.pricing import format_cost_usd
+
 from .data import AnalysisData, GlanceData, ProfilerData
 from .diagnostics import (
     _render_diagnostics,
@@ -215,6 +217,7 @@ def write_dashboard_html(
             ("Output Tokens", f"{glance.llm_total_output_tokens:,}"),
             ("Total Tokens", f"{total_tokens:,}"),
             ("Total Latency", f"{glance.llm_total_latency_s:.1f}s"),
+            ("Est. Cost", format_cost_usd(glance.llm_estimated_cost_usd)),
         ]
         for label, value in llm_rows:
             parts.append(

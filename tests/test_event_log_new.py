@@ -193,3 +193,28 @@ def test_replay_events_drift_check_warning(tmp_path: Path):
     output = replay_events(tmp_path)
     assert "WARNING" in output
     assert "10.0%" in output
+
+
+# -- cost_limit_reached --------------------------------------------------------
+
+def test_cost_limit_reached_event(tmp_path: Path):
+    log = AgentEventLog(run_dir=tmp_path)
+    log.cost_limit_reached(iteration=5, estimated_cost_usd=12.34, max_cost_usd=10.0)
+
+    events = _read_events(tmp_path)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["event_type"] == "cost_limit_reached"
+    assert ev["iteration"] == 5
+    assert ev["estimated_cost_usd"] == 12.34
+    assert ev["max_cost_usd"] == 10.0
+
+
+def test_replay_events_cost_limit_reached(tmp_path: Path):
+    log = AgentEventLog(run_dir=tmp_path)
+    log.cost_limit_reached(iteration=5, estimated_cost_usd=12.34, max_cost_usd=10.0)
+
+    output = replay_events(tmp_path)
+    assert "COST LIMIT REACHED" in output
+    assert "12.34" in output
+    assert "10.00" in output

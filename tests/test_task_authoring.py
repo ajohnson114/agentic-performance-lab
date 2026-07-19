@@ -643,6 +643,9 @@ class TestAgentIsolationResolution:
         from perflab.server.mcp_server import _resolve_isolation
 
         monkeypatch.setattr(perflab.config, "load_config", lambda: PerfLabConfig())
+        # The shipped default is "auto", which resolves via bwrap availability —
+        # pin it so the expectation holds on sandbox-capable Linux hosts too.
+        monkeypatch.setattr("perflab.tools.isolation._bwrap_usable", lambda: False)
         task_file = tmp_path / "task.yaml"
         task_file.write_text("name: t\n", encoding="utf-8")
 

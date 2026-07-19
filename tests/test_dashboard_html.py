@@ -62,6 +62,38 @@ class TestWriteDashboardHtml:
         assert "1.50x" in html
 
 
+class TestLLMUsageSection:
+    def _glance(self, **overrides) -> GlanceData:
+        defaults = dict(
+            metric_name="gflops", baseline_value=100.0, best_value=150.0,
+            best_iter=3, total_iterations=5, speedup=1.5, accepted_count=3,
+            llm_model="claude-opus-4-8", llm_provider="anthropic",
+            llm_total_calls=4, llm_total_input_tokens=1_000_000,
+            llm_total_output_tokens=200_000, llm_total_latency_s=12.5,
+        )
+        defaults.update(overrides)
+        return GlanceData(**defaults)
+
+    def test_no_llm_calls_no_section(self, tmp_path: Path):
+        html = _write(tmp_path, glance=self._glance(llm_total_calls=0))
+        assert "LLM Usage" not in html
+
+    def test_known_cost_rendered(self, tmp_path: Path):
+        html = _write(tmp_path, glance=self._glance(llm_estimated_cost_usd=12.34))
+        assert "LLM Usage" in html
+        assert "Est. Cost" in html
+        assert "$12.34" in html
+
+    def test_unknown_cost_shows_marker(self, tmp_path: Path):
+        html = _write(tmp_path, glance=self._glance(llm_estimated_cost_usd=None))
+        assert "n/a (unknown model pricing)" in html
+
+    def test_token_totals_still_rendered_alongside_cost(self, tmp_path: Path):
+        html = _write(tmp_path, glance=self._glance(llm_estimated_cost_usd=1.0))
+        assert "1,000,000" in html
+        assert "200,000" in html
+
+
 class TestRenderDiagnostics:
     def test_no_diagnostics_no_card(self, tmp_path: Path):
         html = _write(tmp_path)

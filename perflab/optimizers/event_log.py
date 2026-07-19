@@ -196,6 +196,14 @@ class AgentEventLog:
     def early_stop(self, iteration: int, reason: str) -> None:
         self._write("early_stop", iteration, {"reason": reason})
 
+    def cost_limit_reached(
+        self, iteration: int, estimated_cost_usd: float, max_cost_usd: float,
+    ) -> None:
+        self._write("cost_limit_reached", iteration, {
+            "estimated_cost_usd": estimated_cost_usd,
+            "max_cost_usd": max_cost_usd,
+        })
+
     def run_complete(
         self, best_value: float, best_iter: int,
         baseline_value: float, total_iterations: int, total_llm_calls: int,
@@ -343,6 +351,12 @@ def replay_events(run_dir: Path) -> str:
 
         elif et == "early_stop":
             lines.append(f"\n{iter_str}EARLY STOP: {ev['reason']}")
+
+        elif et == "cost_limit_reached":
+            lines.append(
+                f"\n{iter_str}COST LIMIT REACHED: est. ${ev.get('estimated_cost_usd', 0):.2f} "
+                f">= ${ev.get('max_cost_usd', 0):.2f}"
+            )
 
         elif et == "run_complete":
             lines.append("\n=== Run Complete ===")

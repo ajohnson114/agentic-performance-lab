@@ -487,6 +487,10 @@ def accept_best(
             accepted=True, mode=task.benchmark.metric.mode,
             reasoning=cand.reasoning or None,
             secondary_value=sec_val,
+            # getattr guards test doubles that build ctx as a duck-typed
+            # SimpleNamespace without this field -- real AgentContext always
+            # has it (dataclass default None).
+            estimated_cost_usd=getattr(ctx, "total_estimated_cost_usd", None),
         ))
 
         # Track for post-optimization summary
@@ -517,6 +521,7 @@ def accept_best(
     ctx.history.append(make_history_entry(
         it, f"no improvement ({best_desc})", reject_val, ctx.baseline_val,
         accepted=False, mode=task.benchmark.metric.mode,
+        estimated_cost_usd=getattr(ctx, "total_estimated_cost_usd", None),
     ))
     return (False, None, None)
 
