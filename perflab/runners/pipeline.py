@@ -138,7 +138,9 @@ def run_pipeline(
         task.correctness.cmd, cwd=ws,
         program_type=task.program_type,
         rlimit_as_gb=task.constraints.rlimit_as_gb,
+        env_passthrough=task.constraints.env_passthrough,
         isolation=isolation,
+        accuracy_tolerance=task.constraints.accuracy_tolerance,
     )
     if save_logs:
         logs_dir = run_dir / "logs"
@@ -161,6 +163,7 @@ def run_pipeline(
         program_type=task.program_type,
         rlimit_as_gb=task.constraints.rlimit_as_gb,
         isolation=isolation,
+        warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
     )
     bench_wall = time.perf_counter() - t0
     bench_stderr = bench_res.stderr if capture_diagnostics else ""
@@ -250,25 +253,31 @@ def run_pipeline(
     if do_profiles:
         tp0 = time.perf_counter()
         from perflab.profilers import select_profilers
+        from perflab.profilers.base import bench_env_passthrough
 
-        for profiler in select_profilers(task):
-            if not profiler.is_available():
-                artifacts[profiler.name] = "(not available)"
-                continue
-            try:
-                pr = profiler.run(task.benchmark.cmd, cwd=ws, artifacts_dir=artifacts_dir)
-                (artifacts_dir / f"{profiler.name}_summary.json").write_text(
-                    json.dumps(pr.summary, indent=2), encoding="utf-8",
-                )
-                for k, v in pr.artifacts.items():
-                    artifacts[k] = str(artifacts_dir / Path(v).name)
-            except Exception as exc:  # noqa: BLE001 -- a single failed profiler must not abort the others
-                error_summary = {"error": f"{profiler.name} failed: {exc}"}
-                (artifacts_dir / f"{profiler.name}_summary.json").write_text(
-                    json.dumps(error_summary, indent=2), encoding="utf-8",
-                )
-                artifacts[profiler.name] = f"(error: {exc})"
-                _msg(f"[pipeline] Profiler {profiler.name} failed: {exc}")
+        # Forward task.yaml env_passthrough vars (DATA_ROOT/HF_HOME, ...) to the
+        # profiled benchmark runs, matching the non-profiled benchmark/
+        # correctness runs above -- every profiler funnels through
+        # run_bench_under, which reads this context.
+        with bench_env_passthrough(task.constraints.env_passthrough):
+            for profiler in select_profilers(task):
+                if not profiler.is_available():
+                    artifacts[profiler.name] = "(not available)"
+                    continue
+                try:
+                    pr = profiler.run(task.benchmark.cmd, cwd=ws, artifacts_dir=artifacts_dir)
+                    (artifacts_dir / f"{profiler.name}_summary.json").write_text(
+                        json.dumps(pr.summary, indent=2), encoding="utf-8",
+                    )
+                    for k, v in pr.artifacts.items():
+                        artifacts[k] = str(artifacts_dir / Path(v).name)
+                except Exception as exc:  # noqa: BLE001 -- a single failed profiler must not abort the others
+                    error_summary = {"error": f"{profiler.name} failed: {exc}"}
+                    (artifacts_dir / f"{profiler.name}_summary.json").write_text(
+                        json.dumps(error_summary, indent=2), encoding="utf-8",
+                    )
+                    artifacts[profiler.name] = f"(error: {exc})"
+                    _msg(f"[pipeline] Profiler {profiler.name} failed: {exc}")
 
         prof_wall = time.perf_counter() - tp0
 

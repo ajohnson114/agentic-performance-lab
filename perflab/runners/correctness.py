@@ -12,9 +12,20 @@ from perflab.tools.shell import CmdResult, run_cmd
 _logger = logging.getLogger(__name__)
 
 
-def _passthrough_env(env_passthrough: list[str] | None) -> dict[str, str]:
-    """Forward task.yaml-declared env_passthrough vars from the current process env."""
-    return {name: os.environ[name] for name in env_passthrough or [] if name in os.environ}
+def _passthrough_env(
+    env_passthrough: list[str] | None,
+    accuracy_tolerance: str | None = None,
+) -> dict[str, str]:
+    """Forward task.yaml-declared env_passthrough vars from the current process env.
+
+    accuracy_tolerance (task.yaml constraints.accuracy_tolerance) is exported
+    as PERFLAB_ACCURACY_TOLERANCE so tests.py harnesses can loosen their
+    comparison thresholds to the task author's declared bound.
+    """
+    env = {name: os.environ[name] for name in env_passthrough or [] if name in os.environ}
+    if accuracy_tolerance:
+        env["PERFLAB_ACCURACY_TOLERANCE"] = accuracy_tolerance
+    return env
 
 
 def _maybe_wrap(cmd_args: list[str], cwd: Path, isolation: IsolationPolicy | None) -> list[str]:
@@ -39,6 +50,7 @@ def run_correctness(
     skip_preexec: bool = False,
     env_passthrough: list[str] | None = None,
     isolation: IsolationPolicy | None = None,
+    accuracy_tolerance: str | None = None,
 ) -> CmdResult:
     """Run correctness tests. Disables RLIMIT_AS for GPU program types.
 
@@ -49,6 +61,8 @@ def run_correctness(
     environment is built via the allowlist (agent_subprocess_env), not the
     blocklist used for trusted tool invocations. env_passthrough names extra
     task.yaml-declared vars (task.constraints.env_passthrough) to forward.
+    accuracy_tolerance (task.yaml constraints.accuracy_tolerance) is exported
+    as PERFLAB_ACCURACY_TOLERANCE — see _passthrough_env.
 
     isolation (Fix 2b): optional OS-level sandboxing (see perflab.tools.
     isolation), layered on top of the protections above. Defaults to None
@@ -56,7 +70,7 @@ def run_correctness(
     """
     import shlex
     rlimit = _resolve_rlimit(program_type, rlimit_as_gb)
-    extra = _passthrough_env(env_passthrough)
+    extra = _passthrough_env(env_passthrough, accuracy_tolerance)
     cmd_args = _maybe_wrap(shlex.split(cmd), cwd, isolation)
     return run_cmd(
         cmd_args, cwd=cwd, env=extra if extra else None,
@@ -74,6 +88,7 @@ def run_correctness_twice(
     expected_exit: int = 0,
     env_passthrough: list[str] | None = None,
     isolation: IsolationPolicy | None = None,
+    accuracy_tolerance: str | None = None,
 ) -> tuple[CmdResult, list[str]]:
     """Run correctness tests twice with different random seeds.
 
@@ -93,7 +108,7 @@ def run_correctness_twice(
     import shlex
     rlimit = _resolve_rlimit(program_type, rlimit_as_gb)
     args = _maybe_wrap(shlex.split(cmd), cwd, isolation)
-    extra = _passthrough_env(env_passthrough)
+    extra = _passthrough_env(env_passthrough, accuracy_tolerance)
 
     # First run: normal
     res1 = run_cmd(

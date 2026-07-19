@@ -88,6 +88,8 @@ def run_benchmark(
     rlimit_as_gb: float | None = None,
     env_passthrough: list[str] | None = None,
     isolation: IsolationPolicy | None = None,
+    warmup: int | None = None,
+    repeats: int | None = None,
 ) -> tuple[CmdResult, dict]:
     """Run the benchmark command and parse bench.json output.
 
@@ -96,6 +98,11 @@ def run_benchmark(
     The fast screen is only used to rank candidates — the top candidate is always
     re-benchmarked with full warmup/repeats before the accept/reject decision.
     Benchmark harnesses should honor these env vars when present.
+
+    warmup/repeats carry the task.yaml benchmark.warmup/benchmark.repeats
+    values (ignored in fast mode). Priority for the values the harness sees:
+    caller env > PERFLAB_BENCH_* session env vars > task.yaml warmup/repeats
+    > global config defaults.
 
     When program_type is a GPU type (cuda, pytorch, jax, triton), RLIMIT_AS is
     set to 32 GB (instead of 4 GB for CPU tasks) because CUDA runtimes and JIT
@@ -127,7 +134,17 @@ def run_benchmark(
         run_env["PERFLAB_BENCH_WARMUP"] = "0"
         run_env["PERFLAB_BENCH_REPEATS"] = "2"
     else:
-        # Set config defaults only if not already in env (env vars win)
+        # Session-level PERFLAB_BENCH_* env vars outrank task.yaml values;
+        # task.yaml outranks global config (which already folds in those same
+        # env vars, so config only fills the remaining gaps).
+        if warmup is not None:
+            run_env.setdefault(
+                "PERFLAB_BENCH_WARMUP", os.environ.get("PERFLAB_BENCH_WARMUP", str(warmup)),
+            )
+        if repeats is not None:
+            run_env.setdefault(
+                "PERFLAB_BENCH_REPEATS", os.environ.get("PERFLAB_BENCH_REPEATS", str(repeats)),
+            )
         try:
             from perflab.config import load_config
             cfg = load_config()
@@ -190,8 +207,21 @@ def run_benchmark(
     bench = json.loads(bench_path.read_text(encoding="utf-8"))
     return res, bench
 
-def validate_contract(bench: dict, contract) -> list[str]:
-    """Validate bench.json against the task contract. Returns list of errors."""
+def validate_contract(
+    bench: dict, contract, *, enforce_min_sampling: bool = True,
+) -> list[str]:
+    """Validate bench.json against the task contract. Returns list of errors.
+
+    enforce_min_sampling: check contract.min_repeats/min_warmup against the
+    counts the harness reports in bench.meta. Pass False for fast-screen
+    benchmarks, which intentionally run with warmup=0/repeats=2.
+
+    A missing meta.repeats/meta.warmup is logged as a warning, not a hard
+    error: bench.py is tamper-protected (snapshot/restore around each run), so
+    a candidate cannot delete the reporting to dodge the check -- a missing
+    field means a legacy harness that never reported it, not gaming. A field
+    that IS reported but falls below the minimum stays a hard error.
+    """
     errors: list[str] = []
 
     # Check required fields exist (dotted path traversal)
@@ -203,8 +233,12 @@ def validate_contract(bench: dict, contract) -> list[str]:
                 break
             cur = cur[part]
 
-    # Check fixed_params match meta values
-    meta = bench.get("meta", {})
+    # Check fixed_params match meta values. bench.json is candidate-controlled,
+    # so "meta" may be null or a non-dict -- treat anything but a dict as empty
+    # rather than crashing on meta.get(...).
+    meta = bench.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
     for param, expected in contract.fixed_params.items():
         actual = meta.get(param)
         if actual is None:
@@ -213,6 +247,28 @@ def validate_contract(bench: dict, contract) -> list[str]:
             errors.append(
                 f"Contract violation: meta.{param}={actual}, expected {expected}"
             )
+
+    # Enforce minimum sampling (anti-gaming: a harness edit that dials down
+    # repeats/warmup makes timing noise look like speedup). A missing count
+    # only warns — not every legacy harness reports meta.warmup/meta.repeats,
+    # and bench.py is tamper-protected, so a candidate can't delete the
+    # reporting to evade. A reported count below the minimum is a hard error.
+    if enforce_min_sampling:
+        for name, minimum, default_min in (
+            ("repeats", contract.min_repeats, 1),
+            ("warmup", contract.min_warmup, 0),
+        ):
+            reported = meta.get(name)
+            if reported is None:
+                if minimum > default_min:
+                    _logger.warning(
+                        "Contract min_%s=%s not enforced: bench.meta.%s is missing "
+                        "(legacy harness doesn't report it)", name, minimum, name,
+                    )
+            elif not isinstance(reported, (int, float)) or reported < minimum:
+                errors.append(
+                    f"Contract violation: meta.{name}={reported!r} < min_{name}={minimum}"
+                )
 
     return errors
 

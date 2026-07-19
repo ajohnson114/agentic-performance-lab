@@ -40,6 +40,25 @@ class TestDeltaSpeedupMath:
         assert entry["speedup"] == 1.0
 
 
+class TestMinimizeMode:
+    def test_improvement_speedup_above_one(self):
+        # Latency 10ms -> 5ms is a 2x speedup, not 0.5x
+        entry = make_history_entry(1, "halved latency", 5.0, 10.0, accepted=True, mode="minimize")
+        assert entry["speedup"] == 2.0
+        assert entry["delta"] == -5.0
+
+    def test_regression_speedup_below_one(self):
+        entry = make_history_entry(1, "slower", 20.0, 10.0, accepted=False, mode="minimize")
+        assert entry["speedup"] == 0.5
+
+    def test_zero_value_speedup_is_one(self):
+        entry = make_history_entry(1, "d", 0.0, 10.0, accepted=False, mode="minimize")
+        assert entry["speedup"] == 1.0
+
+    def test_default_mode_is_maximize(self):
+        assert make_history_entry(1, "d", 5.0, 10.0, accepted=False)["speedup"] == 0.5
+
+
 class TestExtras:
     def test_none_extras_dropped(self):
         entry = make_history_entry(
@@ -81,3 +100,53 @@ class TestAcceptedFlag:
 
     def test_accepted_false(self):
         assert make_history_entry(1, "d", 1.0, 1.0, accepted=False)["accepted"] is False
+
+
+class TestAutotuneHistoryMode:
+    """FIX 7: autotune.run must pass the metric mode so minimize-mode sweeps
+    record a mode-aware speedup (a 2x latency win, not 0.5x)."""
+
+    def test_minimize_sweep_records_mode_aware_speedup(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from perflab.optimizers.phases import autotune as autotune_mod
+
+        ctx = SimpleNamespace(
+            task=SimpleNamespace(
+                benchmark=SimpleNamespace(metric=SimpleNamespace(mode="minimize")),
+            ),
+            iteration=3,
+            best_value=10.0,
+            baseline_val=10.0,
+            history=[],
+        )
+        # Sweep finds a better (lower) latency of 5.0.
+        monkeypatch.setattr(
+            autotune_mod, "_auto_tune_sweep", lambda ctx, max_trials=15: 5.0,
+        )
+        autotune_mod.run(ctx)
+
+        assert len(ctx.history) == 1
+        entry = ctx.history[0]
+        assert entry["value"] == 5.0
+        assert entry["speedup"] == 2.0  # 10 -> 5 latency is 2x, not 0.5x
+
+    def test_maximize_sweep_speedup_unchanged(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from perflab.optimizers.phases import autotune as autotune_mod
+
+        ctx = SimpleNamespace(
+            task=SimpleNamespace(
+                benchmark=SimpleNamespace(metric=SimpleNamespace(mode="maximize")),
+            ),
+            iteration=1,
+            best_value=10.0,
+            baseline_val=10.0,
+            history=[],
+        )
+        monkeypatch.setattr(
+            autotune_mod, "_auto_tune_sweep", lambda ctx, max_trials=15: 20.0,
+        )
+        autotune_mod.run(ctx)
+        assert ctx.history[0]["speedup"] == 2.0  # 10 -> 20 throughput is 2x

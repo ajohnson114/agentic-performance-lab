@@ -31,18 +31,48 @@ class NcuProfiler:
         # the wrapper process and sees no kernels.
         ncu_base = ["ncu", "--target-processes", "all", "--set", "full"]
 
-        # ncu with CSV output for programmatic analysis
-        csv_res = run_bench_under(
-            ncu_base + ["--csv", "--log-file", str(csv_path)], bench_cmd, cwd=cwd,
-        )
-
-        # Also generate a report file for interactive viewing
+        # Single profiled run producing the .ncu-rep report. --set full
+        # replays every kernel many times, making this by far the most
+        # expensive profiling mode -- so the CSV is exported from the report
+        # afterwards (ncu --import, no benchmark re-run) instead of
+        # profiling the whole benchmark a second time.
         report_res = run_bench_under(
             ncu_base + ["-o", str(report_path)], bench_cmd, cwd=cwd,
         )
 
+        csv_returncode: int | None = None
+        exported = False
+        if report_path.exists():
+            export_res = run_cmd(
+                ["ncu", "--import", str(report_path), "--csv", "--log-file", str(csv_path)],
+                cwd=cwd,
+            )
+            csv_returncode = export_res.returncode
+            exported = True
+
         summary = _parse_ncu_csv(csv_path)
-        summary["csv_returncode"] = csv_res.returncode
+
+        # Fall back to a live profiled --csv run when the import-export didn't
+        # yield a usable CSV. Two failure modes: the export never wrote a file
+        # (missing report / broken import), or it wrote a CSV whose column
+        # layout _parse_ncu_csv can't extract per-kernel metrics from (some ncu
+        # builds emit a different layout on --import). Both silently degrade the
+        # roofline, so re-run the benchmark under ncu --csv (old two-run mode).
+        if not csv_path.exists() or (exported and not _ncu_summary_usable(summary)):
+            if csv_path.exists():
+                logger.warning(
+                    "ncu --import produced a CSV with no extractable per-kernel "
+                    "metrics (unrecognized column layout); falling back to a "
+                    "live profiled --csv run."
+                )
+            csv_res = run_bench_under(
+                ncu_base + ["--csv", "--log-file", str(csv_path)], bench_cmd, cwd=cwd,
+            )
+            # csv_returncode must reflect the run that produced the final CSV.
+            csv_returncode = csv_res.returncode
+            summary = _parse_ncu_csv(csv_path)
+
+        summary["csv_returncode"] = csv_returncode
         summary["report_returncode"] = report_res.returncode
 
         artifacts: dict[str, str] = {}
@@ -305,6 +335,25 @@ def _safe_int(val: str | None) -> int | None:
         return int(float(val.strip().rstrip("%").replace(",", "")))
     except (ValueError, AttributeError):
         return None
+
+
+def _ncu_summary_usable(summary: dict) -> bool:
+    """Whether a parsed ncu summary carries real per-kernel metrics.
+
+    A CSV whose column layout _parse_ncu_csv doesn't recognize can still parse
+    into rows, yielding kernels that have only a name and invocation count but
+    no extracted metric (SM/memory throughput, occupancy, DRAM bytes, ...).
+    That is useless for the roofline and bottleneck analysis, so run() treats
+    it like a parse failure and falls back to a live profiled --csv run. Usable
+    means at least one kernel carries a key beyond "name"/"invocations".
+    """
+    kernels = summary.get("kernels")
+    if not kernels:
+        return False
+    return any(
+        any(key not in ("name", "invocations") for key in kernel)
+        for kernel in kernels
+    )
 
 
 def _parse_ncu_csv(path: Path) -> dict:

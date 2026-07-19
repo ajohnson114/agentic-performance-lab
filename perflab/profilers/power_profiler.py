@@ -15,6 +15,19 @@ from pathlib import Path
 from perflab.profilers.base import ProfileResult, run_bench_under
 from perflab.tools.shell import run_cmd
 
+# RAPL energy counters read by the perf stat wrapper. Shared by the wrapper
+# built in run() and the _rapl_usable() probe so both open the exact same
+# event set.
+_RAPL_EVENTS = "power/energy-pkg/,power/energy-cores/,power/energy-ram/"
+
+# Recorded in the summary when the RAPL PMU is listed by `perf list` but perf
+# can't actually open the events (so CPU energy is missing but GPU power is
+# still measured from a real run).
+_RAPL_UNAVAILABLE_REASON = (
+    "perf cannot open RAPL energy events (check "
+    "/proc/sys/kernel/perf_event_paranoid or CAP_PERFMON permissions)"
+)
+
 
 @dataclass
 class PowerProfiler:
@@ -29,68 +42,94 @@ class PowerProfiler:
         summary: dict = {}
         artifacts: dict[str, str] = {}
 
-        # --- CPU power via RAPL (perf stat) ---
-        if _has_rapl():
-            rapl_path = artifacts_dir / "rapl_stat.txt"
-            run_bench_under([
+        has_rapl = _has_rapl()
+        # _has_rapl() only proves `perf list` exposes the PMU; perf may still
+        # be unable to open the events (perf_event_paranoid / CAP_PERFMON). If
+        # it can't, wrapping the run makes perf exit before exec'ing the
+        # benchmark, so nvidia-smi would sample an idle GPU -- run bare instead.
+        rapl_wrapped = has_rapl and _rapl_usable()
+        has_smi = shutil.which("nvidia-smi") is not None
+
+        # RAPL PMU is listed but perf can't open it: still run the benchmark
+        # (bare, below) so GPU polling gets a real window, and record why CPU
+        # energy is missing.
+        if has_rapl and not rapl_wrapped:
+            summary["rapl_unavailable"] = _RAPL_UNAVAILABLE_REASON
+
+        if not rapl_wrapped and not has_smi:
+            # Nothing measurable: no usable RAPL counters and no GPU to poll.
+            return ProfileResult(name=self.name, artifacts=artifacts, summary=summary)
+
+        # Single benchmark run: RAPL counting (perf stat wrapper, when the
+        # events are usable) with nvidia-smi polling alongside. Counting RAPL
+        # events doesn't perturb GPU sampling, so CPU and GPU power come from
+        # the same execution window -- previously these were two separate bench
+        # runs, which doubled the cost and made CPU-vs-GPU comparisons mix
+        # measurements from different runs.
+        rapl_path = artifacts_dir / "rapl_stat.txt"
+        wrapper: list[str] = []
+        if rapl_wrapped:
+            wrapper = [
                 "perf", "stat",
-                "-e", "power/energy-pkg/,power/energy-cores/,power/energy-ram/",
+                "-e", _RAPL_EVENTS,
                 "-o", str(rapl_path), "--",
-            ], bench_cmd, cwd=cwd)
-            if rapl_path.exists():
-                rapl_data = _parse_rapl_output(rapl_path)
-                if rapl_data:
-                    summary["rapl"] = rapl_data
-                    artifacts["rapl_stat"] = str(rapl_path)
+            ]
 
-        # --- GPU power + memory via nvidia-smi polling ---
-        if shutil.which("nvidia-smi") is not None:
-            gpu_power_path = artifacts_dir / "gpu_power_log.txt"
-            samples: list[float] = []
-            mem_samples: list[dict] = []
-            power_unavailable_reason: str | None = None
-            stop_event = threading.Event()
+        gpu_power_path = artifacts_dir / "gpu_power_log.txt"
+        samples: list[float] = []
+        mem_samples: list[dict] = []
+        power_unavailable_reason: str | None = None
+        stop_event = threading.Event()
+        poller: threading.Thread | None = None
 
-            def poll_gpu_power():
-                nonlocal power_unavailable_reason
-                while not stop_event.is_set():
-                    try:
-                        res = run_cmd(
-                            ["nvidia-smi",
-                             "--query-gpu=power.draw,memory.used,memory.total",
-                             "--format=csv,noheader,nounits"],
-                            timeout_s=5,
-                        )
-                        if res.returncode == 0:
-                            for line in res.stdout.strip().splitlines():
-                                parts = [p.strip() for p in line.split(",")]
-                                # power.draw returns "[N/A]" in containers or MIG mode
+        def poll_gpu_power():
+            nonlocal power_unavailable_reason
+            while not stop_event.is_set():
+                try:
+                    res = run_cmd(
+                        ["nvidia-smi",
+                         "--query-gpu=power.draw,memory.used,memory.total",
+                         "--format=csv,noheader,nounits"],
+                        timeout_s=5,
+                    )
+                    if res.returncode == 0:
+                        for line in res.stdout.strip().splitlines():
+                            parts = [p.strip() for p in line.split(",")]
+                            # power.draw returns "[N/A]" in containers or MIG mode
+                            try:
+                                samples.append(float(parts[0]))
+                            except (ValueError, IndexError):
+                                if parts and power_unavailable_reason is None:
+                                    power_unavailable_reason = parts[0]
+                            if len(parts) >= 3:
                                 try:
-                                    samples.append(float(parts[0]))
+                                    mem_samples.append({
+                                        "used_mib": float(parts[1]),
+                                        "total_mib": float(parts[2]),
+                                    })
                                 except (ValueError, IndexError):
-                                    if parts and power_unavailable_reason is None:
-                                        power_unavailable_reason = parts[0]
-                                if len(parts) >= 3:
-                                    try:
-                                        mem_samples.append({
-                                            "used_mib": float(parts[1]),
-                                            "total_mib": float(parts[2]),
-                                        })
-                                    except (ValueError, IndexError):
-                                        pass
-                    except Exception:  # noqa: BLE001 -- best-effort polling loop, a single failed sample must not kill the thread
-                        pass
-                    stop_event.wait(0.5)
+                                    pass
+                except Exception:  # noqa: BLE001 -- best-effort polling loop, a single failed sample must not kill the thread
+                    pass
+                stop_event.wait(0.5)
 
+        if has_smi:
             poller = threading.Thread(target=poll_gpu_power, daemon=True)
             poller.start()
 
-            # Run the actual benchmark
-            run_bench_under([], bench_cmd, cwd=cwd)
+        run_bench_under(wrapper, bench_cmd, cwd=cwd)
 
+        if poller is not None:
             stop_event.set()
             poller.join(timeout=5)
 
+        if rapl_wrapped and rapl_path.exists():
+            rapl_data = _parse_rapl_output(rapl_path)
+            if rapl_data:
+                summary["rapl"] = rapl_data
+                artifacts["rapl_stat"] = str(rapl_path)
+
+        if has_smi:
             if samples:
                 gpu_data = _compute_gpu_power_stats(samples)
                 summary["gpu_power"] = gpu_data
@@ -122,6 +161,20 @@ def _has_rapl() -> bool:
         return False
     res = run_cmd(["perf", "list"], timeout_s=5)
     return "power/energy-pkg/" in res.stdout
+
+
+@lru_cache(maxsize=1)
+def _rapl_usable() -> bool:
+    """Whether perf can actually open the RAPL events, not just list them.
+
+    _has_rapl() checks `perf list` (PMU is exposed); this opens the events for
+    a trivial ``-- true`` command. When perf_event_paranoid (or a missing
+    CAP_PERFMON) blocks unprivileged access, the counting run exits nonzero
+    before running anything, so run() must fall back to a bare benchmark run.
+    Cached: probed once per process, and each probe spawns perf.
+    """
+    res = run_cmd(["perf", "stat", "-e", _RAPL_EVENTS, "--", "true"], timeout_s=10)
+    return res.returncode == 0
 
 
 def _parse_rapl_output(path: Path) -> dict:

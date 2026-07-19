@@ -546,7 +546,6 @@ def _task_yaml_template(
 ) -> str:
     """Return task.yaml content."""
     build_cmd = _BUILD_TEMPLATES.get(program_type)
-    profilers = _PROFILER_DEFAULTS.get(program_type, {"always": ["cpu_flame"], "optional": []})
 
     lines = [
         f'name: "{name}"',
@@ -585,14 +584,6 @@ def _task_yaml_template(
         "  warmup: 3",
         "  repeats: 20",
         "",
-        "profile_plan:",
-        f'  always: {_yaml_list(profilers["always"])}',
-    ])
-    if profilers["optional"]:
-        lines.append(f'  optional: {_yaml_list(profilers["optional"])}')
-
-    lines.extend([
-        "",
         "constraints:",
         "  max_iters: 10",
         "  regression_tolerance: 0.02",
@@ -619,11 +610,6 @@ def _task_yaml_template(
     ])
 
     return "\n".join(lines) + "\n"
-
-
-def _yaml_list(items: list[str]) -> str:
-    """Format a list as inline YAML."""
-    return "[" + ", ".join(f'"{i}"' for i in items) + "]"
 
 
 # ---------------------------------------------------------------------------

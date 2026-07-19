@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from perflab.optimizers.history import make_history_entry
+from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
 
 if TYPE_CHECKING:
     from perflab.optimizers.agent import AgentContext
@@ -68,7 +69,10 @@ def _auto_tune_sweep(
                 import shlex
 
                 from perflab.tools.shell import run_cmd
-                build_res = run_cmd(shlex.split(task.build.cmd), cwd=task.workspace)
+                build_res = run_cmd(
+                    shlex.split(task.build.cmd), cwd=task.workspace,
+                    timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+                )
                 if build_res.returncode != 0:
                     continue
 
@@ -77,7 +81,9 @@ def _auto_tune_sweep(
                 task.correctness.cmd, cwd=task.workspace,
                 program_type=task.program_type,
                 rlimit_as_gb=task.constraints.rlimit_as_gb,
+                env_passthrough=task.constraints.env_passthrough,
                 isolation=ctx.config.isolation,
+                accuracy_tolerance=task.constraints.accuracy_tolerance,
             )
             if cres.returncode != task.correctness.expected_exit:
                 continue
@@ -87,7 +93,9 @@ def _auto_tune_sweep(
                 task.benchmark.cmd, cwd=task.workspace,
                 program_type=task.program_type,
                 rlimit_as_gb=task.constraints.rlimit_as_gb,
+                env_passthrough=task.constraints.env_passthrough,
                 isolation=ctx.config.isolation,
+                warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
             )
 
             from perflab.runners.benchmark import metric_value
@@ -152,5 +160,5 @@ def run(ctx: AgentContext, max_trials: int = 15) -> None:
         ctx.history.append(make_history_entry(
             ctx.iteration, "Auto-tune sweep found better parameters",
             ctx.best_value, ctx.baseline_val,
-            accepted=True,
+            accepted=True, mode=ctx.task.benchmark.metric.mode,
         ))

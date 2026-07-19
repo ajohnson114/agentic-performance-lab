@@ -157,6 +157,23 @@ class AgentEventLog:
             "drift_pct": drift_pct,
         })
 
+    def baseline_remeasured(
+        self, iteration: int, old_value: float, new_value: float,
+        best_old: float | None = None, best_new: float | None = None,
+    ) -> None:
+        # best_old/best_new record best_value being re-anchored under the same
+        # current conditions as the baseline re-measure (kept out when the
+        # caller only re-measured the baseline).
+        data: dict[str, Any] = {
+            "old_value": old_value,
+            "new_value": new_value,
+        }
+        if best_old is not None:
+            data["best_old"] = best_old
+        if best_new is not None:
+            data["best_new"] = best_new
+        self._write("baseline_remeasured", iteration, data)
+
     def anti_gaming_warning(
         self, iteration: int, check_type: str, details: str,
         candidate_index: int | None = None,
@@ -310,6 +327,9 @@ def replay_events(run_dir: Path) -> str:
             drift = ev.get("drift_pct", 0)
             warn = " WARNING" if drift > 5 else ""
             lines.append(f"{iter_str}  Drift check:{warn} clean={ev.get('clean_value', 0):.6g}, last_accepted={ev.get('last_accepted_value', 0):.6g}, drift={drift:.1f}%")
+
+        elif et == "baseline_remeasured":
+            lines.append(f"{iter_str}  Baseline re-measured after drift: {ev.get('old_value', 0):.6g} -> {ev.get('new_value', 0):.6g}")
 
         elif et == "iteration_complete":
             if not ev["accepted_any"]:

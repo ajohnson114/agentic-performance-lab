@@ -2,12 +2,20 @@
 
 Every profiler launches benchmark runs through bench_argv / run_bench_under /
 run_bench_with_sudo_fallback, so these tests pin down the argv composition,
-env/timeout passthrough, and the sudo escalation ladder in one place.
+env/timeout passthrough, and the (opt-in) sudo escalation ladder in one place.
 """
 from __future__ import annotations
 
+import perflab.config as config_mod
 import perflab.profilers.base as base
 from perflab.tools.shell import DEFAULT_TIMEOUT_S, CmdResult
+
+
+def _allow_sudo(monkeypatch, allowed: bool) -> None:
+    """Pin the sudo opt-in flag without touching real config files."""
+    cfg = config_mod.PerfLabConfig()
+    cfg.profiler.allow_sudo = allowed
+    monkeypatch.setattr(config_mod, "load_config", lambda **kw: cfg)
 
 
 class _RunCmdRecorder:
@@ -23,6 +31,7 @@ class _RunCmdRecorder:
             "cwd": cwd,
             "env": env,
             "timeout_s": timeout_s,
+            "env_mode": kwargs.get("env_mode", "blocklist"),
         })
         rc = self._returncodes.pop(0) if self._returncodes else 0
         return CmdResult(
@@ -76,15 +85,37 @@ class TestRunBenchUnder:
 
         base.run_bench_under([], "python3 bench.py", cwd=tmp_path, env=env)
 
-        assert rec.calls[0]["env"] is env
+        # Caller env is forwarded on top of the forced C locale
+        assert rec.calls[0]["env"] == {"LC_ALL": "C", "PERFLAB_TORCH_PROFILE": "1"}
 
-    def test_env_defaults_to_none(self, monkeypatch, tmp_path):
+    def test_env_defaults_to_c_locale_only(self, monkeypatch, tmp_path):
         rec = _RunCmdRecorder()
         monkeypatch.setattr(base, "run_cmd", rec)
 
         base.run_bench_under(["perf", "record", "--"], "python3 bench.py", cwd=tmp_path)
 
-        assert rec.calls[0]["env"] is None
+        # LC_ALL=C is always forced: the perf/tma/power/lock parsers assume
+        # period decimal separators.
+        assert rec.calls[0]["env"] == {"LC_ALL": "C"}
+
+    def test_caller_env_can_override_locale(self, monkeypatch, tmp_path):
+        rec = _RunCmdRecorder()
+        monkeypatch.setattr(base, "run_cmd", rec)
+
+        base.run_bench_under([], "python3 bench.py", cwd=tmp_path, env={"LC_ALL": "de_DE"})
+
+        assert rec.calls[0]["env"] == {"LC_ALL": "de_DE"}
+
+    def test_uses_allowlist_env_mode(self, monkeypatch, tmp_path):
+        # The wrapped benchmark is candidate-patched (untrusted) code: the
+        # subprocess env must be the allowlist, never the secret-bearing
+        # blocklist env (AWS creds, GITHUB_TOKEN, SSH agent...).
+        rec = _RunCmdRecorder()
+        monkeypatch.setattr(base, "run_cmd", rec)
+
+        base.run_bench_under(["nsys", "profile"], "python3 bench.py", cwd=tmp_path)
+
+        assert rec.calls[0]["env_mode"] == "allowlist"
 
     def test_timeout_passthrough(self, monkeypatch, tmp_path):
         rec = _RunCmdRecorder()
@@ -120,6 +151,7 @@ class TestRunBenchWithSudoFallback:
         rec = _RunCmdRecorder(returncodes=[1, 0])
         monkeypatch.setattr(base, "run_cmd", rec)
         monkeypatch.setattr(base.shutil, "which", lambda name: "/usr/bin/sudo")
+        _allow_sudo(monkeypatch, True)
         artifact = tmp_path / "out.json"  # never created
 
         res, used_sudo = base.run_bench_with_sudo_fallback(
@@ -188,6 +220,7 @@ class TestRunBenchWithSudoFallback:
         rec = _RunCmdRecorder(returncodes=[1, 0])
         monkeypatch.setattr(base, "run_cmd", rec)
         monkeypatch.setattr(base.shutil, "which", lambda name: "/usr/bin/sudo")
+        _allow_sudo(monkeypatch, True)
         env = {"XLA_FLAGS": "--xla_dump_hlo_as_text"}
 
         base.run_bench_with_sudo_fallback(
@@ -195,13 +228,49 @@ class TestRunBenchWithSudoFallback:
             tmp_path, expect_artifact=tmp_path / "out.json", env=env,
         )
 
-        assert rec.calls[0]["env"] is env
-        assert rec.calls[1]["env"] is env
+        expected = {"LC_ALL": "C", "XLA_FLAGS": "--xla_dump_hlo_as_text"}
+        assert rec.calls[0]["env"] == expected
+        assert rec.calls[1]["env"] == expected
+
+    def test_no_sudo_retry_without_opt_in(self, monkeypatch, tmp_path):
+        # Default config: never silently re-run candidate code as root, even
+        # when sudo is on PATH (e.g. NOPASSWD sudo on a cloud GPU box).
+        rec = _RunCmdRecorder(returncodes=[1])
+        monkeypatch.setattr(base, "run_cmd", rec)
+        monkeypatch.setattr(base.shutil, "which", lambda name: "/usr/bin/sudo")
+        _allow_sudo(monkeypatch, False)
+
+        res, used_sudo = base.run_bench_with_sudo_fallback(
+            ["py-spy", "record", "--"], "python3 bench.py",
+            tmp_path, expect_artifact=tmp_path / "out.json",
+        )
+
+        assert used_sudo is False
+        assert len(rec.calls) == 1
+        assert res.returncode == 1
+
+    def test_sudo_gate_fails_closed_on_config_error(self, monkeypatch, tmp_path):
+        rec = _RunCmdRecorder(returncodes=[1])
+        monkeypatch.setattr(base, "run_cmd", rec)
+        monkeypatch.setattr(base.shutil, "which", lambda name: "/usr/bin/sudo")
+
+        def _boom(**kw):
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(config_mod, "load_config", _boom)
+
+        _, used_sudo = base.run_bench_with_sudo_fallback(
+            ["wrapper"], "python3 bench.py",
+            tmp_path, expect_artifact=tmp_path / "out.json",
+        )
+
+        assert used_sudo is False
+        assert len(rec.calls) == 1
 
 
 class TestPySpyLadder:
-    """The py-spy escalation ladder must keep its exact historical sequence:
-    native -> native+sudo -> non-native -> non-native+sudo."""
+    """With sudo opted in, the py-spy escalation ladder keeps its exact
+    historical sequence: native -> native+sudo -> non-native -> non-native+sudo."""
 
     def test_full_ladder_on_repeated_failure(self, monkeypatch, tmp_path):
         from perflab.profilers.python_pyspy import PySpyProfiler
@@ -209,6 +278,7 @@ class TestPySpyLadder:
         rec = _RunCmdRecorder(returncodes=[1, 1, 1, 1])
         monkeypatch.setattr(base, "run_cmd", rec)
         monkeypatch.setattr(base.shutil, "which", lambda name: "/usr/bin/sudo")
+        _allow_sudo(monkeypatch, True)
 
         artifacts_dir = tmp_path / "artifacts"
         result = PySpyProfiler().run("python3 bench.py", tmp_path, artifacts_dir)
@@ -226,6 +296,24 @@ class TestPySpyLadder:
         ]
         assert result.summary["native_mode"] is False
         assert result.summary["returncode"] == 1
+
+    def test_ladder_skips_sudo_rungs_without_opt_in(self, monkeypatch, tmp_path):
+        from perflab.profilers.python_pyspy import PySpyProfiler
+
+        rec = _RunCmdRecorder(returncodes=[1, 1])
+        monkeypatch.setattr(base, "run_cmd", rec)
+        monkeypatch.setattr(base.shutil, "which", lambda name: "/usr/bin/sudo")
+        _allow_sudo(monkeypatch, False)
+
+        artifacts_dir = tmp_path / "artifacts"
+        PySpyProfiler().run("python3 bench.py", tmp_path, artifacts_dir)
+
+        out = str((artifacts_dir / "pyspy_speedscope.json").resolve())
+        native = ["py-spy", "record", "--native", "--format", "speedscope",
+                  "-o", out, "--", "python3", "bench.py"]
+        plain = ["py-spy", "record", "--format", "speedscope",
+                 "-o", out, "--", "python3", "bench.py"]
+        assert [c["cmd"] for c in rec.calls] == [native, plain]
 
     def test_ladder_stops_after_first_success(self, monkeypatch, tmp_path):
         from perflab.profilers.python_pyspy import PySpyProfiler

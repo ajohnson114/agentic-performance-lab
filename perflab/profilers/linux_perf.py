@@ -12,6 +12,27 @@ from perflab.tools.symbols import demangle as _demangle
 
 logger = logging.getLogger(__name__)
 
+_STAT_EVENTS = (
+    "cycles,instructions,cache-references,cache-misses,"
+    "branch-instructions,branch-misses,"
+    "L1-dcache-load-misses,LLC-load-misses,"
+    "task-clock"
+)
+
+# Raw hardware counters _parse_perf_stat reads and that the merged -M
+# TopdownL1 group can push into multiplexing on counter-poor PMUs. task-clock
+# is software-derived and never multiplexed, so it is excluded.
+_BASE_COUNTER_EVENTS = (
+    "cycles", "instructions", "cache-references", "cache-misses",
+    "branch-instructions", "branch-misses",
+    "L1-dcache-load-misses", "LLC-load-misses",
+)
+
+# perf appends a scaling annotation like "(73.42%)" to a counter's line when
+# that counter only held a PMU slot for part of the run (i.e. it was
+# multiplexed). LC_ALL=C is forced, so this format is stable.
+_MUX_SCALING_RE = re.compile(r"\((\d{1,3}(?:\.\d+)?)%\)")
+
 
 @dataclass
 class LinuxPerfProfiler:
@@ -25,15 +46,71 @@ class LinuxPerfProfiler:
         perf_data = artifacts_dir / "perf.data"
         script_path = artifacts_dir / "perf_script.txt"
 
-        # perf stat: high-level counters with specific events
-        stat_res = run_bench_under([
-            "perf", "stat",
-            "-e", "cycles,instructions,cache-references,cache-misses,"
-                  "branch-instructions,branch-misses,"
-                  "L1-dcache-load-misses,LLC-load-misses,"
-                  "task-clock",
-            "-o", str(stat_path), "--",
-        ], bench_cmd, cwd=cwd)
+        # TMA availability and CPU vendor decide what the stat run collects.
+        tma_supported = False
+        vendor = "unknown"
+        try:
+            from perflab.analyzers.tma import _detect_cpu_vendor, is_tma_available
+            tma_supported = is_tma_available()
+            vendor = _detect_cpu_vendor()
+        except ImportError:
+            pass
+
+        events = _STAT_EVENTS
+        if vendor == "amd":
+            # Generic load counters feed the AMD TMA level-2 estimate from
+            # this same run (collect_tma_level2 parses them from stat_text).
+            events += ",L1-dcache-loads,LLC-loads"
+
+        # One perf stat run collects the generic counters and, when the
+        # TopdownL1 metric group exists, the TMA level-1 buckets -- these
+        # used to be two separate benchmark runs. On modern Intel the topdown
+        # metrics ride on fixed counters; on counter-poor PMUs -M can multiplex
+        # the base counters, which degrades IPC / cache rates / the roofline
+        # point -- when that happens we re-measure the base counters once
+        # without -M (see below), keeping TMA on the combined run.
+        def _stat_wrapper(with_tma: bool, out_path: Path = stat_path) -> list[str]:
+            wrapper = ["perf", "stat", "-e", events]
+            if with_tma:
+                wrapper += ["-M", "TopdownL1"]
+            return wrapper + ["-o", str(out_path), "--"]
+
+        stat_res = run_bench_under(_stat_wrapper(tma_supported), bench_cmd, cwd=cwd)
+        if tma_supported and stat_res.returncode != 0 and not stat_path.exists():
+            # A perf build that rejects the -M/-e combination errors out
+            # before running the benchmark (a failing benchmark still writes
+            # the stat file) -- retry plain rather than losing the base
+            # counters.
+            tma_supported = False
+            stat_res = run_bench_under(_stat_wrapper(False), bench_cmd, cwd=cwd)
+
+        stat_text = (
+            stat_path.read_text(encoding="utf-8", errors="replace")
+            if stat_path.exists() else None
+        )
+
+        # If the combined -M run multiplexed the base counters, re-measure them
+        # once without -M into a separate file and parse base counters from
+        # THAT (TMA still parses from the combined stat_text above). Only fires
+        # when the -M run actually ran and scaled a base counter -- exactly one
+        # extra run, only on affected hardware.
+        base_stat_path = stat_path
+        if (
+            tma_supported
+            and stat_text is not None
+            and _base_counters_multiplexed(stat_text)
+        ):
+            logger.info(
+                "perf multiplexed the base counters in the combined "
+                "-M TopdownL1 run; re-running perf stat without -M for "
+                "unmultiplexed base counters."
+            )
+            base_stat_path = artifacts_dir / "base_stat.txt"
+            run_bench_under(_stat_wrapper(False, base_stat_path), bench_cmd, cwd=cwd)
+            if not base_stat_path.exists():
+                # Plain re-run produced no file (unexpected) -- keep the
+                # multiplexed combined counters rather than losing them.
+                base_stat_path = stat_path
 
         # perf record: call graph sampling
         record_res = run_bench_under(
@@ -54,20 +131,23 @@ class LinuxPerfProfiler:
             if annotate_res.returncode == 0 and annotate_res.stdout.strip():
                 annotate_path.write_text(annotate_res.stdout, encoding="utf-8")
 
-        # TMA (Top-Down Microarchitecture Analysis)
+        # TMA (Top-Down Microarchitecture Analysis). The level-1 buckets are
+        # parsed from the combined stat run above (no extra benchmark run);
+        # collect_tma only launches its raw-counter fallback run when that
+        # parse fails. Level 2/3 parses from the same run on AMD; only the
+        # Intel toplev path still needs a run of its own.
         tma_result = None
         tma_level2 = None
         try:
             from perflab.analyzers.tma import collect_tma, collect_tma_level2
             tma_path = artifacts_dir / "tma_stat.txt"
-            tma_result = collect_tma(bench_cmd, cwd, tma_path)
-            # Level 2/3 TMA (toplev on Intel, perf events on AMD)
+            tma_result = collect_tma(bench_cmd, cwd, tma_path, perf_stat_text=stat_text)
             tma_l2_path = artifacts_dir / "tma_level2.txt"
-            tma_level2 = collect_tma_level2(bench_cmd, cwd, tma_l2_path)
+            tma_level2 = collect_tma_level2(bench_cmd, cwd, tma_l2_path, perf_stat_text=stat_text)
         except (ImportError, OSError, ValueError):
             logger.warning("TMA collection failed", exc_info=True)
 
-        summary = _parse_perf_stat(stat_path)
+        summary = _parse_perf_stat(base_stat_path)
         summary["stat_returncode"] = stat_res.returncode
         summary["record_returncode"] = record_res.returncode
 
@@ -91,6 +171,8 @@ class LinuxPerfProfiler:
         artifacts: dict[str, str] = {}
         if stat_path.exists():
             artifacts["perf_stat_txt"] = str(stat_path)
+        if base_stat_path != stat_path and base_stat_path.exists():
+            artifacts["perf_base_stat_txt"] = str(base_stat_path)
         if perf_data.exists():
             artifacts["perf_data"] = str(perf_data)
         if script_path.exists():
@@ -99,6 +181,24 @@ class LinuxPerfProfiler:
             artifacts["perf_annotate_txt"] = str(annotate_path)
 
         return ProfileResult(name=self.name, artifacts=artifacts, summary=summary)
+
+
+def _base_counters_multiplexed(stat_text: str) -> bool:
+    """True if perf scaled (multiplexed) any base hardware counter.
+
+    perf annotates a counter's line with a scaling percentage in parentheses,
+    e.g. ``(73.42%)``, when that counter shared a PMU slot and so ran for only
+    part of the window. A base-counter line carrying a parenthesized
+    percentage below 100 means IPC / cache-miss rate computed from it would be
+    degraded, so run() re-measures the base counters without -M.
+    """
+    for line in stat_text.splitlines():
+        if not any(ev in line for ev in _BASE_COUNTER_EVENTS):
+            continue
+        m = _MUX_SCALING_RE.search(line)
+        if m and float(m.group(1)) < 100.0:
+            return True
+    return False
 
 
 def _parse_perf_stat(path: Path) -> dict:

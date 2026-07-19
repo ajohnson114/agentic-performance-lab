@@ -115,6 +115,74 @@ class TestGenerateReports:
         html = (run_dir / "dashboard.html").read_text()
         assert "Profile diff" in html or "profile diff" in html.lower() or "ipc" in html
 
+    def test_roofline_peaks_reach_report_md(self, tmp_path: Path):
+        # generate.py computes roofline_peaks locally (for the HTML glance
+        # object) but must also thread it into report_data so report.md's
+        # Roofline section (which reads data["roofline_peaks"]) isn't dead.
+        run_dir = _make_run_dir(tmp_path)
+        result = generate_reports(_minimal_params(
+            run_dir,
+            roofline_peaks={
+                "peak_tflops": 19.5,
+                "peak_mem_bw_gbs": 900.0,
+                "source": "known_gpu_spec",
+                "device": "A100",
+            },
+        ))
+        assert result.get("roofline_peaks", {}).get("peak_tflops") == 19.5
+        text = (run_dir / "report.md").read_text(encoding="utf-8")
+        assert "## Roofline" in text
+        assert "19.500" in text
+        assert "900.0" in text
+        assert "known_gpu_spec" in text
+        assert "A100" in text
+
+    def test_hardware_mismatch_fallback_checks_all_gpus(self, tmp_path: Path):
+        # Multi-GPU box where the target only matches the *second* detected
+        # GPU. The old code compared against nvidia_gpus[0] only (via a
+        # single detected_hardware string) and would wrongly show a mismatch
+        # banner. hardware_mismatch isn't provided here (this ReportParams
+        # site mirrors orchestrator.py's profile-only path, which has no
+        # ctx.hardware_mismatch to pass through), so generate.py must fall
+        # back to recomputing -- looping every GPU in system_info.
+        run_dir = _make_run_dir(tmp_path, system_info={
+            "nvidia_gpus": [
+                {"name": "NVIDIA A100-SXM4-80GB"},
+                {"name": "NVIDIA H100-PCIE-80GB"},
+            ],
+        })
+        generate_reports(_minimal_params(run_dir, target_hardware="H100"))
+        html = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+        assert '<div class="hardware-warning">' not in html
+
+    def test_hardware_mismatch_fallback_flags_true_mismatch(self, tmp_path: Path):
+        run_dir = _make_run_dir(tmp_path, system_info={
+            "nvidia_gpus": [
+                {"name": "NVIDIA A100-SXM4-80GB"},
+                {"name": "NVIDIA V100-SXM2-16GB"},
+            ],
+        })
+        generate_reports(_minimal_params(run_dir, target_hardware="H100"))
+        html = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+        assert '<div class="hardware-warning">' in html
+        assert "H100" in html
+
+    def test_hardware_mismatch_prefers_explicit_ctx_value(self, tmp_path: Path):
+        # When the caller (finalize.py) already resolved ctx.hardware_mismatch
+        # (looping all GPUs itself), generate.py must use it as-is rather than
+        # recomputing from system_info.
+        run_dir = _make_run_dir(tmp_path, system_info={
+            "nvidia_gpus": [{"name": "NVIDIA H100-PCIE-80GB"}],
+        })
+        generate_reports(_minimal_params(
+            run_dir,
+            target_hardware="H100",
+            hardware_mismatch='Hardware mismatch: task targets "H100" but detected GPU is "A100"',
+        ))
+        html = (run_dir / "dashboard.html").read_text(encoding="utf-8")
+        assert '<div class="hardware-warning">' in html
+        assert "detected GPU is" in html
+
     def test_no_artifacts_dir(self, tmp_path: Path):
         run_dir = tmp_path / "run-empty"
         run_dir.mkdir()

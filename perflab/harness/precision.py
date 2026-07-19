@@ -19,6 +19,11 @@ from __future__ import annotations
 
 import math
 
+# A single corrupted element (as opposed to ordinary heavy-tail fp32
+# rounding) can blow the max ULP distance up far beyond max_ulp even when
+# the p99 distance still passes -- see the max_ulp_observed gate below.
+HARD_MAX_ULP_FACTOR = 64
+
 
 def _ulp_distance(a_float: float, b_float: float) -> float:
     """Compute ULP distance between two floats.
@@ -45,6 +50,19 @@ def _ulp_distance(a_float: float, b_float: float) -> float:
 def _float_ulp(x: float) -> float:
     """Return the ULP (unit in last place) for float x."""
     return math.ulp(abs(x)) if x != 0 else math.ulp(0.0)
+
+
+def _ceil_percentile_index(fraction: float, n_s: int) -> int:
+    """Ceiling-indexed position of `fraction` into a sorted list of n_s values.
+
+    Floor indexing (int(fraction * (n_s - 1))) rounds toward the middle of
+    the distribution, so for small samples the single most extreme value can
+    fall just past the computed index and never get checked -- e.g. n_s=4,
+    fraction=0.99: floor(0.99*3)=2 picks the 3rd-largest value and misses the
+    outlier at index 3 entirely. Ceiling indexing always includes at least
+    the top `1 - fraction` fraction of the tail.
+    """
+    return min(n_s - 1, math.ceil(fraction * (n_s - 1)))
 
 
 def assert_ulp_close(
@@ -111,9 +129,8 @@ def assert_ulp_close(
     ulp_dists = []
     a_list = a_sampled.tolist()
     r_list = r_sampled.tolist()
-    # a_list/r_list are always the same length (sliced/derived together above); zip() strict=
-    # needs Python 3.10+ and this codebase still runs on 3.9.
-    for a_val, r_val in zip(a_list, r_list):  # noqa: B905
+    # a_list/r_list are always the same length (sliced/derived together above).
+    for a_val, r_val in zip(a_list, r_list, strict=True):
         ulp_dists.append(_ulp_distance(a_val, r_val))
 
     ulp_dists.sort()
@@ -122,11 +139,26 @@ def assert_ulp_close(
     stats = {
         "mean_ulp": sum(ulp_dists) / n_s if n_s > 0 else 0,
         "p50_ulp": ulp_dists[n_s // 2] if n_s > 0 else 0,
-        "p95_ulp": ulp_dists[int(0.95 * (n_s - 1))] if n_s > 1 else (ulp_dists[0] if n_s else 0),
-        "p99_ulp": ulp_dists[int(0.99 * (n_s - 1))] if n_s > 1 else (ulp_dists[0] if n_s else 0),
+        "p95_ulp": ulp_dists[_ceil_percentile_index(0.95, n_s)] if n_s > 1 else (ulp_dists[0] if n_s else 0),
+        "p99_ulp": ulp_dists[_ceil_percentile_index(0.99, n_s)] if n_s > 1 else (ulp_dists[0] if n_s else 0),
         "max_ulp_observed": ulp_dists[-1] if n_s > 0 else 0,
         "n_samples": n_s,
     }
+
+    # Hard ceiling: a single corrupted element can leave p99 well within
+    # bounds (the percentile window covers only ~1% of samples) while the
+    # max ULP distance is catastrophic. Heavy-tail fp32 rounding is tolerated
+    # up to HARD_MAX_ULP_FACTOR x max_ulp; a corrupted element is not.
+    hard_max = max_ulp * HARD_MAX_ULP_FACTOR
+    if stats["max_ulp_observed"] > hard_max:
+        raise AssertionError(
+            f"Precision downgrade detected: max ULP distance is "
+            f"{stats['max_ulp_observed']:.1f}, which exceeds the hard ceiling of "
+            f"{hard_max:.1f} ({HARD_MAX_ULP_FACTOR}x max_ulp={max_ulp}). "
+            f"Heavy-tail fp32 rounding is tolerated up to that ceiling, but a "
+            f"single element this far off is almost certainly corrupted, not "
+            f"just imprecise. Checked {n_s}/{n} elements."
+        )
 
     if stats["p99_ulp"] > max_ulp:
         raise AssertionError(

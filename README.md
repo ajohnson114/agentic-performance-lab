@@ -96,6 +96,8 @@ These are good starting points for seeing what the agent can do:
 | DataLoader bottleneck | `pytorch` | `num_workers=0`, `pin_memory=false` | Parallel loading, pinned memory |
 | C++/CUDA reduction | `cpp` | Per-iteration H2D/D2H, naive kernel, sync-bound | Persistent device mem, pinned memory, shared-mem reduction, streams |
 | PyTorch inference | `pytorch` | Per-image CPU preprocessing, batch_size=1, eager mode, fp32 | Batching, GPU preprocess, `torch.compile`, half precision |
+| STREAM (memory bandwidth) | `python` | Column-major traversal of row-major arrays, scalar loops (cache-unfriendly) | NumPy vectorization, row-major access order |
+| GPU inference demo (H100) | `pytorch` | fp32 eager, per-image CPU pre/postprocess, no AMP/compile (14 antipatterns) | AMP, `channels_last`, `torch.compile`, CUDA graphs, batched pre/postprocessing |
 
 ---
 
@@ -130,6 +132,9 @@ All activity is logged to `agent_events.jsonl`. Use `perflab replay` to review.
 | `perflab list-runs` | List stored runs (newest first) |
 | `perflab compare <A> <B>` | Compare two runs: metric delta, ratio, bottleneck diff |
 | `perflab show-task <task.yaml>` | Show effective task config with defaults filled in |
+| `perflab show-task-schema` | Show the full task.yaml schema with all fields and types |
+| `perflab thresholds` | List analysis thresholds used for bottleneck diagnosis |
+| `perflab show-tuning-schema` | Show what goes in tuning.yaml: fixed vs tunable params, sweep syntax |
 | `perflab show-config` | Display resolved configuration |
 | `perflab show-config-template` | Emit commented YAML config template |
 | `perflab init-config` | Create `./perflab.yaml` with default template |
@@ -141,8 +146,8 @@ All activity is logged to `agent_events.jsonl`. Use `perflab replay` to review.
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--suggest` | none | Expert hint for the LLM |
-| `--iters` | 8 | Max agent iterations |
-| `--candidates` | 4 | Candidates per LLM call |
+| `--iters` | 12 | Max agent iterations |
+| `--candidates` | 3 | Candidates per LLM call |
 | `--max-time` | 3600 | Wall-clock budget in seconds |
 | `--no-early-stop` | off | Disable convergence detection |
 | `--no-fast-screen` | off | Disable two-tier benchmarking |
@@ -167,7 +172,7 @@ What the agent is allowed to change:
 What the resulting code is allowed to do when it runs, controlled by `--isolation`:
 
 - **`--isolation=none`** (default) — no sandboxing; candidate code runs with your user's full privileges
-- **`--isolation=restricted`** — Bubblewrap (`bwrap`) sandboxing on Linux: network namespace unshared unless `task.yaml` sets `network: true`, filesystem access scoped to the workspace, GPU devices dev-bound explicitly
+- **`--isolation=restricted`** — Bubblewrap (`bwrap`) sandboxing on Linux: network namespace unshared unless `task.yaml` sets `network: true` (in which case `/etc/resolv.conf`, `/etc/ssl/certs`, and `/etc/hosts` are also read-only bound, so DNS resolution and TLS verification work), filesystem access scoped to the workspace, GPU devices dev-bound explicitly
 - **`--isolation=strict`** — reserved for a seccomp syscall-denial layer on top of `restricted`; **today it behaves exactly like `restricted` plus a logged warning** — the BPF filter is not shipped yet (see DESIGN.md). On non-Linux hosts both `restricted` and `strict` fall back to `none` with an explicit warning.
 - **Resource limits** — memory, process, and file descriptor caps (Linux), applied regardless of isolation level
 
@@ -175,10 +180,11 @@ What the resulting code is allowed to do when it runs, controlled by `--isolatio
 
 Checks applied to what a candidate produces, independent of edit policy or runtime isolation:
 
+- **Disposable eval workspaces** — every candidate builds, tests, and benchmarks in a temporary copy of the workspace, so a candidate process that writes files at runtime (even `tests.py`) poisons only its own discarded copy; protected files in the real workspace are additionally hash-verified after each iteration
 - **Correctness gate** — every candidate runs `tests.py`; rejected on failure
-- **Contract validation** — benchmark output checked against `contract.fixed_params` (prevents shrinking the problem to "optimize")
+- **Contract validation** — benchmark output checked against `contract.fixed_params` (prevents shrinking the problem to "optimize") and `min_repeats`/`min_warmup` (prevents dialing down measurement counts)
 - **Regression check** — candidates must beat baseline by `regression_tolerance` (default 2%)
-- **Anti-gaming** — variance checks, determinism re-runs, speedup threshold alerts
+- **Anti-gaming** — determinism re-runs with a varied seed (reject on divergence), zero-variance timing detection, mode-aware single-iteration speedup alerts, and optional thread-count enforcement — configured via `anti_gaming:` in task.yaml
 
 PerfLab also includes `perflab.harness`, a library of anti-gaming utilities for `bench.py` and `tests.py`:
 

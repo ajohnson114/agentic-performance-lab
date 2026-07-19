@@ -1,12 +1,9 @@
 """Tests for perflab.analyzers.metrics_rollup."""
 from __future__ import annotations
 
-import importlib.util
-
 from perflab.analyzers.metrics_rollup import (
     compute_run_summary,
     is_improvement,
-    is_statistically_significant,
 )
 
 
@@ -88,21 +85,3 @@ class TestIsImprovement:
     def test_minimize_above_tolerance(self):
         # new=0.995 < 0.99? No.
         assert is_improvement(0.995, 1.0, "minimize", 0.01) is False
-
-
-class TestIsStatisticallySignificant:
-    def test_small_samples_returns_true(self):
-        sig, p = is_statistically_significant([1.0], [2.0])
-        assert sig is True
-        assert p == 0.0
-
-    def test_identical_distributions(self):
-        vals = [1.0, 1.0, 1.0, 1.0, 1.0]
-        sig, p = is_statistically_significant(vals, vals)
-        if importlib.util.find_spec("scipy") is not None:
-            # With scipy, identical values → not significant (p≥0.05)
-            assert sig is False
-        else:
-            # Without scipy, falls back to (True, 0.0)
-            assert sig is True
-            assert p == 0.0

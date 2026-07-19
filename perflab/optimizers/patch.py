@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import hashlib
+import logging
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from perflab.task_spec import TaskSpec
+
+logger = logging.getLogger(__name__)
 
 PROTECTED_FILENAMES = {"tests.py", "bench.py", "task.yaml"}
 
@@ -43,6 +48,38 @@ def read_source_files(task: TaskSpec) -> dict[str, str]:
     return sources
 
 
+def workspace_copy_ignore(
+    ws: Path, out_dir: Path,
+) -> Callable[[str, list[str]], set[str]]:
+    """Build a shutil.copytree ignore callback that skips out_dir's contents.
+
+    out_dir accumulates run artifacts (out/runs gains bench json, profiler
+    traces, and snapshots every iteration), so copying it into each
+    disposable candidate workspace makes every prescreen/eval copy slower and
+    larger as a run progresses. The directory itself is kept -- empty --
+    because bench harnesses write out/bench.json relative to the workspace
+    without necessarily creating the directory first. Ignores nothing when
+    out_dir lies outside the workspace or equals it (degenerate config).
+    """
+    try:
+        out_resolved = out_dir.resolve()
+        ws_resolved = ws.resolve()
+    except OSError:
+        return lambda src, names: set()
+    if out_resolved == ws_resolved:
+        return lambda src, names: set()
+
+    def _ignore(src: str, names: list[str]) -> set[str]:
+        try:
+            if Path(src).resolve() == out_resolved:
+                return set(names)
+        except OSError:
+            pass
+        return set()
+
+    return _ignore
+
+
 @dataclass
 class SearchReplaceBlock:
     file_path: str
@@ -68,7 +105,9 @@ def _strip_code_fences(text: str) -> str:
     return re.sub(r"^```\w*\s*$", "", text, flags=re.MULTILINE)
 
 
-def parse_patch_response(response: str) -> list[SearchReplaceBlock]:
+def parse_patch_response(
+    response: str, warnings: list[str] | None = None,
+) -> list[SearchReplaceBlock]:
     """Parse LLM output containing search/replace blocks.
 
     Expected format per block:
@@ -78,6 +117,12 @@ def parse_patch_response(response: str) -> list[SearchReplaceBlock]:
         =======
         <replace text>
         >>>>>>> REPLACE
+
+    A block whose closing marker never arrives (LLM output truncated
+    mid-block) is dropped, never returned partially: a REPLACE cut off at
+    the truncation point would silently delete the tail of the matched
+    region and could still benchmark "faster". If `warnings` is provided,
+    a note is appended for every dropped incomplete block.
     """
     response = _strip_code_fences(response)
     blocks: list[SearchReplaceBlock] = []
@@ -121,16 +166,34 @@ def parse_patch_response(response: str) -> list[SearchReplaceBlock]:
             search_lines.append(lines[i])
             i += 1
         if i >= len(lines):
+            if warnings is not None:
+                warnings.append(
+                    f"Dropped incomplete edit block for '{file_path}': no "
+                    f"'{DIVIDER_MARKER}' divider before end of output "
+                    f"(response truncated?)"
+                )
             break
         i += 1  # skip =======
 
         # Collect replace text until >>>>>>> REPLACE
         replace_lines: list[str] = []
-        while i < len(lines) and lines[i].strip() != REPLACE_MARKER:
+        terminated = False
+        while i < len(lines):
+            if lines[i].strip() == REPLACE_MARKER:
+                terminated = True
+                i += 1
+                break
             replace_lines.append(lines[i])
             i += 1
-        if i < len(lines):
-            i += 1  # skip >>>>>>> REPLACE
+
+        if not terminated:
+            if warnings is not None:
+                warnings.append(
+                    f"Dropped incomplete edit block for '{file_path}': no "
+                    f"'{REPLACE_MARKER}' marker before end of output "
+                    f"(response truncated?)"
+                )
+            break
 
         blocks.append(SearchReplaceBlock(
             file_path=file_path,
@@ -483,3 +546,65 @@ def restore_files(backed_up: dict[str, Path], workspace: Path) -> None:
     for file_path, backup_path in backed_up.items():
         dst = workspace / file_path
         shutil.copy2(backup_path, dst)
+
+
+def _protected_files(workspace: Path) -> list[Path]:
+    return sorted(
+        p for p in workspace.rglob("*")
+        if p.is_file() and p.name in PROTECTED_FILENAMES
+    )
+
+
+def snapshot_protected_files(workspace: Path, snapshot_dir: Path) -> dict[str, str]:
+    """Snapshot protected files (tests.py/bench.py/task.yaml) for tamper detection.
+
+    Patch validation blocks *edits* to these files, but candidate code
+    executed in the real workspace (post-accept re-profiling, autotune,
+    drift checks) can still rewrite them at runtime. Copies every protected
+    file into snapshot_dir and returns {relative_path: sha256} for
+    verify_protected_files() to check against.
+    """
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    hashes: dict[str, str] = {}
+    for p in _protected_files(workspace):
+        rel = p.relative_to(workspace).as_posix()
+        shutil.copy2(p, snapshot_dir / rel.replace("/", "__"))
+        hashes[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return hashes
+
+
+def verify_protected_files(
+    workspace: Path, snapshot_dir: Path, hashes: dict[str, str],
+) -> list[str]:
+    """Compare protected files against their snapshot, restoring any that changed.
+
+    Returns the relative paths that had been modified or deleted since the
+    snapshot (empty = clean). Detection via the returned list is
+    authoritative; restoration is best-effort. Each tampered file is restored
+    from the snapshot so later correctness checks stay honest, but the restore
+    never raises: candidate code may have deleted a protected file's enclosing
+    directory (so ``copy2`` would hit FileNotFoundError) or the snapshot copy
+    itself may be gone. The parent directory is recreated first, and any
+    restore failure degrades to a logged warning -- the file stays flagged as
+    tampered either way. The per-iteration caller relies on this: a crash here
+    would take down the very run this guard protects.
+    """
+    tampered: list[str] = []
+    for rel, expected in hashes.items():
+        target = workspace / rel
+        actual = (
+            hashlib.sha256(target.read_bytes()).hexdigest()
+            if target.exists() else None
+        )
+        if actual != expected:
+            tampered.append(rel)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot_dir / rel.replace("/", "__"), target)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to restore tampered protected file '%s' from "
+                    "snapshot: %s. File remains flagged as tampered.",
+                    rel, exc,
+                )
+    return tampered

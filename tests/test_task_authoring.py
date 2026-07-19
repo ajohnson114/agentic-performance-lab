@@ -144,6 +144,23 @@ class TestGenerateTaskFiles:
         data = yaml.safe_load(files["task.yaml"])
         assert data["target_hardware"] == "NVIDIA A100"
 
+    @pytest.mark.parametrize("program_type", ["python", "pytorch", "jax", "triton", "cpp", "cuda"])
+    def test_scaffold_omits_dead_profile_plan(self, program_type):
+        """profile_plan is parsed by TaskSpec but never consumed by profiler
+        selection (perflab.profilers.select_profilers branches on
+        program_type only) -- new task.yaml scaffolds must not suggest it
+        does anything by including it."""
+        from perflab.server.task_templates import generate_task_files
+
+        files = generate_task_files(
+            name="scaffold_test",
+            program_type=program_type,
+            workspace="tasks/custom/scaffold_test",
+        )
+        assert "profile_plan" not in files["task.yaml"]
+        data = yaml.safe_load(files["task.yaml"])
+        assert "profile_plan" not in data
+
 
 # ---------------------------------------------------------------------------
 # Profiler suggestions

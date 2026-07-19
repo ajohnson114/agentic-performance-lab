@@ -607,10 +607,11 @@ def _analyze_gpu_attribution(
     except ImportError:
         return findings
 
-    correlations = nsys_summary.get("cpu_gpu_correlations")
-    if not correlations:
-        return findings
-
+    # Note: no gate on cpu_gpu_correlations here -- nsys can silently omit it
+    # (sqlite3.OperationalError, empty rows) while top_kernels/per_stream_gaps/
+    # stream_utilization/memcpy are still populated independently.
+    # compute_attribution_ranking() defaults correlations to [] internally and
+    # still produces gpu-kernel/pipeline-stall findings from that other data.
     ranking = compute_attribution_ranking(nsys_summary, perf_summary)
     for entry in ranking[:3]:  # top 3 attribution entries
         # 20%: a kernel taking >20% of total GPU time is a dominant optimization target

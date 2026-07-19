@@ -101,3 +101,25 @@ def test_sweep_improvement_keeps_best_knobs(sweep_task, monkeypatch):
     assert knobs["block_size"] in (64, 128)
     # The sweep section survives a winning sweep so future iterations can retune
     assert knobs["sweep"] == ORIGINAL_KNOBS["sweep"]
+
+
+def test_sweep_benchmark_call_forwards_env_passthrough(sweep_task, monkeypatch):
+    """run_correctness and run_benchmark are sibling calls in the sweep loop and
+    must both forward task.constraints.env_passthrough (DATA_ROOT/HF_HOME/...) --
+    otherwise a sweep silently loses access to env vars the benchmark needs."""
+    sweep_task.constraints.env_passthrough = ["DATA_ROOT", "HF_HOME"]
+    monkeypatch.setattr("perflab.runners.correctness.run_correctness", _pass_correctness)
+
+    captured_kwargs: dict = {}
+
+    def recording_benchmark(cmd, **kwargs):
+        captured_kwargs.update(kwargs)
+        return (
+            SimpleNamespace(returncode=0, stdout="", stderr="", rlimits_applied=None),
+            {"ok": True, "throughput": {"median": 0.5}},
+        )
+
+    monkeypatch.setattr("perflab.runners.benchmark.run_benchmark", recording_benchmark)
+
+    autotune._auto_tune_sweep(_make_ctx(sweep_task))
+    assert captured_kwargs.get("env_passthrough") == ["DATA_ROOT", "HF_HOME"]

@@ -138,3 +138,72 @@ class TestFormatTmaSummary:
         assert "Frontend Bound: 15.0%" in text
         assert "Backend Bound:  50.0%" in text
         assert "Backend Bound" in text  # dominant bottleneck
+
+
+class TestModernPerfMetricNames:
+    def test_tma_prefixed_names_parse(self):
+        # perf >= 6.x emits TopdownL1 metrics as "tma_frontend_bound" etc.
+        text = """
+                        #     23.4 %  tma_frontend_bound
+                        #     45.2 %  tma_backend_bound
+                        #      8.1 %  tma_bad_speculation
+                        #     23.3 %  tma_retiring
+        """
+        result = _parse_tma_output(text)
+        assert result is not None
+        assert result.frontend_bound_pct == 23.4
+        assert result.backend_bound_pct == 45.2
+        assert result.bad_speculation_pct == 8.1
+        assert result.retiring_pct == 23.3
+
+
+class TestCollectTmaFromText:
+    _GOOD = """
+                        #     20.0 %  tma_frontend_bound
+                        #     50.0 %  tma_backend_bound
+                        #     10.0 %  tma_bad_speculation
+                        #     20.0 %  tma_retiring
+    """
+
+    def test_precollected_text_avoids_metric_group_run(self, tmp_path, monkeypatch):
+        import perflab.analyzers.tma as tma_mod
+
+        calls: list[list[str]] = []
+
+        def fake_run_cmd(cmd, cwd=None, **kwargs):
+            calls.append(list(cmd))
+            from perflab.tools.shell import CmdResult
+            return CmdResult(cmd=list(cmd), returncode=1, stdout="", stderr="", duration_s=0.01)
+
+        monkeypatch.setattr(tma_mod, "run_cmd", fake_run_cmd)
+        result = tma_mod.collect_tma(
+            "python3 bench.py", tmp_path, tmp_path / "tma.txt",
+            perf_stat_text=self._GOOD,
+        )
+
+        assert result is not None
+        assert result.backend_bound_pct == 50.0
+        # No benchmark run: the metrics were already in the caller's output.
+        assert calls == []
+
+    def test_unparseable_text_falls_back_to_raw_counter_run(self, tmp_path, monkeypatch):
+        import perflab.analyzers.tma as tma_mod
+
+        calls: list[list[str]] = []
+
+        def fake_run_cmd(cmd, cwd=None, **kwargs):
+            calls.append(list(cmd))
+            from perflab.tools.shell import CmdResult
+            return CmdResult(cmd=list(cmd), returncode=1, stdout="", stderr="", duration_s=0.01)
+
+        monkeypatch.setattr(tma_mod, "run_cmd", fake_run_cmd)
+        result = tma_mod.collect_tma(
+            "python3 bench.py", tmp_path, tmp_path / "tma.txt",
+            perf_stat_text="just plain counters, no topdown metrics",
+        )
+
+        assert result is None
+        # Exactly one attempt: the raw topdown-* events fallback, never the
+        # -M TopdownL1 run (its metrics would already be in the text).
+        assert len(calls) == 1
+        assert "topdown-fetch-bubbles" in calls[0][calls[0].index("-e") + 1]

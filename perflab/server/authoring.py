@@ -207,11 +207,13 @@ def show_task_authoring_guide() -> dict:
             },
             {
                 "step": 6,
-                "title": "Pick profilers and thresholds",
+                "title": "Pick thresholds; check relevant profilers",
                 "description": (
-                    "Use suggest_profilers and suggest_thresholds to get "
-                    "recommended settings for your program type and hardware. "
-                    "Copy the suggestions into task.yaml."
+                    "Use suggest_thresholds to get recommended analysis_thresholds "
+                    "overrides for your program type and hardware, and copy them "
+                    "into task.yaml. suggest_profilers is informational only -- "
+                    "PerfLab auto-selects profilers by program_type, so there is "
+                    "nothing to copy into task.yaml for it."
                 ),
                 "tools": ["suggest_profilers", "suggest_thresholds"],
             },
@@ -486,10 +488,14 @@ def validate_task(task_yaml: str) -> dict:
 
 @mcp.tool(annotations={"readOnlyHint": True})
 def suggest_profilers(program_type: str, target_hardware: str | None = None) -> dict:
-    """Suggest which profilers to use for a given program type and hardware.
+    """Suggest which profilers are relevant for a given program type and hardware.
 
-    Returns a recommended profile_plan (always/optional lists) with rationale
-    for each profiler. Copy the result into your task.yaml profile_plan section.
+    Informational only: PerfLab auto-selects which profilers actually run
+    based on program_type (perflab.profilers.select_profilers) -- there is
+    no task.yaml field that changes this selection, so there is nothing to
+    "copy in" from this suggestion. Use it to understand what `perflab
+    profile`/`perflab agent` will already run, or to choose a profiler to
+    invoke manually.
 
     Args:
         program_type: python | pytorch | jax | triton | cpp | cuda.

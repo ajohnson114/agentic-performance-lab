@@ -7,7 +7,7 @@ from perflab.analyzers.bottleneck_analyzer import (
     AnalysisThresholds,
     diagnose_bottlenecks,
 )
-from perflab.profilers.ncu_profiler import _parse_ncu_csv
+from perflab.profilers.ncu_profiler import _ncu_summary_usable, _parse_ncu_csv
 
 # ---------------------------------------------------------------------------
 # NCU Warp Stall Reason parsing
@@ -209,6 +209,34 @@ class TestNcuInstructionMix:
         result = _parse_ncu_csv(csv_path)
 
         assert "instruction_mix" not in result.get("kernels", [{}])[0]
+
+
+# ---------------------------------------------------------------------------
+# _ncu_summary_usable predicate (gates the live-run fallback in run())
+# ---------------------------------------------------------------------------
+
+class TestNcuSummaryUsable:
+    def test_empty_summary_is_unusable(self):
+        assert _ncu_summary_usable({}) is False
+
+    def test_no_kernels_is_unusable(self):
+        assert _ncu_summary_usable({"kernel_count": 3}) is False
+
+    def test_name_and_invocations_only_is_unusable(self):
+        # An unrecognized CSV layout parses into rows but extracts no metric.
+        summary = {"kernels": [{"name": "(unknown)", "invocations": 1}]}
+        assert _ncu_summary_usable(summary) is False
+
+    def test_kernel_with_a_metric_is_usable(self):
+        summary = {"kernels": [{"name": "k1", "invocations": 1, "sm_utilization_pct": 50.0}]}
+        assert _ncu_summary_usable(summary) is True
+
+    def test_usable_if_any_kernel_has_a_metric(self):
+        summary = {"kernels": [
+            {"name": "bare", "invocations": 2},
+            {"name": "rich", "invocations": 1, "memory_throughput_pct": 30.0},
+        ]}
+        assert _ncu_summary_usable(summary) is True
 
 
 # ---------------------------------------------------------------------------

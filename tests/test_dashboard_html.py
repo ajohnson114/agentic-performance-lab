@@ -182,6 +182,22 @@ class TestOutcomeAnalysis:
         html = _write(tmp_path)
         assert "Optimization analysis" not in html
 
+    def test_early_stop_duplicate_row_filtered(self, tmp_path: Path):
+        # maybe_early_stop() (finalize.py) appends a synthetic second history
+        # entry for the same iteration ("early stop: ...", accepted=False).
+        # generate.py already filters this out of glance.rows, but the raw
+        # history reaching _render_outcome_analysis was unfiltered -- so the
+        # "what didn't work" table showed two rows for one iteration whenever
+        # convergence stopped the run.
+        history = [
+            {"iteration": 0, "value": 100.0, "accepted": True, "notes": "baseline"},
+            {"iteration": 1, "value": 100.0, "accepted": False, "description": "no improvement found"},
+            {"iteration": 1, "value": 100.0, "accepted": False, "description": "early stop: 1 consecutive failures"},
+        ]
+        html = _write(tmp_path, history=history)
+        assert html.count("no improvement found") == 1
+        assert "early stop:" not in html
+
     def test_perfetto_trace_link(self, tmp_path: Path):
         trace_path = tmp_path / "perfetto_trace.json"
         trace_path.write_text('{"traceEvents": []}', encoding="utf-8")

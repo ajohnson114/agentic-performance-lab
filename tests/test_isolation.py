@@ -215,6 +215,69 @@ class TestWrapCommandFallbacks:
             result = wrap_command(cmd, IsolationPolicy(level="restricted", workspace=ws, network=True))
         assert "--unshare-net" not in result
 
+    def test_network_true_binds_dns_tls_paths(self, tmp_path):
+        """FIX 6: constraints.network: true must also read-only bind DNS/TLS
+        config -- previously _readonly_bind_paths() only ever covered /usr,
+        /lib, the venv, and CUDA paths (nothing under /etc), so a
+        network-allowed task still couldn't resolve hostnames or verify TLS
+        certs from inside the sandbox."""
+        cmd = ["python3", "bench.py"]
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        fake_net_paths = [Path("/etc/resolv.conf"), Path("/etc/ssl/certs"), Path("/etc/hosts")]
+        with patch.object(isolation_mod.platform, "system", return_value="Linux"), \
+             patch.object(isolation_mod.shutil, "which", return_value="/usr/bin/bwrap"), \
+             patch.object(isolation_mod, "_bwrap_usable", return_value=True), \
+             patch.object(isolation_mod, "_readonly_bind_paths", return_value=[]), \
+             patch.object(isolation_mod, "_network_bind_paths", return_value=fake_net_paths), \
+             patch.object(isolation_mod, "_nvidia_device_paths", return_value=[]):
+            result = wrap_command(cmd, IsolationPolicy(level="restricted", workspace=ws, network=True))
+        for p in fake_net_paths:
+            idx = result.index(str(p))
+            assert result[idx - 1] == "--ro-bind"
+            assert result[idx + 1] == str(p)
+
+    def test_network_false_omits_dns_tls_binds(self, tmp_path):
+        """When network isn't allowed, --unshare-net is in effect and there's
+        nothing to resolve/verify from inside the sandbox -- the DNS/TLS
+        binds must not be added even if the candidate paths exist."""
+        cmd = ["python3", "bench.py"]
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        fake_net_paths = [Path("/etc/resolv.conf")]
+        with patch.object(isolation_mod.platform, "system", return_value="Linux"), \
+             patch.object(isolation_mod.shutil, "which", return_value="/usr/bin/bwrap"), \
+             patch.object(isolation_mod, "_bwrap_usable", return_value=True), \
+             patch.object(isolation_mod, "_readonly_bind_paths", return_value=[]), \
+             patch.object(isolation_mod, "_network_bind_paths", return_value=fake_net_paths), \
+             patch.object(isolation_mod, "_nvidia_device_paths", return_value=[]):
+            result = wrap_command(cmd, IsolationPolicy(level="restricted", workspace=ws, network=False))
+        assert "/etc/resolv.conf" not in result
+
+
+class TestNetworkBindPaths:
+    """Unit tests for isolation._network_bind_paths(), the helper FIX 6 adds
+    alongside _readonly_bind_paths() to cover DNS/TLS config paths."""
+
+    def test_only_existing_candidates_returned(self):
+        with patch.object(
+            isolation_mod, "_NETWORK_RO_BIND_CANDIDATES",
+            ("/definitely/does/not/exist/resolv.conf", "/etc/hosts"),
+        ):
+            paths = isolation_mod._network_bind_paths()
+        assert Path("/definitely/does/not/exist/resolv.conf") not in paths
+        expected = [Path("/etc/hosts")] if Path("/etc/hosts").exists() else []
+        assert paths == expected
+
+    def test_returns_subset_of_known_candidates(self):
+        """Real (unmocked) call: every path returned must both exist and be
+        one of the documented candidates -- guards against the helper
+        silently picking up something unintended."""
+        paths = isolation_mod._network_bind_paths()
+        for p in paths:
+            assert p.exists()
+        assert {str(p) for p in paths} <= set(isolation_mod._NETWORK_RO_BIND_CANDIDATES)
+
     def test_bare_python_resolved_to_sys_executable_when_wrapped(self, tmp_path):
         import sys
         cmd = ["python", "bench.py"]
@@ -485,6 +548,18 @@ class TestBwrapAcceptance:
         finally:
             srv.close()
 
+    def test_restricted_network_true_can_read_resolv_conf(self, tmp_path):
+        """FIX 6 acceptance: with constraints.network: true, DNS config is
+        readable inside the sandbox (needed for hostname resolution)."""
+        if not Path("/etc/resolv.conf").exists():
+            pytest.skip("no /etc/resolv.conf on this host")
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        policy = IsolationPolicy(level="restricted", workspace=ws, network=True)
+        cmd = wrap_command(["python3", "-c", "open('/etc/resolv.conf').read()"], policy)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+
     def test_matmul_cpp_builds_and_runs_under_restricted(self, tmp_path):
         from perflab.runners.benchmark import run_benchmark
         from perflab.runners.correctness import run_correctness
@@ -557,6 +632,9 @@ class TestAgentLoopIsolationWiring:
         from perflab.task_spec import TaskSpec
 
         task = TaskSpec.load(sample_task_yaml)
+        # Route through the single-run path this test patches (the
+        # determinism re-run wiring is covered in test_anti_gaming.py)
+        task.anti_gaming.determinism_rerun = False
         policy = IsolationPolicy(level="restricted")
         ctx = _make_agent_ctx(task, tmp_path, policy)
 
@@ -580,6 +658,7 @@ class TestAgentLoopIsolationWiring:
         from perflab.task_spec import TaskSpec
 
         task = TaskSpec.load(sample_task_yaml)
+        task.anti_gaming.determinism_rerun = False
         policy = IsolationPolicy(level="restricted")
         ctx = _make_agent_ctx(task, tmp_path, policy)
 

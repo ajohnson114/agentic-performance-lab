@@ -35,6 +35,18 @@ def _urlopen_with_retry(req: urllib.request.Request, timeout: float):
     request itself is bad and is never retried. urlopen raises HTTPError for
     non-2xx, so callers' in-context status checks are a belt-and-suspenders
     second path.
+
+    Also retries bare TimeoutError: urllib's do_open() only wraps errors from
+    h.request() in URLError, not from the getresponse() call that follows --
+    so a timeout while Ollama is generating (the dominant real failure mode,
+    which _REQUEST_TIMEOUT_S is sized for) surfaces as a raw TimeoutError
+    (socket.timeout is TimeoutError on Python >=3.10) instead of URLError.
+    Without catching it here, that timeout would propagate uncaught and abort
+    the whole optimizer run instead of retrying.
+
+    This only ever wraps the initial urlopen() call for a fresh request, never
+    a mid-stream read -- stream()'s chunk-by-chunk iteration happens outside
+    this function, so a timeout partway through a response is never retried.
     """
     for delay in _RETRY_DELAYS_S:
         try:
@@ -42,7 +54,7 @@ def _urlopen_with_retry(req: urllib.request.Request, timeout: float):
         except urllib.error.HTTPError as exc:
             if exc.code < 500:
                 raise
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError):
             pass
         time.sleep(delay)
     return urllib.request.urlopen(req, timeout=timeout)
@@ -135,12 +147,20 @@ class OllamaProvider:
             body = json.loads(resp.read().decode("utf-8"))
 
         message = body.get("message", {})
-        usage = {}
+        # Each field is populated independently from its own source key, and
+        # omitted (not defaulted to 0) when that key is absent -- Ollama omits
+        # prompt_eval_count on a KV-cache hit (nothing was evaluated) and could
+        # in principle omit eval_count too. Mirrors the missing-vs-zero
+        # distinction usage_input_tokens/usage_output_tokens make in
+        # optimizers/progress.py. total_tokens is only meaningful (and only
+        # set) when both components are actually known.
+        usage: dict = {}
         if "eval_count" in body:
             usage["completion_tokens"] = body["eval_count"]
         if "prompt_eval_count" in body:
             usage["prompt_tokens"] = body["prompt_eval_count"]
-            usage["total_tokens"] = body.get("prompt_eval_count", 0) + body.get("eval_count", 0)
+        if "eval_count" in body and "prompt_eval_count" in body:
+            usage["total_tokens"] = body["prompt_eval_count"] + body["eval_count"]
 
         return CompletionResult(
             content=message.get("content", ""),

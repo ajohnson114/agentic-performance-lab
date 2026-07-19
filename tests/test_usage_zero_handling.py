@@ -76,14 +76,14 @@ def test_reject_history_records_genuine_zero_metric(tmp_path):
         accepted_patches=[],
         accepted_count=0,
         sec_metric=None,
-        config=SimpleNamespace(isolation=None),
+        config=SimpleNamespace(isolation=None, top_k=2),
     )
     cand = BeamCandidate(
         iteration=2, index=0, blocks=[], description="candidate 1: 1 blocks", value=0.0,
     )
 
     accepted, rel_improvement, accepted_value = accept_best(
-        ctx, [cand], tmp_path / "backups", use_fast=False,
+        ctx, [cand], use_fast=False,
     )
 
     assert accepted is False

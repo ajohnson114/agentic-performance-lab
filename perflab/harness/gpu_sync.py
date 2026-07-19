@@ -30,7 +30,11 @@ def _sync_device(device) -> None:
     dev_type = getattr(device, "type", str(device))
     if dev_type == "cuda":
         import torch
-        torch.cuda.synchronize()
+        # Pass the device explicitly -- a bare synchronize() drains the
+        # ambient current device, not necessarily the one being timed, so
+        # side-stream/side-device work on another CUDA device would escape
+        # the timing window.
+        torch.cuda.synchronize(device)
     elif dev_type == "mps":
         import torch
         torch.mps.synchronize()

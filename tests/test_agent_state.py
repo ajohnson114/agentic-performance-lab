@@ -106,3 +106,49 @@ class TestContextOverflowDetection:
         from perflab.optimizers.phases.generate import _is_context_overflow_error
         exc = Exception("rate limit exceeded, retry after 30s")
         assert _is_context_overflow_error(exc) is False
+
+
+class TestCollectPromisingAlternatives:
+    def _cands(self, values_accepted):
+        from perflab.optimizers.phases.evaluate import BeamCandidate
+        return [
+            BeamCandidate(
+                iteration=1, index=i, blocks=[], description=f"cand {i}",
+                reasoning=f"r{i}", value=v, accepted=a,
+            )
+            for i, (v, a) in enumerate(values_accepted)
+        ]
+
+    def test_maximize_keeps_above_baseline_only(self):
+        from perflab.optimizers.agent import _collect_promising_alternatives
+        cands = self._cands([(12.0, True), (11.0, False), (9.0, False), (None, False)])
+        alts = _collect_promising_alternatives(cands, 10.0, "maximize")
+        assert [a["value"] for a in alts] == [11.0]
+        assert alts[0]["improvement"] == 1.1
+
+    def test_minimize_keeps_below_baseline_only(self):
+        # Lower is better: 9.0 improved on baseline 10.0; 12.0 regressed and
+        # must not be reported as promising.
+        from perflab.optimizers.agent import _collect_promising_alternatives
+        cands = self._cands([(8.0, True), (9.0, False), (12.0, False)])
+        alts = _collect_promising_alternatives(cands, 10.0, "minimize")
+        assert [a["value"] for a in alts] == [9.0]
+        assert alts[0]["improvement"] == round(10.0 / 9.0, 2)
+
+    def test_minimize_sorted_best_first_and_capped_at_three(self):
+        from perflab.optimizers.agent import _collect_promising_alternatives
+        cands = self._cands([
+            (5.0, True), (9.5, False), (7.0, False), (8.0, False), (9.0, False),
+        ])
+        alts = _collect_promising_alternatives(cands, 10.0, "minimize")
+        assert [a["value"] for a in alts] == [7.0, 8.0, 9.0]
+
+    def test_accepted_candidate_excluded(self):
+        from perflab.optimizers.agent import _collect_promising_alternatives
+        cands = self._cands([(12.0, True)])
+        assert _collect_promising_alternatives(cands, 10.0, "maximize") == []
+
+    def test_zero_baseline_yields_no_alternatives(self):
+        from perflab.optimizers.agent import _collect_promising_alternatives
+        cands = self._cands([(12.0, True), (11.0, False)])
+        assert _collect_promising_alternatives(cands, 0.0, "maximize") == []

@@ -1148,11 +1148,25 @@ def _add_build_flag_recommendations(parts: list[str], ctx: PromptContext) -> Non
                 f"fused multiply-add across statements, and assumes no NaN/Inf. "
                 f"Typical speedup: 10-30% for floating-point-heavy code."
             )
-            if ctx.accuracy_tolerance:
-                parts.append(
-                    f"Accuracy tolerance: **{ctx.accuracy_tolerance}** — results may differ "
-                    f"from IEEE-compliant output by up to this amount."
-                )
+        parts.append("")
+
+
+def _add_accuracy_tolerance(parts: list[str], ctx: PromptContext) -> None:
+    """Accuracy tolerance, rendered independently of build flags.
+
+    It stands on its own because it also licenses precision reduction
+    (fp32→tf32/fp16) and algebraic rewrites, not just fast-math compiler flags.
+    Framework tasks (PyTorch/JAX/Triton) declare a tolerance without carrying any
+    build-flag recommendations, so this must not be nested under those.
+    """
+    if ctx.accuracy_tolerance:
+        parts.append("## Accuracy tolerance\n")
+        parts.append(
+            f"Accuracy tolerance: **{ctx.accuracy_tolerance}** — results may differ "
+            f"from the reference output by up to this amount. This also licenses "
+            f"precision reduction (fp32→tf32/fp16) and algebraic rewrites, not just "
+            f"fast-math compiler flags."
+        )
         parts.append("")
 
 
@@ -1857,6 +1871,7 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
     _add_profiler_summaries(parts, ctx)
     _add_profiler_context(parts, ctx)  # GPU-aware profiler annotation
     _add_build_flag_recommendations(parts, ctx)
+    _add_accuracy_tolerance(parts, ctx)
     _add_compiler_diagnostics(parts, ctx)
     _add_cross_referenced_insights(parts, ctx)
     _add_kernel_analysis(parts, ctx)
@@ -2109,11 +2124,14 @@ def _add_perf_vs_peak(parts: list[str], ctx: PromptContext) -> None:
 
 def parse_candidates(
     response: str,
+    warnings: list[str] | None = None,
 ) -> list[tuple[str, list[SearchReplaceBlock]]]:
     """Split multi-candidate response on '--- CANDIDATE N ---' markers.
 
     Returns a list of (reasoning_text, blocks) tuples where reasoning_text
     is the text before the first FILE: line in each candidate segment.
+    If `warnings` is provided, parse_patch_response appends a note for every
+    incomplete (truncated) edit block it drops.
     """
     # Split on candidate separators
     segments: list[str] = []
@@ -2133,7 +2151,7 @@ def parse_candidates(
     # Parse each segment, extracting reasoning and blocks
     candidates: list[tuple[str, list[SearchReplaceBlock]]] = []
     for segment in segments:
-        blocks = parse_patch_response(segment)
+        blocks = parse_patch_response(segment, warnings=warnings)
         if blocks:
             # Extract reasoning: text before the first "FILE:" line
             reasoning_lines = []

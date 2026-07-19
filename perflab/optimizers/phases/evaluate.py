@@ -1,25 +1,37 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import math
+import shlex
 import shutil
+import tempfile
+import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from perflab.analyzers.metrics_rollup import calc_speedup, is_improvement
+from perflab.analyzers.metrics_rollup import improvement_factor, is_improvement
 from perflab.memory.run_store import snapshot_workspace
 from perflab.optimizers.history import make_history_entry
 from perflab.optimizers.patch import (
     SearchReplaceBlock,
     apply_patch,
-    backup_files,
-    restore_files,
     validate_patch,
+    workspace_copy_ignore,
 )
-from perflab.runners.benchmark import metric_value, run_benchmark, validate_contract
-from perflab.runners.correctness import run_correctness
+from perflab.runners.benchmark import (
+    metric_value,
+    run_benchmark,
+    validate_bench_variance,
+    validate_contract,
+)
+from perflab.runners.correctness import run_correctness, run_correctness_twice
 from perflab.runners.pipeline import run_pipeline_for_ctx
+from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
+from perflab.tools.shell import run_cmd
 
 if TYPE_CHECKING:
     from perflab.optimizers.agent import AgentContext
@@ -38,6 +50,34 @@ class BeamCandidate:
     accepted: bool = False
 
 
+@contextlib.contextmanager
+def _patched_workspace_copy(
+    ws: Path, blocks: list[SearchReplaceBlock], prefix: str, out_dir: Path,
+) -> Iterator[Path]:
+    """Yield a temporary copy of the workspace with the patch applied.
+
+    Candidate code runs with the workspace as cwd and can write arbitrary
+    files at runtime -- not just the ones the patch touched -- so correctness
+    and benchmark subprocesses must never execute in the real workspace.
+    A candidate that rewrites tests.py mid-benchmark poisons only its own
+    discarded copy, not the checks applied to later candidates.
+
+    out_dir's contents are excluded from the copy (out/runs grows every
+    iteration); the empty directory is kept for bench.json writes.
+    """
+    temp_dir = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        temp_ws = temp_dir / "ws"
+        shutil.copytree(
+            ws, temp_ws, dirs_exist_ok=True,
+            ignore=workspace_copy_ignore(ws, out_dir),
+        )
+        apply_patch(blocks, temp_ws)
+        yield temp_ws
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def evaluate_single_candidate(
     ctx: AgentContext,
     ci: int,
@@ -51,7 +91,6 @@ def evaluate_single_candidate(
     """
     task = ctx.task
     ws = ctx.ws
-    rp = ctx.rp
     it = ctx.iteration
     progress = ctx.progress
     event_log = ctx.event_log
@@ -86,10 +125,6 @@ def evaluate_single_candidate(
             reasoning=reasoning,
         ), errors
 
-    # Backup -> apply -> correctness -> benchmark -> restore
-    backup_dir = rp.run_dir / "backups" / f"iter{it}"
-    backed_up = backup_files(blocks, ws, backup_dir)
-
     def _warn_if_rlimit_failed(rlimits_applied: bool | None, stage: str) -> None:
         if rlimits_applied is False:
             event_log.rlimit_warning(
@@ -97,16 +132,51 @@ def evaluate_single_candidate(
                 candidate_index=ci,
             )
 
-    try:
-        apply_patch(blocks, ws)
+    def _reject(suffix: str, error: dict) -> tuple[BeamCandidate, list[dict]]:
+        errors.append(error)
+        return BeamCandidate(
+            iteration=it, index=ci, blocks=blocks,
+            description=f"{desc} ({suffix})", reasoning=reasoning,
+        ), errors
 
-        # Correctness check
-        cres = run_correctness(
-            task.correctness.cmd, cwd=ws, program_type=task.program_type,
-            rlimit_as_gb=task.constraints.rlimit_as_gb,
-            env_passthrough=task.constraints.env_passthrough,
-            isolation=ctx.config.isolation,
-        )
+    # Apply -> build -> correctness -> benchmark, all inside a temporary
+    # workspace copy so nothing the candidate's processes write survives.
+    with _patched_workspace_copy(ws, blocks, f"perflab_eval_{ci}_", task.out_dir) as temp_ws:
+        # Build the patched copy so compiled tasks benchmark the patched
+        # binary (prescreen built only its own, already-discarded copy).
+        if task.build is not None:
+            build_res = run_cmd(
+                shlex.split(task.build.cmd), cwd=temp_ws,
+                timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+            )
+            if build_res.returncode != task.build.expected_exit:
+                progress.on_message(f"[agent]   Build FAILED (rc={build_res.returncode})")
+                return _reject("build failed", {
+                    "type": "build",
+                    "description": f"candidate {ci + 1} failed build (exit code {build_res.returncode})",
+                    "output": (build_res.stderr or "")[:3000],
+                })
+
+        # Correctness check (re-run with a different seed when the
+        # anti-gaming determinism check is enabled)
+        det_warnings: list[str] = []
+        if task.anti_gaming.determinism_rerun:
+            cres, det_warnings = run_correctness_twice(
+                task.correctness.cmd, cwd=temp_ws, program_type=task.program_type,
+                rlimit_as_gb=task.constraints.rlimit_as_gb,
+                expected_exit=task.correctness.expected_exit,
+                env_passthrough=task.constraints.env_passthrough,
+                isolation=ctx.config.isolation,
+                accuracy_tolerance=task.constraints.accuracy_tolerance,
+            )
+        else:
+            cres = run_correctness(
+                task.correctness.cmd, cwd=temp_ws, program_type=task.program_type,
+                rlimit_as_gb=task.constraints.rlimit_as_gb,
+                env_passthrough=task.constraints.env_passthrough,
+                isolation=ctx.config.isolation,
+                accuracy_tolerance=task.constraints.accuracy_tolerance,
+            )
         _warn_if_rlimit_failed(cres.rlimits_applied, "correctness")
         event_log.candidate_correctness(
             it, ci, cres.returncode == task.correctness.expected_exit,
@@ -115,24 +185,35 @@ def evaluate_single_candidate(
 
         if cres.returncode != task.correctness.expected_exit:
             progress.on_message(f"[agent]   Correctness FAILED (rc={cres.returncode})")
-            errors.append({
+            return _reject("correctness failed", {
                 "type": "correctness",
                 "description": f"candidate {ci + 1} failed correctness (exit code {cres.returncode})",
                 "output": (cres.stderr or "")[:3000],
             })
-            return BeamCandidate(
-                iteration=it, index=ci, blocks=blocks,
-                description=f"{desc} (correctness failed)",
-                reasoning=reasoning,
-            ), errors
+
+        if det_warnings:
+            for warning in det_warnings:
+                event_log.anti_gaming_warning(
+                    it, "determinism_rerun", warning, candidate_index=ci,
+                )
+            progress.on_message("[agent]   Determinism re-run FAILED — rejecting candidate")
+            return _reject("determinism re-run failed", {
+                "type": "anti_gaming",
+                "description": (
+                    f"candidate {ci + 1} passed correctness once but failed the "
+                    f"re-run with a different seed (possible caching/gaming)"
+                ),
+                "output": det_warnings[0][:3000],
+            })
 
         # Benchmark (fast screen or full depending on mode)
         try:
             bres, bench = run_benchmark(
-                task.benchmark.cmd, cwd=ws, fast_mode=use_fast, program_type=task.program_type,
+                task.benchmark.cmd, cwd=temp_ws, fast_mode=use_fast, program_type=task.program_type,
                 rlimit_as_gb=task.constraints.rlimit_as_gb,
                 env_passthrough=task.constraints.env_passthrough,
                 isolation=ctx.config.isolation,
+                warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
             )
             _warn_if_rlimit_failed(bres.rlimits_applied, "benchmark")
         except Exception as exc:  # noqa: BLE001 -- untrusted candidate's benchmark subprocess can fail in arbitrary ways; must feed back as candidate error, not crash the run
@@ -140,32 +221,94 @@ def evaluate_single_candidate(
             # subprocess's stdout/stderr) out of "description" -- descriptions
             # flow into prompt headings and failure_memory unsanitized; only
             # "output" is sanitized at prompt-render time.
-            errors.append({
+            progress.on_message(f"[agent]   Benchmark FAILED: {exc}")
+            return _reject("benchmark failed", {
                 "type": "benchmark",
                 "description": f"candidate {ci + 1} benchmark failed ({type(exc).__name__})",
                 "output": str(exc)[:3000],
             })
-            progress.on_message(f"[agent]   Benchmark FAILED: {exc}")
-            return BeamCandidate(
-                iteration=it, index=ci, blocks=blocks,
-                description=f"{desc} (benchmark failed)",
-                reasoning=reasoning,
-            ), errors
 
-        # Contract validation
-        contract_errors = validate_contract(bench, task.contract)
+        # Anti-gaming: zero-variance timing arrays suggest memoization/caching
+        # (advisory — coarse timers can legitimately produce identical values)
+        if task.anti_gaming.bench_variance_check:
+            for warning in validate_bench_variance(bench):
+                event_log.anti_gaming_warning(
+                    it, "bench_variance", warning, candidate_index=ci,
+                )
+                progress.on_message(f"[agent]   WARNING (anti-gaming): {warning}")
+
+        # Anti-gaming: reject candidates that spin up background threads
+        # (opt-in; requires the bench harness to report thread_delta)
+        if task.anti_gaming.thread_count_check:
+            # bench.json is candidate-controlled: "meta" may be null/non-dict,
+            # and thread_delta may be non-numeric or non-finite ("3.0", NaN,
+            # Infinity, "lots"). Any of these must reject the candidate, never
+            # crash the run.
+            meta = bench.get("meta")
+            thread_delta = bench.get("thread_delta")
+            if thread_delta is None and isinstance(meta, dict):
+                thread_delta = meta.get("thread_delta")
+            if thread_delta is None:
+                event_log.anti_gaming_warning(
+                    it, "thread_count",
+                    "thread_count_check enabled but bench.json reports no thread_delta field",
+                    candidate_index=ci,
+                )
+            else:
+                try:
+                    parsed = float(thread_delta)
+                    if not math.isfinite(parsed):
+                        raise ValueError("non-finite thread_delta")
+                    thread_delta_int = int(parsed)
+                except (TypeError, ValueError, OverflowError):
+                    event_log.anti_gaming_warning(
+                        it, "thread_count",
+                        f"unparseable thread_delta value: {thread_delta!r}",
+                        candidate_index=ci,
+                    )
+                    progress.on_message(
+                        "[agent]   Thread check FAILED (unparseable thread_delta) — rejecting candidate"
+                    )
+                    # Keep the raw candidate-controlled value in "output" (see
+                    # the prompt-injection note near the benchmark-failure path
+                    # above), not in "description".
+                    return _reject("thread check failed", {
+                        "type": "anti_gaming",
+                        "description": (
+                            f"candidate {ci + 1} reported an unparseable thread_delta value"
+                        ),
+                        "output": str(thread_delta)[:3000],
+                    })
+                if thread_delta_int > task.anti_gaming.max_thread_delta:
+                    event_log.anti_gaming_warning(
+                        it, "thread_count",
+                        f"thread_delta={thread_delta_int} exceeds max_thread_delta={task.anti_gaming.max_thread_delta}",
+                        candidate_index=ci,
+                    )
+                    progress.on_message(
+                        f"[agent]   Thread check FAILED (delta={thread_delta_int}) — rejecting candidate"
+                    )
+                    return _reject("thread check failed", {
+                        "type": "anti_gaming",
+                        "description": (
+                            f"candidate {ci + 1} created {thread_delta_int} new thread(s) during "
+                            f"benchmarking (max allowed: {task.anti_gaming.max_thread_delta})"
+                        ),
+                        "output": "",
+                    })
+
+        # Contract validation (fast screens intentionally run warmup=0/repeats=2,
+        # so min-sampling enforcement applies only to full benchmarks)
+        contract_errors = validate_contract(
+            bench, task.contract, enforce_min_sampling=not use_fast,
+        )
         if contract_errors:
             progress.on_message(f"[agent]   Contract violation: {contract_errors}")
-            errors.append({
+            return _reject("contract violation", {
                 "type": "contract_violation",
                 "description": f"candidate {ci + 1}: {contract_errors[0]}",
                 "output": "",
             })
-            return BeamCandidate(
-                iteration=it, index=ci, blocks=blocks,
-                description=f"{desc} (contract violation)",
-                reasoning=reasoning,
-            ), errors
 
         val = metric_value(bench, task.benchmark.metric.name)
         progress.on_message(f"[agent]   {task.benchmark.metric.name} = {val:.6g}{screen_label}")
@@ -176,15 +319,11 @@ def evaluate_single_candidate(
             iteration=it, index=ci, blocks=blocks,
             description=desc, reasoning=reasoning, value=val,
         ), errors
-    finally:
-        restore_files(backed_up, ws)
-        shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def accept_best(
     ctx: AgentContext,
     candidates: list[BeamCandidate],
-    backup_dir: Path,
     use_fast: bool,
 ) -> tuple[bool, float | None, float | None]:
     """Find the best improving candidate and accept it (apply permanently, record history).
@@ -215,7 +354,18 @@ def accept_best(
 
     scored.sort(key=_cand_value, reverse=(task.benchmark.metric.mode == "maximize"))
 
-    for cand in scored:
+    # top_k is a per-iteration budget of *full re-benchmarks*, not a hard cap
+    # on candidates examined. The old scored[:top_k] slice discarded
+    # lower-ranked candidates before the loop, so a genuinely-improving
+    # candidate was never examined when the higher-ranked ones failed their
+    # full re-bench. Instead: non-improving candidates are skipped for free (the
+    # `continue` below), and the budget is charged only when a fast-screened
+    # candidate actually enters the full re-bench. top_k <= 0 means unlimited.
+    # Non-fast mode never re-benches, so it ignores the budget and accepts the
+    # first improving candidate as before.
+    rebench_budget = ctx.config.top_k
+
+    for idx, cand in enumerate(scored):
         assert cand.value is not None  # guaranteed by the `scored` filter above
         if not is_improvement(
             cand.value, ctx.best_value,
@@ -224,13 +374,43 @@ def accept_best(
         ):
             continue
 
-        # If we used fast screening, re-benchmark with full precision
+        # If we used fast screening, re-benchmark with full precision --
+        # in a temp workspace copy, same as the initial evaluation, so the
+        # re-bench can't leak candidate writes into the real workspace.
         if use_fast:
+            if ctx.config.top_k > 0 and rebench_budget <= 0:
+                remaining = sum(
+                    1 for c in scored[idx:]
+                    if is_improvement(
+                        _cand_value(c), ctx.best_value,
+                        task.benchmark.metric.mode,
+                        task.constraints.regression_tolerance,
+                    )
+                )
+                progress.on_message(
+                    f"[agent]   Re-bench budget (top_k={ctx.config.top_k}) exhausted; "
+                    f"{remaining} improving candidate(s) left unexamined"
+                )
+                break
+            rebench_budget -= 1
             progress.on_message("[agent]   Re-benchmarking top candidate with full precision...")
-            backed_up = backup_files(cand.blocks, ws, backup_dir)
-            try:
-                apply_patch(cand.blocks, ws)
-                _, bench_full = run_benchmark(task.benchmark.cmd, cwd=ws, fast_mode=False, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb, isolation=ctx.config.isolation)
+            with _patched_workspace_copy(ws, cand.blocks, "perflab_rebench_", task.out_dir) as temp_ws:
+                if task.build is not None:
+                    build_res = run_cmd(
+                        shlex.split(task.build.cmd), cwd=temp_ws,
+                        timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+                    )
+                    if build_res.returncode != task.build.expected_exit:
+                        progress.on_message(f"[agent]   Build failed on full re-bench (rc={build_res.returncode})")
+                        continue
+                _, bench_full = run_benchmark(
+                    task.benchmark.cmd, cwd=temp_ws, fast_mode=False,
+                    program_type=task.program_type,
+                    rlimit_as_gb=task.constraints.rlimit_as_gb,
+                    env_passthrough=task.constraints.env_passthrough,
+                    isolation=ctx.config.isolation,
+                    warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
+                )
                 contract_errors = validate_contract(bench_full, task.contract)
                 if contract_errors:
                     progress.on_message(f"[agent]   Contract violation on full re-bench: {contract_errors}")
@@ -238,8 +418,6 @@ def accept_best(
                 full_val = metric_value(bench_full, task.benchmark.metric.name)
                 progress.on_message(f"[agent]   Full benchmark: {task.benchmark.metric.name} = {full_val:.6g}")
                 cand.value = full_val
-            finally:
-                restore_files(backed_up, ws)
 
             # Re-check improvement with full benchmark value
             if not is_improvement(
@@ -257,16 +435,42 @@ def accept_best(
         progress.on_message(f"[agent]   ACCEPTING {cand.description} (value={cand.value:.6g})")
         apply_patch(cand.blocks, ws)
         delta = cand.value - ctx.baseline_val
-        speedup = calc_speedup(cand.value, ctx.baseline_val)
+        speedup = improvement_factor(cand.value, ctx.baseline_val, task.benchmark.metric.mode)
         ctx.best_value = cand.value
         ctx.best_iter = it
         cand.accepted = True
 
         event_log.candidate_accepted(it, cand.index, cand.value, delta, speedup, cand.description)
 
-        # Gaming detector: warn if suspiciously large speedup on first iteration
-        if it == 1 and speedup > 10.0:
-            progress.on_message(f"[agent] WARNING: suspiciously large speedup ({speedup:.1f}x) on first iteration — possible gaming")
+        # Gaming detector: a single-iteration jump beyond the configured
+        # threshold is suspicious. improvement_factor is mode-aware (>1 always
+        # means better), unlike calc_speedup, which for minimize-mode metrics
+        # shrinks toward 0 on improvement and could never cross a threshold.
+        gain = improvement_factor(cand.value, old_best, task.benchmark.metric.mode)
+        threshold = task.anti_gaming.gaming_speedup_threshold
+        if gain > threshold:
+            gaming_msg = (
+                f"suspiciously large improvement ({gain:.1f}x > {threshold:g}x "
+                f"threshold) in a single iteration — possible benchmark gaming"
+            )
+            progress.on_message(f"[agent] WARNING: {gaming_msg}")
+            event_log.anti_gaming_warning(
+                it, "speedup_threshold", gaming_msg, candidate_index=cand.index,
+            )
+
+        # Zero-metric gaming: improvement_factor returns a neutral 1.0 when a
+        # value is 0, so the gain>threshold check above never fires for a
+        # minimize-mode candidate reporting exactly 0.0 -- a stubbed/no-op
+        # kernel, the most extreme gaming case. Flag it explicitly.
+        if task.benchmark.metric.mode == "minimize" and cand.value == 0.0:
+            zero_msg = (
+                f"candidate reports zero {task.benchmark.metric.name} — degenerate "
+                f"value, almost certainly benchmark gaming"
+            )
+            progress.on_message(f"[agent] WARNING: {zero_msg}")
+            event_log.anti_gaming_warning(
+                it, "zero_metric", zero_msg, candidate_index=cand.index,
+            )
 
         # Track secondary metric if available
         sec_val = None
@@ -280,7 +484,7 @@ def accept_best(
                 logger.debug("Secondary metric extraction failed for iteration %d", it, exc_info=True)
         ctx.history.append(make_history_entry(
             it, cand.description, cand.value, ctx.baseline_val,
-            accepted=True,
+            accepted=True, mode=task.benchmark.metric.mode,
             reasoning=cand.reasoning or None,
             secondary_value=sec_val,
         ))
@@ -301,11 +505,9 @@ def accept_best(
 
         accepted_value = cand.value
         rel_improvement = abs(cand.value - old_best) / abs(old_best) if old_best != 0 else 0
-        shutil.rmtree(backup_dir, ignore_errors=True)
         return (True, rel_improvement, accepted_value)
 
     # No candidate improved
-    shutil.rmtree(backup_dir, ignore_errors=True)
     progress.on_message("[agent]   No improving candidate this iteration")
     best_desc = scored[0].description if scored else "no valid candidates"
     # Explicit None check: a genuine 0.0 metric value must be recorded, not
@@ -314,7 +516,7 @@ def accept_best(
     reject_val = best_val if best_val is not None else ctx.best_value
     ctx.history.append(make_history_entry(
         it, f"no improvement ({best_desc})", reject_val, ctx.baseline_val,
-        accepted=False,
+        accepted=False, mode=task.benchmark.metric.mode,
     ))
     return (False, None, None)
 
@@ -326,6 +528,12 @@ def reprofile_after_accept(ctx: AgentContext, accepted_value: float) -> None:
     candidate's value (captured before any auto-tune sweep runs), used as the
     drift-check baseline -- intentionally distinct from ctx.best_value, which
     the auto-tune phase may have already moved past this candidate's value.
+
+    When drift triggers a baseline re-measure, the drift benchmark's own
+    measurement of the current workspace (drift_val) is passed through as
+    current_value so remeasure_baseline can re-anchor ctx.best_value under the
+    same conditions -- keeping both sides of the final speedup consistent (see
+    remeasure_baseline's both-sides-same-conditions invariant) with no extra run.
     """
     task = ctx.task
     ws = ctx.ws
@@ -341,11 +549,93 @@ def reprofile_after_accept(ctx: AgentContext, accepted_value: float) -> None:
     if ctx.accepted_count % 3 == 0:
         try:
             progress.on_message(f"[agent]   Drift check (accepted #{ctx.accepted_count})...")
-            _, drift_bench = run_benchmark(task.benchmark.cmd, cwd=ws, fast_mode=False, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb, isolation=ctx.config.isolation)
+            _, drift_bench = run_benchmark(task.benchmark.cmd, cwd=ws, fast_mode=False, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb, env_passthrough=task.constraints.env_passthrough, isolation=ctx.config.isolation, warmup=task.benchmark.warmup, repeats=task.benchmark.repeats)
             drift_val = metric_value(drift_bench, task.benchmark.metric.name)
             drift_pct = abs(drift_val - accepted_value) / abs(accepted_value) * 100 if accepted_value else 0
             event_log.drift_check(it, drift_val, accepted_value, drift_pct)
             if drift_pct > 5:
-                progress.on_message(f"[agent]   WARNING: drift of {drift_pct:.1f}% detected")
+                progress.on_message(f"[agent]   WARNING: drift of {drift_pct:.1f}% detected — re-measuring baseline")
+                remeasure_baseline(ctx, current_value=drift_val)
         except Exception as exc:  # noqa: BLE001 -- best-effort periodic sanity check, must not abort the run
             progress.on_message(f"[agent]   Drift check failed: {exc}")
+
+
+def remeasure_baseline(ctx: AgentContext, current_value: float | None = None) -> None:
+    """Re-benchmark the baseline program under current machine conditions.
+
+    Machine drift (thermal throttling, background load) makes the run-start
+    baseline stale: speedups computed against it compare measurements taken
+    under different conditions. Accepted patches can only touch
+    edit_policy.allowed_paths, and snapshots/baseline.zip holds exactly those
+    files as of the baseline run, so extracting the zip over a temp copy of
+    the current workspace reconstructs the baseline program. Updates
+    ctx.baseline_val (used by subsequent history entries and the final
+    report); earlier history entries keep the speedups they were recorded
+    with. Best-effort: keeps the original baseline on any failure.
+
+    Invariant: final speedup = baseline/best must compare both sides under the
+    SAME machine conditions. Re-measuring only the baseline would leave
+    ctx.best_value at its old-conditions value, so the ratio could show <1x for
+    a genuinely good run (or be inflated the other way). When ``current_value``
+    is given -- the drift-check measurement of the current workspace taken
+    moments ago under these same conditions -- ctx.best_value is re-anchored to
+    it, keeping both sides consistent without any extra benchmark run.
+    """
+    task = ctx.task
+    progress = ctx.progress
+    baseline_zip = ctx.rp.run_dir / "snapshots" / "baseline.zip"
+    if not baseline_zip.exists():
+        progress.on_message("[agent]   No baseline snapshot found; keeping original baseline")
+        return
+    temp_dir = Path(tempfile.mkdtemp(prefix="perflab_baseline_rebench_"))
+    try:
+        temp_ws = temp_dir / "ws"
+        shutil.copytree(
+            ctx.ws, temp_ws, dirs_exist_ok=True,
+            ignore=workspace_copy_ignore(ctx.ws, task.out_dir),
+        )
+        with zipfile.ZipFile(baseline_zip) as zf:
+            zf.extractall(temp_ws)
+        if task.build is not None:
+            build_res = run_cmd(
+                shlex.split(task.build.cmd), cwd=temp_ws,
+                timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+            )
+            if build_res.returncode != task.build.expected_exit:
+                progress.on_message(
+                    f"[agent]   Baseline re-measure build failed (rc={build_res.returncode}); keeping original baseline"
+                )
+                return
+        _, bench = run_benchmark(
+            task.benchmark.cmd, cwd=temp_ws, fast_mode=False,
+            program_type=task.program_type,
+            rlimit_as_gb=task.constraints.rlimit_as_gb,
+            env_passthrough=task.constraints.env_passthrough,
+            isolation=ctx.config.isolation,
+            warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
+        )
+        new_baseline = metric_value(bench, task.benchmark.metric.name)
+    except Exception as exc:  # noqa: BLE001 -- best-effort recalibration, must not abort the run
+        progress.on_message(f"[agent]   Baseline re-measure failed: {exc}; keeping original baseline")
+        return
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    old_baseline = ctx.baseline_val
+    ctx.baseline_val = new_baseline
+    if current_value is not None:
+        best_old = ctx.best_value
+        ctx.best_value = current_value
+        ctx.event_log.baseline_remeasured(
+            ctx.iteration, old_baseline, new_baseline,
+            best_old=best_old, best_new=current_value,
+        )
+        progress.on_message(
+            f"[agent]   Baseline re-measured: {old_baseline:.6g} -> {new_baseline:.6g}; "
+            f"best re-anchored under same conditions: {best_old:.6g} -> {current_value:.6g}"
+        )
+    else:
+        ctx.event_log.baseline_remeasured(ctx.iteration, old_baseline, new_baseline)
+        progress.on_message(
+            f"[agent]   Baseline re-measured: {old_baseline:.6g} -> {new_baseline:.6g}"
+        )

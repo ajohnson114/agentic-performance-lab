@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from perflab.tools.shell import run_cmd
@@ -51,8 +52,14 @@ class TMAResult:
         }
 
 
+@lru_cache(maxsize=1)
 def is_tma_available() -> bool:
-    """Check if TMA metrics are available on this system."""
+    """Check if TMA metrics are available on this system.
+
+    Cached: called once per profiling pass and ``perf list`` spawns a
+    subprocess. Tests monkeypatching run_cmd must call
+    ``is_tma_available.cache_clear()``.
+    """
     if shutil.which("perf") is None:
         return False
     # Check for TopdownL1 metric group
@@ -60,26 +67,39 @@ def is_tma_available() -> bool:
     return "TopdownL1" in res.stdout or "topdown" in res.stdout.lower()
 
 
-def collect_tma(bench_cmd: str, cwd: Path, output_path: Path) -> TMAResult | None:
+def collect_tma(
+    bench_cmd: str, cwd: Path, output_path: Path,
+    perf_stat_text: str | None = None,
+) -> TMAResult | None:
     """Run perf stat with TMA metrics and parse results.
 
     Tries TopdownL1 metric group first, falls back to raw counter estimation.
+
+    ``perf_stat_text`` is the output of a perf stat run the caller already
+    executed (with -M TopdownL1 merged in when available). When provided,
+    it is parsed instead of launching a dedicated -M benchmark run -- only
+    the raw-counter fallback run remains, and only if the parse fails.
     """
     cmd_parts = shlex.split(bench_cmd)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Try metric group first
-    stat_cmd = [
-        "perf", "stat", "-M", "TopdownL1",
-        "-o", str(output_path), "--",
-    ] + cmd_parts
-    run_cmd(stat_cmd, cwd=cwd)
-
-    if output_path.exists():
-        text = output_path.read_text(encoding="utf-8", errors="replace")
-        result = _parse_tma_output(text)
+    if perf_stat_text is not None:
+        result = _parse_tma_output(perf_stat_text)
         if result is not None:
             return result
+    else:
+        # Try metric group first
+        stat_cmd = [
+            "perf", "stat", "-M", "TopdownL1",
+            "-o", str(output_path), "--",
+        ] + cmd_parts
+        run_cmd(stat_cmd, cwd=cwd)
+
+        if output_path.exists():
+            text = output_path.read_text(encoding="utf-8", errors="replace")
+            result = _parse_tma_output(text)
+            if result is not None:
+                return result
 
     # Fallback: use topdown-* events (perf >= 5.10)
     fallback_events = (
@@ -115,17 +135,18 @@ def _parse_tma_output(text: str) -> TMAResult | None:
         ...
     """
     # Match per-line to avoid cross-line false matches.
-    # Forward: "23.4%  frontend bound"
+    # Forward: "23.4%  frontend bound" (modern perf emits "tma_frontend_bound")
     # Reversed: "frontend bound:  23.4%"
+    _tma = r"(?:tma[\s_-]+)?"
     line_patterns = [
-        ("frontend", re.compile(r"([\d.]+)\s*%?\s*frontend[\s_-]*bound", re.IGNORECASE)),
-        ("frontend", re.compile(r"frontend[\s_-]*bound\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
-        ("backend", re.compile(r"([\d.]+)\s*%?\s*backend[\s_-]*bound", re.IGNORECASE)),
-        ("backend", re.compile(r"backend[\s_-]*bound\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
-        ("speculation", re.compile(r"([\d.]+)\s*%?\s*bad[\s_-]*speculation", re.IGNORECASE)),
-        ("speculation", re.compile(r"bad[\s_-]*speculation\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
-        ("retiring", re.compile(r"([\d.]+)\s*%?\s*retiring", re.IGNORECASE)),
-        ("retiring", re.compile(r"retiring\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
+        ("frontend", re.compile(r"([\d.]+)\s*%?\s*" + _tma + r"frontend[\s_-]*bound", re.IGNORECASE)),
+        ("frontend", re.compile(_tma + r"frontend[\s_-]*bound\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
+        ("backend", re.compile(r"([\d.]+)\s*%?\s*" + _tma + r"backend[\s_-]*bound", re.IGNORECASE)),
+        ("backend", re.compile(_tma + r"backend[\s_-]*bound\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
+        ("speculation", re.compile(r"([\d.]+)\s*%?\s*" + _tma + r"bad[\s_-]*speculation", re.IGNORECASE)),
+        ("speculation", re.compile(_tma + r"bad[\s_-]*speculation\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
+        ("retiring", re.compile(r"([\d.]+)\s*%?\s*" + _tma + r"retiring", re.IGNORECASE)),
+        ("retiring", re.compile(_tma + r"retiring\s*[:\s]+\s*([\d.]+)\s*%?", re.IGNORECASE)),
     ]
 
     values: dict[str, float] = {}
@@ -274,12 +295,19 @@ def _detect_cpu_vendor() -> str:
 
 def collect_tma_level2(
     bench_cmd: str, cwd: Path, output_path: Path,
+    perf_stat_text: str | None = None,
 ) -> TMALevel2Result | None:
     """Collect Level 2/3 TMA metrics using toplev (Intel) or perf events (AMD).
 
     Requires:
     - Intel: toplev from pmu-tools (pip install pmu-tools or git clone)
     - AMD: perf with Zen 3+ topdown event support
+
+    ``perf_stat_text`` is the output of a perf stat run the caller already
+    executed. On AMD -- where the level-2 estimate needs only generic cache
+    events the caller's run can carry -- it is parsed directly instead of
+    launching a dedicated benchmark run. The Intel toplev path genuinely
+    needs its own run (toplev drives perf itself across event groups).
     """
     vendor = _detect_cpu_vendor()
 
@@ -291,6 +319,11 @@ def collect_tma_level2(
 
     # AMD fallback: use perf stat with Zen topdown-like events
     if vendor == "amd":
+        if perf_stat_text is not None:
+            # The cache events either were in the caller's run or the
+            # hardware doesn't report them; a dedicated re-run of the same
+            # events cannot do better, so this path never launches one.
+            return _parse_amd_tma(perf_stat_text)
         return _collect_amd_tma(bench_cmd, cwd, output_path)
 
     return None

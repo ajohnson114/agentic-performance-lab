@@ -174,6 +174,38 @@ class TestOllamaProviderRetries:
         assert mock_urlopen.call_count == 2
         mock_sleep.assert_called_once_with(1.0)
 
+    def test_complete_usage_with_eval_count_only_omits_prompt_and_total(
+        self, mock_urlopen, mock_sleep
+    ):
+        # KV-cache reuse: Ollama may omit prompt_eval_count while still
+        # reporting eval_count. completion_tokens must still be populated,
+        # and total_tokens must be omitted (not silently computed as 0 + eval)
+        # since only one component is known.
+        body = {
+            "message": {"content": "pong"},
+            "done_reason": "stop",
+            "eval_count": 5,
+        }
+        mock_urlopen.return_value = _ollama_response(body)
+        result = OllamaProvider().complete([Message("user", "ping")])
+        assert result.usage == {"completion_tokens": 5}
+
+    def test_complete_usage_with_prompt_eval_count_only_omits_total(
+        self, mock_urlopen, mock_sleep
+    ):
+        # The reverse asymmetry: prompt_eval_count present, eval_count absent.
+        # Previously this defaulted the missing eval_count to 0 and still
+        # emitted a (wrong, understated) total_tokens; total must now be
+        # omitted since completion_tokens is unknown.
+        body = {
+            "message": {"content": "pong"},
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+        }
+        mock_urlopen.return_value = _ollama_response(body)
+        result = OllamaProvider().complete([Message("user", "ping")])
+        assert result.usage == {"prompt_tokens": 7}
+
     def test_complete_http_404_raises_without_retry(self, mock_urlopen, mock_sleep):
         mock_urlopen.side_effect = _http_error(404)
         with pytest.raises(urllib.error.HTTPError):
@@ -209,6 +241,26 @@ class TestOllamaProviderRetries:
         assert out == ["po", "ng"]
         assert mock_urlopen.call_count == 2
         mock_sleep.assert_called_once_with(1.0)
+
+    def test_complete_retries_after_bare_timeout_error(self, mock_urlopen, mock_sleep):
+        # urllib's do_open() only wraps h.request() failures in URLError; a
+        # timeout blocked in getresponse() (waiting on Ollama to generate)
+        # surfaces as a raw TimeoutError/socket.timeout instead.
+        mock_urlopen.side_effect = [
+            TimeoutError("timed out"),
+            _ollama_response(_OLLAMA_BODY),
+        ]
+        result = OllamaProvider().complete([Message("user", "ping")])
+        assert result.content == "pong"
+        assert mock_urlopen.call_count == 2
+        mock_sleep.assert_called_once_with(1.0)
+
+    def test_complete_raises_after_timeout_retries_exhausted(self, mock_urlopen, mock_sleep):
+        mock_urlopen.side_effect = TimeoutError("still stalled")
+        with pytest.raises(TimeoutError):
+            OllamaProvider().complete([Message("user", "ping")])
+        assert mock_urlopen.call_count == 3  # initial + 2 retries
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [1.0, 4.0]
 
     def test_stream_never_retries_after_first_chunk(self, mock_urlopen, mock_sleep):
         def lines():

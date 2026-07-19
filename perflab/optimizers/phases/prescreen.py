@@ -3,9 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from perflab.optimizers.patch import SearchReplaceBlock, apply_patch, validate_patch
+from perflab.optimizers.patch import (
+    SearchReplaceBlock,
+    apply_patch,
+    validate_patch,
+    workspace_copy_ignore,
+)
 from perflab.runners.correctness import run_correctness
-from perflab.task_spec import TaskSpec
+from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S, TaskSpec
 from perflab.tools.isolation import IsolationPolicy
 
 if TYPE_CHECKING:
@@ -54,7 +59,12 @@ def _prescreen_candidate(
     try:
         temp_dir = Path(tempfile.mkdtemp(prefix=f"perflab_prescreen_{ci}_"))
         temp_ws = temp_dir / "ws"
-        _shutil.copytree(ws, temp_ws, dirs_exist_ok=True)
+        # Skip out_dir contents (out/runs grows every iteration) so the
+        # per-candidate copy doesn't get slower as the run progresses.
+        _shutil.copytree(
+            ws, temp_ws, dirs_exist_ok=True,
+            ignore=workspace_copy_ignore(ws, task.out_dir),
+        )
 
         # Apply patch to temp copy
         apply_patch(blocks, temp_ws)
@@ -64,7 +74,11 @@ def _prescreen_candidate(
         # preexec_fn + fork() in a multithreaded process is undefined behavior.
         if task.build is not None:
             import shlex
-            bres = run_cmd(shlex.split(task.build.cmd), cwd=temp_ws, timeout_s=120, skip_preexec=True)
+            bres = run_cmd(
+                shlex.split(task.build.cmd), cwd=temp_ws,
+                timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+                skip_preexec=True,
+            )
             if bres.returncode != task.build.expected_exit:
                 result["error"] = {
                     "type": "build",
@@ -79,7 +93,9 @@ def _prescreen_candidate(
             program_type=task.program_type,
             rlimit_as_gb=task.constraints.rlimit_as_gb,
             skip_preexec=True,
+            env_passthrough=task.constraints.env_passthrough,
             isolation=isolation,
+            accuracy_tolerance=task.constraints.accuracy_tolerance,
         )
         if cres.returncode != task.correctness.expected_exit:
             result["error"] = {

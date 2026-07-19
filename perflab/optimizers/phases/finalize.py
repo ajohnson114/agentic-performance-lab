@@ -5,7 +5,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from perflab.analyzers.metrics_rollup import calc_speedup
+from perflab.analyzers.metrics_rollup import improvement_factor
 from perflab.memory.run_store import RunStore, load_profiler_summaries
 from perflab.optimizers.history import make_history_entry
 from perflab.optimizers.progress import fmt_elapsed, usage_input_tokens, usage_output_tokens
@@ -85,7 +85,7 @@ def generate_optimization_summary(
     best_value = ctx.best_value
     accepted_patches = ctx.accepted_patches
 
-    speedup = calc_speedup(best_value, baseline_val)
+    speedup = improvement_factor(best_value, baseline_val, task.benchmark.metric.mode)
     patches_desc = []
     for p in accepted_patches:
         patches_desc.append(f"- Iter {p['iteration']}: {p['description']}")
@@ -151,16 +151,18 @@ def maybe_early_stop(ctx: AgentContext, it: int) -> bool:
     ctx.event_log.early_stop(it, reason)
     ctx.history.append(make_history_entry(
         it, f"early stop: {reason}", ctx.best_value, ctx.baseline_val,
-        accepted=False,
+        accepted=False, mode=ctx.task.benchmark.metric.mode,
     ))
     return True
 
 
-def run(ctx: AgentContext) -> None:
+def run(ctx: AgentContext, status: str = "completed") -> None:
     """Finalize phase: optimization summary, reports, and run-completion bookkeeping.
 
     Runs after the iteration loop exits. Mutates ctx.total_llm_calls/latency/
-    tokens (from the optimization-summary LLM call).
+    tokens (from the optimization-summary LLM call). ``status`` is recorded in
+    the run meta -- run_agent passes "failed" when finalizing after a crash so
+    partial runs aren't reported as completed.
     """
     task = ctx.task
     rp = ctx.rp
@@ -233,6 +235,7 @@ def run(ctx: AgentContext) -> None:
         llm_stats=llm_stats,
         target_hardware=task.target_hardware,
         detected_hardware=detected_hw,
+        hardware_mismatch=ctx.hardware_mismatch,
         build_cmd=task.build.cmd if task.build else None,
         secondary_metric_name=task.benchmark.secondary_metric.name if task.benchmark.secondary_metric else None,
         secondary_metric_mode=task.benchmark.secondary_metric.mode if task.benchmark.secondary_metric else None,
@@ -242,7 +245,7 @@ def run(ctx: AgentContext) -> None:
 
     # Update meta with completion status
     RunStore(task.out_dir).update_meta(rp.run_id, {
-        "status": "completed",
+        "status": status,
         "best_value": ctx.best_value,
         "baseline_value": ctx.baseline_val,
         "completed_at": time.strftime("%Y%m%d-%H%M%S"),

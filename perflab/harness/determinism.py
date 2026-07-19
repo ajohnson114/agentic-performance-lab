@@ -9,6 +9,17 @@ The fix: run the kernel multiple times with identical inputs and verify outputs
 match with torch.equal. Also zero the output buffer before each run to catch
 buffer reuse. Run with different inputs to catch no-ops.
 
+Tolerance split: the same-inputs reproducibility check (Phase 1) runs the SAME
+binary twice and asks whether it produces the SAME bits -- that is not an
+accuracy question, so its default tolerance is a fixed strict 1e-5, never the
+task-declared PERFLAB_ACCURACY_TOLERANCE. Otherwise a task that legitimately
+loosens tolerance for e.g. fp16 math (say 1e-2) would let run-to-run garbage
+from uninitialized buffers slip past the very check built to catch it. The
+optional reference_fn comparison (Phase 3) is a genuine accuracy question --
+kernel output vs a reference implementation -- so its default DOES track the
+task tolerance. An explicit atol/rtol passed by the caller (a task author's
+deliberate choice in tests.py) always wins for both.
+
 Usage in tests.py:
     from perflab.harness.determinism import assert_deterministic
 
@@ -31,8 +42,8 @@ def assert_deterministic(
     input_factory: Callable[[], tuple],
     reference_fn: Callable[..., Any] | None = None,
     n_runs: int = 3,
-    atol: float = 1e-5,
-    rtol: float = 1e-5,
+    atol: float | None = None,
+    rtol: float | None = None,
 ) -> None:
     """Verify kernel produces deterministic, correct output across multiple runs.
 
@@ -41,13 +52,29 @@ def assert_deterministic(
         input_factory: Callable that returns a tuple of fresh input tensors.
         reference_fn: Optional reference implementation for correctness check.
         n_runs: Number of times to run with identical inputs (default 3).
-        atol: Absolute tolerance for comparison.
-        rtol: Relative tolerance for comparison.
+        atol: Absolute tolerance for comparison. When passed explicitly it wins
+            for every comparison. When left as None the default is split by
+            purpose: the same-inputs reproducibility check (Phase 1) uses a
+            fixed strict 1e-5, while the reference comparison (Phase 3) uses the
+            task's declared accuracy tolerance (PERFLAB_ACCURACY_TOLERANCE, or
+            1e-5). See the module docstring for the rationale.
+        rtol: Relative tolerance for comparison (same default resolution).
 
     Raises:
         AssertionError if outputs differ across runs or diverge from reference.
     """
     import torch
+
+    from perflab.harness.tolerance import env_accuracy_tolerance
+
+    # Reproducibility (same binary, same inputs): a fixed strict default that
+    # never inherits the loose task tolerance. Explicit caller args still win.
+    det_atol = atol if atol is not None else 1e-5
+    det_rtol = rtol if rtol is not None else 1e-5
+    # Reference correctness (kernel vs reference impl): a genuine accuracy
+    # question, so its default tracks the task-declared tolerance.
+    ref_atol = atol if atol is not None else env_accuracy_tolerance(1e-5)
+    ref_rtol = rtol if rtol is not None else env_accuracy_tolerance(1e-5)
 
     # --- Phase 1: Same inputs, multiple runs → outputs must be identical ---
     inputs = input_factory()
@@ -63,11 +90,13 @@ def assert_deterministic(
     # Compare all runs against the first
     for i in range(1, len(outputs)):
         if isinstance(outputs[0], torch.Tensor):
-            if not torch.allclose(outputs[0], outputs[i], atol=atol, rtol=rtol):
+            if not torch.allclose(
+                outputs[0], outputs[i], atol=det_atol, rtol=det_rtol
+            ):
                 max_diff = (outputs[0] - outputs[i]).abs().max().item()
                 raise AssertionError(
                     f"Non-deterministic output: run 0 vs run {i} differ "
-                    f"(max_diff={max_diff:.2e}, atol={atol}, rtol={rtol}). "
+                    f"(max_diff={max_diff:.2e}, atol={det_atol}, rtol={det_rtol}). "
                     f"Kernel may be reading uninitialized memory or shared "
                     f"memory overflow."
                 )
@@ -105,11 +134,13 @@ def assert_deterministic(
         if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
             actual_f = _to_float(actual)
             expected_f = _to_float(expected)
-            if not torch.allclose(actual_f, expected_f, atol=atol, rtol=rtol):
+            if not torch.allclose(
+                actual_f, expected_f, atol=ref_atol, rtol=ref_rtol
+            ):
                 max_diff = (actual_f - expected_f).abs().max().item()
                 raise AssertionError(
                     f"Correctness failure against reference: max_diff={max_diff:.2e} "
-                    f"(atol={atol}, rtol={rtol})"
+                    f"(atol={ref_atol}, rtol={ref_rtol})"
                 )
 
 

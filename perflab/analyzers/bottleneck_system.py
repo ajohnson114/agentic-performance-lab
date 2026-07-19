@@ -193,6 +193,27 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "Use float16 / channels_last for faster MPS kernel dispatch",
                 ],
             ))
+        elif gpu_us == 0 and not summary.get("top_gpu_kernels"):
+            # No GPU kernels were recorded at all (e.g. torch.device("cpu") on
+            # a GPU-less machine, the default for any pytorch task without a
+            # GPU). This is not a dispatch bottleneck -- there is no GPU to
+            # underutilize -- so it gets its own low-confidence, informational
+            # finding instead of the high-confidence GPU-underutilized one.
+            findings.append(BottleneckDiagnosis(
+                rank=0,
+                bottleneck="CPU-only run (no GPU activity captured)",
+                root_cause=(
+                    "The PyTorch profiler recorded zero GPU kernel time and no GPU kernels "
+                    "at all -- this run executed entirely on CPU. This is not a GPU "
+                    "underutilization issue; there is no GPU workload to optimize"
+                ),
+                confidence="low",
+                suggested_actions=[
+                    "Confirm this is intentional (CPU-only environment or explicit CPU device)",
+                    "If a GPU is expected, check torch.cuda.is_available() and device placement",
+                    "Focus on CPU-side optimizations: vectorization, batching, reducing Python overhead",
+                ],
+            ))
         elif ratio < thresholds.gpu_cpu_ratio_low:
             findings.append(BottleneckDiagnosis(
                 rank=0,

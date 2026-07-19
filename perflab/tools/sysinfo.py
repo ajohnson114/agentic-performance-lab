@@ -158,24 +158,9 @@ def collect_system_info() -> dict[str, Any]:
         pass
 
     # C++ compiler
-    try:
-        result = subprocess.run(
-            ["g++", "--version"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            info["cpp_compiler"] = result.stdout.splitlines()[0].strip()
-        else:
-            result = subprocess.run(
-                ["c++", "--version"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                info["cpp_compiler"] = result.stdout.splitlines()[0].strip()
-    except FileNotFoundError:
-        pass
-    except (OSError, subprocess.SubprocessError):
-        logger.warning("C++ compiler detection failed", exc_info=True)
+    cpp_compiler = detect_cpp_compiler()
+    if cpp_compiler:
+        info["cpp_compiler"] = cpp_compiler
 
     # OpenMP version
     try:
@@ -207,6 +192,31 @@ def collect_system_info() -> dict[str, Any]:
         logger.warning("CPU ISA feature detection failed", exc_info=True)
 
     return info
+
+
+def detect_cpp_compiler() -> str | None:
+    """Detect the available C++ compiler, preferring g++ and falling back to c++.
+
+    Each candidate gets its own try/except. They used to share one try block
+    with the c++ fallback nested inside the g++ branch's ``else``, so a
+    missing g++ raised FileNotFoundError straight out of the block (skipping
+    the c++ probe entirely) -- the fallback only ever ran when g++ was
+    present but exited nonzero. Returns None if neither is found/usable.
+    """
+    for compiler in ("g++", "c++"):
+        try:
+            result = subprocess.run(
+                [compiler, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except FileNotFoundError:
+            continue
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("%s version check failed", compiler, exc_info=True)
+            continue
+        if result.returncode == 0:
+            return result.stdout.splitlines()[0].strip()
+    return None
 
 
 def detect_cpu_isa_features() -> dict:

@@ -18,7 +18,9 @@ Levels:
   none       -- current behavior (rlimits only). The compiled-in default.
   restricted -- bwrap: read-only bind of /usr, /lib, the venv, and any
                 detected CUDA/driver paths; read-write bind of the calling
-                workspace only; --unshare-net unless network=True;
+                workspace only; --unshare-net unless network=True (in which
+                case /etc/resolv.conf, /etc/ssl/certs, and /etc/hosts are
+                also read-only bound, so DNS/TLS work inside the sandbox);
                 --die-with-parent. Falls back to 'none' (with a logged
                 warning) if bwrap is missing, not on Linux, or user
                 namespaces are unusable.
@@ -70,6 +72,20 @@ _CUDA_PATH_GLOBS: tuple[str, ...] = (
     "/usr/lib/x86_64-linux-gnu/libcuda*",
     "/usr/lib64/libcuda*",
     "/usr/lib/nvidia*",
+)
+
+# DNS/TLS config, read-only bound only when a task's constraints.network is
+# true (i.e. --unshare-net is skipped -- see wrap_command). None of
+# _RO_BIND_CANDIDATES cover /etc, so without these a network-allowed task
+# could still reach the network namespace-wise but couldn't resolve hostnames
+# or verify TLS certs from inside the sandbox. Bound as-is (no symlink
+# resolution): on distros where /etc/ssl/certs is itself a symlink to another
+# directory, --ro-bind on the symlink path still exposes whatever it points
+# at, the same way it would outside the sandbox.
+_NETWORK_RO_BIND_CANDIDATES: tuple[str, ...] = (
+    "/etc/resolv.conf",
+    "/etc/ssl/certs",
+    "/etc/hosts",
 )
 
 
@@ -231,6 +247,11 @@ def _readonly_bind_paths() -> list[Path]:
     return paths
 
 
+def _network_bind_paths() -> list[Path]:
+    """Existing DNS/TLS config paths from _NETWORK_RO_BIND_CANDIDATES."""
+    return [Path(p) for p in _NETWORK_RO_BIND_CANDIDATES if Path(p).exists()]
+
+
 def _nvidia_device_paths() -> list[str]:
     return sorted(glob.glob("/dev/nvidia*"))
 
@@ -306,6 +327,14 @@ def wrap_command(cmd: list[str], policy: IsolationPolicy) -> list[str]:
 
     for p in _readonly_bind_paths():
         args += ["--ro-bind", str(p), str(p)]
+
+    if policy.network:
+        # Task explicitly allowed network access (constraints.network: true),
+        # so --unshare-net is skipped below -- bind the DNS/TLS config
+        # candidate code needs to actually use that network from inside the
+        # sandbox (see _NETWORK_RO_BIND_CANDIDATES).
+        for p in _network_bind_paths():
+            args += ["--ro-bind", str(p), str(p)]
 
     args += ["--proc", "/proc", "--dev", "/dev"]
     for dev in _nvidia_device_paths():

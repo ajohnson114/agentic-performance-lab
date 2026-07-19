@@ -4,10 +4,12 @@ from __future__ import annotations
 from perflab.analyzers.bottleneck_analyzer import (
     AnalysisThresholds,
     _analyze_ebpf,
+    _analyze_gpu_attribution,
     _analyze_lock_contention,
     _analyze_memray,
     _analyze_power,
     _analyze_thread_sched,
+    _analyze_torch_trace,
     diagnose_bottlenecks,
 )
 
@@ -186,6 +188,91 @@ def test_analyze_power_no_throttle():
     ]
     summary = {"gpu_power": {"power_samples": samples}}
     findings = _analyze_power(summary, _default_thresholds())
+    assert findings == []
+
+
+# -- torch trace: CPU-only vs MPS vs real-GPU-low-ratio ----------------------
+
+def test_analyze_torch_trace_cpu_only_no_gpu_underutilized_finding():
+    """A genuine CPU-only run (no GPU present/used) must not be diagnosed as
+    'GPU underutilized' -- there's no GPU to underutilize."""
+    summary = {
+        "cpu_vs_gpu": {
+            "total_cpu_op_us": 50_000.0,
+            "total_gpu_kernel_us": 0.0,
+            "ratio": 0.0,
+        },
+    }
+    findings = _analyze_torch_trace(summary, device="cpu", thresholds=_default_thresholds())
+    assert not any("underutilized" in f.bottleneck.lower() for f in findings)
+    assert any("cpu-only" in f.bottleneck.lower() or "cpu only" in f.bottleneck.lower() for f in findings)
+    cpu_only = next(f for f in findings if "cpu-only" in f.bottleneck.lower() or "cpu only" in f.bottleneck.lower())
+    assert cpu_only.confidence == "low"
+
+
+def test_analyze_torch_trace_cpu_only_no_device_specified():
+    """device=None (device unknown) with zero GPU kernels should also be treated
+    as CPU-only, not GPU-underutilized -- the common case for a GPU-less machine."""
+    summary = {
+        "cpu_vs_gpu": {
+            "total_cpu_op_us": 50_000.0,
+            "total_gpu_kernel_us": 0.0,
+            "ratio": 0.0,
+        },
+    }
+    findings = _analyze_torch_trace(summary, device=None, thresholds=_default_thresholds())
+    assert not any("underutilized" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_mps_timing_unavailable_unaffected():
+    """MPS's existing 'timing unavailable' explanation must keep working."""
+    summary = {
+        "cpu_vs_gpu": {
+            "total_cpu_op_us": 50_000.0,
+            "total_gpu_kernel_us": 0.0,
+            "ratio": 0.0,
+        },
+    }
+    findings = _analyze_torch_trace(summary, device="mps", thresholds=_default_thresholds())
+    assert any("timing unavailable" in f.bottleneck.lower() for f in findings)
+    assert not any("cpu-only" in f.bottleneck.lower() or "cpu only" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_real_gpu_low_ratio_still_flagged():
+    """A real GPU with nonzero kernel time but a low ratio is still a genuine
+    CPU-dispatch bottleneck and must still be flagged 'GPU underutilized'."""
+    summary = {
+        "cpu_vs_gpu": {
+            "total_cpu_op_us": 100_000.0,
+            "total_gpu_kernel_us": 10_000.0,  # ratio = 0.1 < gpu_cpu_ratio_low (0.5)
+            "ratio": 0.1,
+        },
+        "top_gpu_kernels": [{"name": "sgemm_kernel", "total_us": 10_000.0, "count": 5, "pct": 100.0}],
+    }
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert any("underutilized" in f.bottleneck.lower() for f in findings)
+    underutilized = next(f for f in findings if "underutilized" in f.bottleneck.lower())
+    assert underutilized.confidence == "high"
+
+
+# -- GPU attribution: findings must not be dropped when correlations missing -
+
+def test_analyze_gpu_attribution_without_correlations_still_yields_findings():
+    """nsys can omit cpu_gpu_correlations (sqlite3.OperationalError, empty rows)
+    while still providing top_kernels/per_stream_gaps/stream_utilization --
+    those should still produce findings instead of being silently dropped."""
+    nsys_summary = {
+        "top_kernels": [{"name": "big_kernel", "pct": 30.0, "total_ms": 100.0}],
+        "stream_utilization": {"0": {"active_pct": 20.0, "kernel_count": 5}},
+        "per_stream_gaps": {"0": {"max_gap_us": 500.0}},
+    }
+    findings = _analyze_gpu_attribution(nsys_summary, None, _default_thresholds())
+    assert len(findings) >= 1
+    assert any("idle" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_gpu_attribution_no_data_returns_empty():
+    findings = _analyze_gpu_attribution({}, None, _default_thresholds())
     assert findings == []
 
 

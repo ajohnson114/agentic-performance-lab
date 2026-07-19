@@ -19,6 +19,7 @@ from perflab.harness.pointer_poison import assert_no_memoization
 from perflab.harness.precision import assert_ulp_close
 from perflab.harness.tensor_check import assert_real_tensor
 from perflab.harness.thread_guard import ThreadGuard, assert_no_new_threads
+from perflab.harness.tolerance import env_accuracy_tolerance
 
 __all__ = [
     "cuda_sync_guard",
@@ -29,4 +30,5 @@ __all__ = [
     "assert_deterministic",
     "assert_ulp_close",
     "assert_no_memoization",
+    "env_accuracy_tolerance",
 ]

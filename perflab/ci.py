@@ -103,12 +103,12 @@ def _run_bench_full(task: TaskSpec) -> dict:
             raise RuntimeError(f"Build failed with code {bres.returncode}")
 
     # Correctness
-    cres = run_correctness(task.correctness.cmd, cwd=ws, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb)
+    cres = run_correctness(task.correctness.cmd, cwd=ws, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb, env_passthrough=task.constraints.env_passthrough, accuracy_tolerance=task.constraints.accuracy_tolerance)
     if cres.returncode != task.correctness.expected_exit:
         raise RuntimeError(f"Correctness failed with code {cres.returncode}")
 
     # Benchmark
-    _, bench = run_benchmark(task.benchmark.cmd, cwd=ws, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb)
+    _, bench = run_benchmark(task.benchmark.cmd, cwd=ws, program_type=task.program_type, rlimit_as_gb=task.constraints.rlimit_as_gb, env_passthrough=task.constraints.env_passthrough, warmup=task.benchmark.warmup, repeats=task.benchmark.repeats)
 
     # Contract validation
     contract_errors = validate_contract(bench, task.contract)

@@ -30,8 +30,8 @@ def assert_no_memoization(
     fn: Callable[..., Any],
     input_factory: Callable[[], tuple],
     reference_fn: Callable[..., Any],
-    atol: float = 1e-5,
-    rtol: float = 1e-5,
+    atol: float | None = None,
+    rtol: float | None = None,
     n_rounds: int = 2,
 ) -> None:
     """Detect memoization by mutating inputs in-place after initial correctness pass.
@@ -49,14 +49,21 @@ def assert_no_memoization(
         fn: The kernel function to test.
         input_factory: Creates a fresh tuple of input tensors.
         reference_fn: Reference implementation for correctness.
-        atol: Absolute tolerance.
-        rtol: Relative tolerance.
+        atol: Absolute tolerance. Defaults to the task's declared accuracy
+            tolerance (PERFLAB_ACCURACY_TOLERANCE), or 1e-5.
+        rtol: Relative tolerance (same default resolution).
         n_rounds: Number of poison rounds (default 2).
 
     Raises:
         AssertionError if memoization is detected.
     """
     import torch
+
+    from perflab.harness.tolerance import env_accuracy_tolerance
+    if atol is None:
+        atol = env_accuracy_tolerance(1e-5)
+    if rtol is None:
+        rtol = env_accuracy_tolerance(1e-5)
 
     # Phase 1: Initial run to populate any cache
     inputs = input_factory()

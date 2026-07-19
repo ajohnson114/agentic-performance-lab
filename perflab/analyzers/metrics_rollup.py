@@ -21,28 +21,6 @@ class RunSummary:
     total_iterations: int
 
 
-def is_statistically_significant(
-    baseline_times: list[float],
-    candidate_times: list[float],
-    alpha: float = 0.05,
-) -> tuple[bool, float]:
-    """Test whether candidate times differ significantly from baseline.
-
-    Uses Mann-Whitney U test. Returns (is_significant, p_value).
-    Falls back to (True, 0.0) if scipy is not installed.
-    """
-    if len(baseline_times) < 2 or len(candidate_times) < 2:
-        return True, 0.0
-    try:
-        from scipy.stats import mannwhitneyu
-        stat, p_value = mannwhitneyu(
-            baseline_times, candidate_times, alternative="two-sided"
-        )
-        return p_value < alpha, p_value
-    except ImportError:
-        return True, 0.0
-
-
 def is_improvement(new: float, best: float, mode: Literal["maximize","minimize"], tol: float) -> bool:
     if mode == "maximize":
         return new > best * (1.0 + tol)
@@ -53,6 +31,25 @@ def is_improvement(new: float, best: float, mode: Literal["maximize","minimize"]
 def calc_speedup(value: float, baseline: float) -> float:
     """Compute speedup ratio (value / baseline), returning 1.0 if baseline is zero."""
     return value / baseline if baseline != 0 else 1.0
+
+
+def improvement_factor(
+    new: float, old: float, mode: Literal["maximize", "minimize"],
+) -> float:
+    """How many times better ``new`` is than ``old`` under the metric mode.
+
+    Mode-aware, unlike calc_speedup: >1.0 always means "better" (a latency
+    drop from 10ms to 1ms is 10.0, as is a throughput rise from 1 to 10).
+    Returns 1.0 when either value is zero, since no meaningful ratio exists.
+
+    The neutral 1.0 for a zero value is correct for history/reporting, but
+    callers policing benchmark gaming must special-case zero themselves: a
+    candidate reporting exactly 0.0 (a stubbed/no-op kernel) is the most
+    extreme gaming case, yet it looks neutral here.
+    """
+    if new == 0 or old == 0:
+        return 1.0
+    return new / old if mode == "maximize" else old / new
 
 
 def compute_run_summary(

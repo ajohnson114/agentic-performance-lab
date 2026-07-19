@@ -102,7 +102,7 @@ def run(ctx: AgentContext) -> None:
     # (calc_speedup returns 1.0 for a zero baseline).
     ctx.history.append(make_history_entry(
         0, "baseline", ctx.baseline_val, ctx.baseline_val,
-        accepted=True,
+        accepted=True, mode=task.benchmark.metric.mode,
         secondary_value=ctx.baseline_sec_val,
         bench_wall_time_s=bench_wall,
         profiling_overhead_pct=(

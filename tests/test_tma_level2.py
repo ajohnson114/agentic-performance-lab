@@ -301,3 +301,57 @@ class TestEventLogBuildFlags:
         assert events[0]["event_type"] == "build_flags_state"
         assert events[0]["build_cmd"] == "g++ -O3 -march=native -o bin main.cpp"
         assert len(events[0]["flags_recommended"]) == 2
+
+
+class TestCollectLevel2FromText:
+    _AMD_TEXT = """
+       100,000,000      L1-dcache-loads
+         2,000,000      L1-dcache-load-misses
+         1,000,000      LLC-loads
+           300,000      LLC-load-misses
+    """
+
+    def test_amd_parses_precollected_text_without_run(self, tmp_path, monkeypatch):
+        import perflab.analyzers.tma as tma_mod
+
+        calls: list[list[str]] = []
+
+        def fake_run_cmd(cmd, cwd=None, **kwargs):
+            calls.append(list(cmd))
+            from perflab.tools.shell import CmdResult
+            return CmdResult(cmd=list(cmd), returncode=0, stdout="", stderr="", duration_s=0.01)
+
+        monkeypatch.setattr(tma_mod, "run_cmd", fake_run_cmd)
+        monkeypatch.setattr(tma_mod, "_detect_cpu_vendor", lambda: "amd")
+
+        result = tma_mod.collect_tma_level2(
+            "python3 bench.py", tmp_path, tmp_path / "l2.txt",
+            perf_stat_text=self._AMD_TEXT,
+        )
+
+        assert calls == []
+        assert result is not None
+        assert result.source == "amd-perf"
+        assert result.dram_bound_pct == 30.0
+
+    def test_amd_without_text_still_runs_dedicated_collection(self, tmp_path, monkeypatch):
+        import perflab.analyzers.tma as tma_mod
+
+        calls: list[list[str]] = []
+
+        def fake_run_cmd(cmd, cwd=None, **kwargs):
+            calls.append(list(cmd))
+            from perflab.tools.shell import CmdResult
+            return CmdResult(cmd=list(cmd), returncode=0, stdout="", stderr="", duration_s=0.01)
+
+        monkeypatch.setattr(tma_mod, "run_cmd", fake_run_cmd)
+        monkeypatch.setattr(tma_mod, "_detect_cpu_vendor", lambda: "amd")
+
+        result = tma_mod.collect_tma_level2(
+            "python3 bench.py", tmp_path, tmp_path / "l2.txt",
+        )
+
+        # Backward-compatible: no precollected text -> its own perf stat run
+        # (which produced no output file here, hence None).
+        assert len(calls) == 1
+        assert result is None

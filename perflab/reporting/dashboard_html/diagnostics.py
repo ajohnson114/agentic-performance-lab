@@ -452,6 +452,12 @@ def _render_outcome_analysis(
 ) -> None:
     """Render the What Worked / What Didn't analysis card."""
     rows = history or (glance.rows if glance else None) or []
+    # finalize.py's maybe_early_stop() appends a synthetic second history
+    # entry for the same iteration ("early stop: ...", accepted=False).
+    # glance.rows is already filtered the same way in reporting/generate.py,
+    # but the raw ``history`` list passed here is not -- drop it here too so
+    # the "what didn't work" table doesn't show a duplicate row.
+    rows = [r for r in rows if not str(r.get("description", "")).startswith("early stop:")]
     accepted_rows = [r for r in rows if r.get("accepted") and r.get("iter", r.get("iteration", 0)) > 0]
     rejected_rows = [r for r in rows if not r.get("accepted") and r.get("iter", r.get("iteration", 0)) > 0]
 

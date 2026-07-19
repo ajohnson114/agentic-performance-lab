@@ -56,6 +56,10 @@ class ProfilerSection:
     torch_with_flops: bool = True
     peaks_cache: str = str(Path.home() / ".cache" / "perflab" / "peaks.json")
     peaks_no_cache: bool = False
+    # Allow profilers (py-spy et al.) to retry a failed run under `sudo -n`.
+    # Off by default: the retried command re-runs the candidate-patched
+    # benchmark as root, outside every rlimit/env protection.
+    allow_sudo: bool = False
 
 
 @dataclass
@@ -74,8 +78,17 @@ class OllamaSection:
 
 @dataclass
 class AgentSection:
-    """Agent loop defaults (can be overridden per-task in task.yaml or via CLI flags)."""
-    n_candidates: int = 6          # LLM candidates per iteration
+    """Agent loop defaults (can be overridden per-task in task.yaml or via CLI flags).
+
+    n_candidates/max_iters are kept in sync with perflab.task_spec.AgentSpec,
+    which is the actual source of truth for these two: cli.py's resolution
+    chain (``candidates or task.agent.n_candidates or ga.n_candidates``) only
+    ever falls through to this section's values when task.agent.n_candidates/
+    max_iters are falsy, but AgentSpec's own dataclass defaults (3 / 12) are
+    always truthy -- so unless a task.yaml explicitly sets one to 0, this
+    section's n_candidates/max_iters are structurally unreachable defaults.
+    """
+    n_candidates: int = 3          # LLM candidates per iteration
     max_iters: int = 12            # maximum optimization iterations
     max_wall_time_s: int = 3600    # wall-clock budget in seconds
     fast_screen: bool = True       # use fast benchmark screening for candidates
@@ -186,6 +199,8 @@ def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
             cfg.profiler.peaks_cache = str(prof["peaks_cache"])
         if "peaks_no_cache" in prof:
             cfg.profiler.peaks_no_cache = bool(prof["peaks_no_cache"])
+        if "allow_sudo" in prof:
+            cfg.profiler.allow_sudo = bool(prof["allow_sudo"])
 
     mps = data.get("mps", {})
     if isinstance(mps, dict):
@@ -248,6 +263,8 @@ def _overlay_env(cfg: PerfLabConfig) -> None:
         cfg.profiler.peaks_cache = v
     if os.environ.get("PERFLAB_PEAKS_NO_CACHE", "").strip() == "1":
         cfg.profiler.peaks_no_cache = True
+    if os.environ.get("PERFLAB_PROFILER_ALLOW_SUDO", "").strip() == "1":
+        cfg.profiler.allow_sudo = True
 
     # MPS
     if v := os.environ.get("PERFLAB_MPS_DEVICE_MATCH"):
@@ -359,6 +376,10 @@ profiler:
   torch_with_flops: true     # Enable per-operator FLOPS counting
   peaks_cache: "~/.cache/perflab/peaks.json"
   peaks_no_cache: false      # Set true to force re-detection
+  allow_sudo: false          # Allow profilers to retry under `sudo -n` when a run
+                             # fails (e.g. py-spy needing elevated permissions).
+                             # WARNING: the retried command re-runs the
+                             # candidate-patched benchmark as root.
 
 mps:
   device_match: ""           # Substring match for Metal device name
@@ -369,7 +390,7 @@ ollama:
   allowed_ports: []          # Extra allowed ports (default: 11434 only)
 
 agent:
-  n_candidates: 6            # LLM candidates generated per iteration
+  n_candidates: 3            # LLM candidates generated per iteration
   max_iters: 12              # Maximum optimization iterations
   max_wall_time_s: 3600      # Wall-clock budget (seconds). 3600 = 1 hour
   fast_screen: true          # Quick benchmark to rank candidates before full eval
@@ -431,6 +452,8 @@ isolation:
 #
 # PERFLAB_API_KEY            — LLM API key (security: never written to disk)
 # PERFLAB_DETERMINISM_SEED   — Set to 42 during correctness testing
+# PERFLAB_ACCURACY_TOLERANCE — task.yaml constraints.accuracy_tolerance,
+#                              forwarded to correctness subprocesses
 # PERFLAB_TORCH_PROFILE      — Set to "1" to enable torch profiler capture
 # PERFLAB_TORCH_TRACE_PATH   — Path for torch profiler Chrome trace output
 # PERFLAB_TORCH_WITH_FLOPS   — Set to "1" for per-op FLOPS counting

@@ -11,10 +11,16 @@ from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds
 
 ProgramType = Literal["python", "pytorch", "jax", "triton", "cpp", "cuda"]
 
+# Some builds (large CUDA/C++ translation units, cold JIT caches) legitimately
+# take minutes; 600s keeps slow-but-honest builds from being killed. Tasks can
+# override via build.timeout_s.
+DEFAULT_BUILD_TIMEOUT_S = 600
+
 @dataclass
 class CommandSpec:
     cmd: str
     expected_exit: int = 0
+    timeout_s: int | None = None  # None -> DEFAULT_BUILD_TIMEOUT_S at the build call site
 
 @dataclass
 class MetricSpec:
@@ -37,6 +43,16 @@ class BenchmarkSpec:
 
 @dataclass
 class ProfilePlan:
+    """Parsed from task.yaml's ``profile_plan:`` section, but not consumed.
+
+    DEPRECATED / unconsumed: profiler selection is actually driven entirely
+    by ``perflab.profilers.select_profilers()`` branching on program_type
+    (and target_hardware), which never reads this field. Kept for backward
+    compatibility with existing task.yaml files that already set
+    profile_plan -- parsing it here is harmless, it just has no effect.
+    Do not add new task.yaml scaffolding that sets this field (see
+    perflab/server/task_templates.py and perflab/server/authoring.py).
+    """
     always: list[str] = field(default_factory=list)
     optional: list[str] = field(default_factory=list)
 
@@ -103,7 +119,10 @@ class AntiGamingSpec:
     # Framework-level checks (run automatically by the agent)
     bench_variance_check: bool = True      # Detect zero-variance timing arrays (caching)
     determinism_rerun: bool = True          # Run correctness twice with different seed
-    gaming_speedup_threshold: float = 100.0  # Warn if single-iteration speedup exceeds this
+    # Warn if a single iteration's speedup exceeds this. Warn-only, so false
+    # positives are cheap; a genuine >10x jump in one step almost always means
+    # benchmark gaming. Per-task override (gaming_speedup_threshold) remains.
+    gaming_speedup_threshold: float = 10.0
     # Thread monitoring (via bench.json protocol)
     thread_count_check: bool = False        # Check bench.json thread_delta field (opt-in)
     max_thread_delta: int = 0               # Allowed new threads during kernel execution
@@ -161,7 +180,17 @@ class TaskSpec:
         def cmd_or_none(x: Any) -> CommandSpec | None:
             if x is None:
                 return None
-            return CommandSpec(cmd=str(x.get("cmd")), expected_exit=int(x.get("expected_exit", 0)))
+            timeout_raw = x.get("timeout_s")
+            timeout_s: int | None = None
+            if timeout_raw is not None:
+                timeout_s = int(timeout_raw)
+                if timeout_s <= 0:
+                    raise ValueError(f"build.timeout_s must be > 0, got {timeout_s}")
+            return CommandSpec(
+                cmd=str(x.get("cmd")),
+                expected_exit=int(x.get("expected_exit", 0)),
+                timeout_s=timeout_s,
+            )
 
         def metric_mode(raw: str, field_path: str) -> Literal["maximize", "minimize"]:
             if raw not in ("maximize", "minimize"):
@@ -225,6 +254,7 @@ class TaskSpec:
         except Exception:  # noqa: BLE001 -- best-effort, dataclass defaults still apply
             pass
 
+        accuracy_tolerance_raw = constraints_data.get("accuracy_tolerance")
         constraints = Constraints(
             max_iters=int(constraints_data.get("max_iters", 10)),
             regression_tolerance=float(constraints_data.get("regression_tolerance", 0.02)),
@@ -232,6 +262,10 @@ class TaskSpec:
             prompt_token_budget=int(constraints_data.get("prompt_token_budget", _cfg_token_budget)),
             top_n=int(constraints_data.get("top_n", 3)),
             max_history=int(constraints_data.get("max_history", _cfg_max_history)),
+            allow_fast_math=bool(constraints_data.get("allow_fast_math", False)),
+            accuracy_tolerance=(
+                str(accuracy_tolerance_raw) if accuracy_tolerance_raw is not None else None
+            ),
             env_passthrough=list(constraints_data.get("env_passthrough", [])),
         )
 
@@ -266,7 +300,9 @@ class TaskSpec:
         anti_gaming = AntiGamingSpec(
             bench_variance_check=bool(ag_data.get("bench_variance_check", True)),
             determinism_rerun=bool(ag_data.get("determinism_rerun", True)),
-            gaming_speedup_threshold=float(ag_data.get("gaming_speedup_threshold", 100.0)),
+            gaming_speedup_threshold=float(ag_data.get(
+                "gaming_speedup_threshold", AntiGamingSpec.gaming_speedup_threshold,
+            )),
             thread_count_check=bool(ag_data.get("thread_count_check", False)),
             max_thread_delta=int(ag_data.get("max_thread_delta", 0)),
         )

@@ -816,23 +816,26 @@ def show_task_schema():
     typer.echo("=" * 70)
     typer.echo()
 
+    n_thresholds = len(dataclasses.fields(AnalysisThresholds))
+
     _SCHEMA = [
         ("REQUIRED FIELDS", [
             ("name", "str", "Task name (used in reports and file paths)"),
-            ("workspace", "str", "Path to the task directory"),
             ("program_type", "str", "python | pytorch | jax | triton | cpp | cuda"),
             ("correctness.cmd", "str", "Command to run correctness test (must exit 0)"),
             ("benchmark.cmd", "str", "Command to run benchmark (must write --json)"),
             ("benchmark.metric.name", "str", "Dotted path into bench.json (e.g., tflops.median)"),
-            ("benchmark.metric.mode", "str", "maximize | minimize"),
             ("edit_policy.allowed_paths", "list[str]", "Files the agent can edit (e.g., ['sgemm.cu', 'tuning.yaml'])"),
         ]),
         ("OPTIONAL FIELDS", [
+            ("workspace", "str", "Documentation only — ignored; the workspace is always this file's directory"),
             ("target_hardware", "str|null", "GPU/CPU name for hardware-specific hints (e.g., 'NVIDIA H100')"),
             ("build.cmd", "str|null", "Build command for compiled languages (e.g., 'nvcc -O2 -o bin kern.cu')"),
+            ("benchmark.metric.mode", "str", "maximize | minimize (default: maximize)"),
             ("benchmark.warmup", "int", "Warmup iterations before timing (default: 3)"),
             ("benchmark.repeats", "int", "Timed iterations (default: 20)"),
             ("benchmark.secondary_metric", "dict|null", "Secondary metric for Pareto analysis"),
+            ("out_dir", "str", "Run artifacts directory, relative to this file's directory (default: 'out')"),
         ]),
         ("CONSTRAINTS", [
             ("constraints.max_iters", "int", "Max agent iterations (default: 10)"),
@@ -843,12 +846,20 @@ def show_task_schema():
             ("constraints.max_history", "int", "Recent iterations in prompt (default: 3)"),
             ("constraints.allow_fast_math", "bool", "Permit -ffast-math/--use_fast_math (default: false)"),
             ("constraints.accuracy_tolerance", "str|null", "Acceptable error: 'exact', '1e-3', '1e-1'"),
+            ("constraints.env_passthrough", "list[str]", "Extra env vars forwarded to candidate subprocesses"),
         ]),
         ("CONTRACT (anti-gaming)", [
             ("contract.fixed_params", "dict", "Values enforced in bench.json meta (e.g., {M: 4096, N: 4096})"),
             ("contract.min_repeats", "int", "Minimum benchmark repeats (default: 1)"),
             ("contract.min_warmup", "int", "Minimum warmup iterations (default: 0)"),
             ("contract.required_bench_fields", "list[str]", "Fields that must exist in bench.json"),
+        ]),
+        ("ANTI_GAMING (reward-hack mitigations)", [
+            ("anti_gaming.bench_variance_check", "bool", "Detect zero-variance timing arrays / caching (default: true)"),
+            ("anti_gaming.determinism_rerun", "bool", "Re-run correctness with a different seed (default: true)"),
+            ("anti_gaming.gaming_speedup_threshold", "float", "Warn if one iteration's speedup exceeds this (default: 10.0)"),
+            ("anti_gaming.thread_count_check", "bool", "Check bench.json thread_delta field (default: false)"),
+            ("anti_gaming.max_thread_delta", "int", "Allowed new threads during kernel execution (default: 0)"),
         ]),
         ("ROOFLINE", [
             ("roofline.peak_tflops", "float", "Hardware peak TFLOPS (e.g., 989.0 for H100 TF32)"),
@@ -858,7 +869,7 @@ def show_task_schema():
             ("roofline.dtype_peaks", "dict|null", "Per-dtype peaks (peak_tflops_fp32, _tf32, _fp16, _bf16)"),
         ]),
         ("ANALYSIS THRESHOLDS", [
-            ("analysis_thresholds.*", "float|int", "~55 fields — run `perflab thresholds` for full list"),
+            ("analysis_thresholds.*", "float|int", f"{n_thresholds} fields — run `perflab thresholds` for full list"),
             ("  ncu_tc_util_low", "float", "Tensor Core utilization threshold (default: 30%)"),
             ("  ncu_stall_pct_high", "float", "Warp stall threshold (default: 30%)"),
             ("  ncu_bank_conflicts_high", "float", "Bank conflict threshold (default: 100)"),
@@ -874,8 +885,8 @@ def show_task_schema():
             ("data_hints.custom", "list|null", "Free-form hints: ['data is symmetric', 'output is sparse']"),
         ]),
         ("AGENT", [
-            ("agent.n_candidates", "int", "Candidates per LLM call (default: 6)"),
-            ("agent.top_k", "int", "Top candidates to re-benchmark (default: 2)"),
+            ("agent.n_candidates", "int", "Candidates per LLM call (default: 3)"),
+            ("agent.top_k", "int", "Max full re-benchmarks per iteration (default: 2)"),
             ("agent.max_iters", "int", "Agent loop iterations (default: 12)"),
         ]),
     ]

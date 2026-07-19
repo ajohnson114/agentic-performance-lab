@@ -25,10 +25,19 @@ def assert_real_tensor(tensor, name: str = "output") -> None:
       2. Its exact type is torch.Tensor (not a subclass)
       3. It has allocated storage (not a view of nothing)
       4. Its data pointer is non-null (storage actually exists)
-      5. It has a concrete shape (not symbolic/lazy)
-      6. It is not a nested tensor (which can mask lazy eval)
+      5. It is not a nested tensor (which can mask lazy eval)
+      6. It has a concrete shape (not symbolic/lazy)
 
     Raises AssertionError with a descriptive message on failure.
+
+    Check 5 (nested) intentionally runs before check 6 (shape/stride): the
+    legacy "strided" nested-tensor layout has, across torch versions,
+    sometimes raised an internal RuntimeError from .shape/.stride() access
+    itself (e.g. torch 2.13 raises "NestedTensorImpl doesn't support sizes")
+    rather than returning symbolic values. is_nested is always safe to read
+    on a nested tensor, so checking it first gives a precise, stable
+    diagnostic instead of a generic "non-concrete shape" one that depends on
+    which torch version happens to be installed.
     """
     import torch
 
@@ -64,7 +73,15 @@ def assert_real_tensor(tensor, name: str = "output") -> None:
             f"(storage not allocated)"
         )
 
-    # Check 5: concrete shape (not symbolic)
+    # Check 5: not a nested tensor. Deliberately before the shape/stride
+    # check below -- see the docstring note on check ordering.
+    if tensor.is_nested:
+        raise AssertionError(
+            f"Suspicious tensor: {name} is a nested tensor, which can mask "
+            f"lazy evaluation patterns"
+        )
+
+    # Check 6: concrete shape (not symbolic)
     try:
         _ = tensor.shape
         _ = tensor.stride()
@@ -72,10 +89,3 @@ def assert_real_tensor(tensor, name: str = "output") -> None:
         raise AssertionError(
             f"Lazy evaluation detected: {name} has non-concrete shape/stride: {e}"
         ) from e
-
-    # Check 6: not a nested tensor
-    if tensor.is_nested:
-        raise AssertionError(
-            f"Suspicious tensor: {name} is a nested tensor, which can mask "
-            f"lazy evaluation patterns"
-        )

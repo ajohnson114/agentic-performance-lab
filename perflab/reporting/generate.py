@@ -58,6 +58,7 @@ class ReportParams:
     llm_stats: dict | None = None
     target_hardware: str | None = None
     detected_hardware: str | None = None
+    hardware_mismatch: str | None = None
     build_cmd: str | None = None
     secondary_metric_name: str | None = None
     secondary_metric_mode: str | None = None
@@ -75,6 +76,40 @@ def _build_microarch_for_dashboard(
     except Exception:  # noqa: BLE001 -- best-effort dashboard section, must not abort report generation
         logger.warning("Microarch summary build failed", exc_info=True)
         return None
+
+
+def _compute_hardware_mismatch_fallback(
+    target_hardware: str | None,
+    detected_hardware: str | None,
+    system_info: dict | None,
+) -> str | None:
+    """Fallback hardware-mismatch recompute for ReportParams call sites that
+    don't already provide a resolved ``hardware_mismatch`` (see
+    ``optimizers/phases/baseline.py._check_hardware_mismatch``, which is the
+    preferred source -- it loops every GPU and is threaded through by
+    finalize.py).
+
+    Checks every GPU in *system_info* (not just the first one) before
+    declaring a mismatch; falls back to the single *detected_hardware* name
+    only when system_info has no GPU list at all.
+    """
+    if not target_hardware:
+        return None
+    t_low = target_hardware.lower()
+    gpus = (system_info or {}).get("nvidia_gpus") or []
+    names = [g.get("name", "") for g in gpus if g.get("name")]
+    if not names and detected_hardware:
+        names = [detected_hardware]
+    if not names:
+        return None
+    for name in names:
+        d_low = name.lower()
+        if t_low in d_low or d_low in t_low:
+            return None
+    return (
+        f'Hardware mismatch: configured for "{target_hardware}" '
+        f'but running on "{names[0]}"'
+    )
 
 
 def generate_reports(p: ReportParams) -> dict:
@@ -103,6 +138,7 @@ def generate_reports(p: ReportParams) -> dict:
     llm_stats = p.llm_stats
     target_hardware = p.target_hardware
     detected_hardware = p.detected_hardware
+    hardware_mismatch_hint = p.hardware_mismatch
     build_cmd = p.build_cmd
     secondary_metric_name = p.secondary_metric_name
     secondary_metric_mode = p.secondary_metric_mode
@@ -245,6 +281,8 @@ def generate_reports(p: ReportParams) -> dict:
         report_data["early_stop_reason"] = early_stop_reason
     if optimization_summary_text:
         report_data["optimization_summary"] = optimization_summary_text
+    if roofline_peaks:
+        report_data["roofline_peaks"] = roofline_peaks
 
     # --- Machine fingerprint ---
     if report_system_info:
@@ -282,7 +320,10 @@ def generate_reports(p: ReportParams) -> dict:
 
     # --- Build at-a-glance data ---
     accepted_count = sum(1 for h in history if h.get("accepted") and h.get("iteration", 0) > 0)
-    speedup = best_value / baseline_val if baseline_val != 0 else 1.0
+    if metric_mode == "minimize":
+        speedup = baseline_val / best_value if best_value != 0 else 1.0
+    else:
+        speedup = best_value / baseline_val if baseline_val != 0 else 1.0
     glance = GlanceData(
         metric_name=metric_name,
         baseline_value=baseline_val,
@@ -491,15 +532,17 @@ def generate_reports(p: ReportParams) -> dict:
         logger.warning("Perfetto trace export failed", exc_info=True)
 
     # --- Hardware mismatch detection ---
-    hw_mismatch: str | None = None
-    if target_hardware and detected_hardware:
-        t_low = target_hardware.lower()
-        d_low = detected_hardware.lower()
-        if t_low not in d_low and d_low not in t_low:
-            hw_mismatch = (
-                f'Hardware mismatch: configured for "{target_hardware}" '
-                f'but running on "{detected_hardware}"'
-            )
+    # Prefer the caller's already-resolved value (e.g. finalize.py passes
+    # ctx.hardware_mismatch, computed by baseline.py._check_hardware_mismatch
+    # looping every detected GPU) when provided. Otherwise fall back to a
+    # local recompute for callers that don't have one (e.g. orchestrator.py's
+    # profile-only / knob-search paths) -- also looping every GPU in
+    # system_info, not just index 0.
+    hw_mismatch = hardware_mismatch_hint
+    if hw_mismatch is None and target_hardware:
+        hw_mismatch = _compute_hardware_mismatch_fallback(
+            target_hardware, detected_hardware, report_system_info,
+        )
 
     # --- Write reports ---
     write_report_md(run_dir / "report.md", report_data)

@@ -36,6 +36,10 @@ class GenerateResult:
     candidate_blocks: list[list[SearchReplaceBlock]] = field(default_factory=list)
     candidate_reasoning: list[str] = field(default_factory=list)
     llm_failed: bool = False
+    # Error dicts (same shape as evaluate-phase errors) for problems detected
+    # at generation time — truncated LLM output, dropped incomplete edit
+    # blocks — fed back to the LLM in the next iteration's prompt.
+    generation_errors: list[dict] = field(default_factory=list)
 
 
 def _is_context_overflow_error(exc: Exception) -> bool:
@@ -46,15 +50,23 @@ def _is_context_overflow_error(exc: Exception) -> bool:
     importing provider-specific exception types (which may not be installed), we
     match against known error message substrings.
 
+    "max_tokens" alone is ambiguous: it also shows up in unrelated output-cap
+    errors like "max_tokens exceeds model's output limit", which prompt
+    trimming can never fix. It's only treated as a context-overflow signal
+    when a context/prompt-length indicator ("context" or "prompt") co-occurs
+    in the same message.
+
     If a provider changes its error format, the worst case is a missed catch —
     the error propagates normally instead of triggering emergency trimming.
     """
     exc_str = str(exc).lower()
-    return any(k in exc_str for k in (
+    if any(k in exc_str for k in (
         "context_length", "context length", "maximum context",
-        "token limit", "too many tokens", "max_tokens",
+        "token limit", "too many tokens",
         "prompt is too long", "request too large",
-    ))
+    )):
+        return True
+    return "max_tokens" in exc_str and ("context" in exc_str or "prompt" in exc_str)
 
 
 def _warn_build_flag_mismatch(
@@ -646,10 +658,42 @@ def run(ctx: AgentContext) -> GenerateResult:
     ctx.total_output_tokens += usage_output_tokens(result.usage)
     progress.on_message(f"[agent] LLM response ({fmt_elapsed(llm_latency)}): {len(result.content)} chars, tokens: {fmt_usage(result.usage)}")
 
+    generation_errors: list[dict] = []
+
+    # Truncation check: a response cut off at max_tokens can end mid-edit-block.
+    # The parser drops incomplete blocks; surface the truncation so the next
+    # prompt tells the LLM to produce fewer/smaller candidates. getattr:
+    # stub/mock providers may return objects without a finish_reason field.
+    finish_reason = getattr(result, "finish_reason", None)
+    if finish_reason in ("length", "max_tokens"):
+        progress.on_message(
+            f"[agent] WARNING: LLM response was truncated at the max_tokens limit "
+            f"(finish_reason={finish_reason!r}); incomplete trailing edit "
+            f"blocks are discarded"
+        )
+        generation_errors.append({
+            "type": "truncated_output",
+            "description": (
+                "your previous response was truncated at the max_tokens limit; "
+                "any incomplete edit block was discarded — produce fewer or "
+                "smaller candidates"
+            ),
+            "output": "",
+        })
+
     # Parse candidates (with reasoning)
-    parsed = parse_candidates(result.content)
+    parse_warnings: list[str] = []
+    parsed = parse_candidates(result.content, warnings=parse_warnings)
     candidate_blocks = [blocks for _, blocks in parsed]
     candidate_reasoning = [reasoning for reasoning, _ in parsed]
+
+    for warning in parse_warnings:
+        progress.on_message(f"[agent] Patch parse warning: {warning}")
+        generation_errors.append({
+            "type": "incomplete_block",
+            "description": warning,
+            "output": "",
+        })
 
     event_log.llm_response(it, result.content, result.usage, len(candidate_blocks))
 
@@ -664,4 +708,8 @@ def run(ctx: AgentContext) -> GenerateResult:
                     "source": ua.source,
                 })
 
-    return GenerateResult(candidate_blocks=candidate_blocks, candidate_reasoning=candidate_reasoning)
+    return GenerateResult(
+        candidate_blocks=candidate_blocks,
+        candidate_reasoning=candidate_reasoning,
+        generation_errors=generation_errors,
+    )
