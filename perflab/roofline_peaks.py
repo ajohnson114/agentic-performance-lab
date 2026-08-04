@@ -6,6 +6,8 @@ import os
 import platform
 import re
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -750,15 +752,242 @@ def infer_mps_peaks() -> Peaks | None:
     return None
 
 # ---------------- CPU ----------------
+#
+# Two ways to get a CPU compute roof, in preference order:
+#
+#   1. MEASURE it (`_measured_cpu_peaks`) with a short calibrated fp32 GEMM.
+#      Whatever the machine actually sustains is what gets recorded, which
+#      sidesteps turbo behavior, AVX-512 licensing and FMA-port counts in one
+#      move. Source: "cpu-measured" / "cpu-measured-flops".
+#   2. MODEL it (`_estimate_cpu_peaks`) from cores x clock x FLOP/cycle, used
+#      whenever the measurement is unavailable or implausible. Source:
+#      "cpu-spec".
+#
+# The roof matters beyond reporting: peak_tflops / peak_mem_bw_gbs is the
+# roofline knee, and `_classify_bound()` in perflab/optimizers/prompt.py uses
+# that knee to decide whether the LLM is told to chase memory-bound or
+# compute-bound optimizations. A 2x error in the roof flips the strategy for
+# any kernel near the knee.
+
+# ===== The FLOP/cycle model =====
+#
+# Every FLOP/cycle number below follows one rule:
+#
+#     fp32 FLOP/cycle/core = fp32_lanes * 2 * pipes
+#
+# where the *2 is one multiply plus one add, and `pipes` is the number of
+# full-width FP pipelines that can retire such a pair every cycle:
+#
+#   * FMA hardware: pipes == the FMA unit count. Two on nearly every
+#     mainstream core since Haswell / Zen 2; one on Zen 1, Atom/E-cores, and
+#     most 512-bit client parts.
+#   * Pre-FMA hardware (SSE, AVX1): pipes == 1. The separate FP-mul and
+#     FP-add ports co-issue to retire one mul+add pair per cycle. There is no
+#     fused op and only a perfectly balanced mul/add mix reaches even that
+#     rate, so crediting two pipes here would be wrong.
+#
+# The previous model used "vector_bits / 32 * 2" unconditionally: that
+# hard-codes exactly one FMA unit for every ISA (2x pessimistic on the
+# dual-FMA parts that dominate the installed base) while simultaneously
+# granting pre-FMA SSE/AVX an FMA they do not have.
+
+
+@dataclass(frozen=True)
+class _CpuIsa:
+    """One ISA class of the CPU peak-FLOPS model."""
+
+    name: str
+    fp32_lanes: int
+    pipes: int
+    note: str
+
+    @property
+    def flops_per_cycle(self) -> int:
+        return self.fp32_lanes * 2 * self.pipes
+
+
+# Apple P-cores (M1 onward) have four 128-bit NEON FMA pipes:
+# 4 lanes * 2 * 4 = 32 fp32 FLOP/cycle/core. Cross-check: M1 Max, 8 P-cores at
+# 3.2 GHz -> 819 GFLOP/s, matching the commonly cited ~800 GFLOP/s NEON peak.
+# (The old model assumed two pipes and so understated Apple silicon 2x.)
+_APPLE_ISA = _CpuIsa("neon-apple", 4, 4, "Apple P-core: 4x 128-bit NEON FMA pipes")
+
+# Generic AArch64: Neoverse N1/V1 and Cortex-A7x have two 128-bit FP/ASIMD
+# pipes capable of FMA -> 4 * 2 * 2 = 16 fp32 FLOP/cycle/core.
+_NEON_ISA = _CpuIsa("neon", 4, 2, "128-bit NEON, 2 FMA pipes (Neoverse/Cortex-A7x class)")
+
+_SCALAR_ISA = _CpuIsa("scalar", 1, 1, "no usable SIMD flags detected")
+
+# Single-core max turbo is never sustained across all cores. All-core turbo
+# typically lands at 70-85% of the single-core ceiling on server parts and
+# nearer 90% on desktop parts; 0.75 is a deliberately conservative middle used
+# only when no true base clock can be read.
+_ALL_CORE_TURBO_DERATE = 0.75
+
+# Intel parts that carry two 512-bit FMA units. Everything else with avx512f
+# is assumed to have one (the conservative direction), which is correct for
+# Xeon Silver/Bronze, Xeon Gold 51xx/52xx and all 512-bit client parts, and
+# happens to give the right answer for Zen 4 as well (its AVX-512 is
+# double-pumped over two 256-bit FMAs, i.e. the same 32 fp32 FLOP/cycle as one
+# 512-bit unit). It understates Zen 5 desktop parts with a full 512-bit
+# datapath; there is no architectural CPUID bit for FMA unit count, so brand
+# matching is the only cheap signal and it errs low on purpose.
+_AVX512_DUAL_FMA_PATTERNS = (
+    # Xeon Platinum 81xx/82xx (SKX/CLX) through 84xx/85xx (SPR/EMR).
+    r"platinum\s*8\d{3}",
+    # Xeon Gold 6xxx only. Gold 51xx/52xx have a single 512-bit FMA and are
+    # deliberately excluded by requiring a leading 6.
+    r"gold\s*6\d{3}",
+    # Sapphire Rapids workstation (Xeon w3-/w5-/w7-/w9-24xx/34xx).
+    r"\bw[3579]-\d{4}",
+    # Sapphire Rapids HBM (Xeon Max 94xx).
+    r"xeon\s*max\s*9\d{3}",
+)
+
+# Skylake-SP / Cascade Lake drop to roughly 60-70% of base clock under the
+# heavy AVX-512 license. Ice Lake-SP and later, plus Zen 4/5, either do not
+# license-throttle or do so negligibly, so they keep a factor of 1.0. The
+# pattern matches the SKX (x1xx) and CLX (x2xx) numbering only.
+_AVX512_HEAVY_LICENSE_RE = r"\b(?:platinum|gold|silver|bronze)\s*\d[12]\d{2}\b"
+_AVX512_HEAVY_LICENSE_FACTOR = 0.70
+
+# AVX2+FMA parts with only one FMA unit (256-bit ops issue at half rate).
+# Everything else gets two, which is right for Haswell onward and Zen 2
+# onward.
+_AVX2_SINGLE_FMA_PATTERNS = (
+    r"ryzen\s+\w+\s+1\d{3}",        # Zen 1 desktop (Ryzen 5 1600, ...)
+    r"ryzen\s+threadripper\s+19\d{2}",  # Zen 1 Threadripper
+    r"epyc\s+7\d{2}1",              # Zen 1 EPYC (7601, 7351, ...)
+    r"\batom\b",                    # Silvermont/Goldmont/Tremont/Gracemont
+    r"\bceleron\b",
+    r"pentium\s+silver",
+)
+
+
+def _matches_any(name: str, patterns: tuple[str, ...]) -> bool:
+    low = (name or "").lower()
+    return any(re.search(p, low) for p in patterns)
+
+
+def _avx512_fma_units(cpu_name: str) -> int:
+    return 2 if _matches_any(cpu_name, _AVX512_DUAL_FMA_PATTERNS) else 1
+
+
+def _avx512_clock_factor(cpu_name: str) -> float:
+    """Heavy-AVX-512-license clock derate for the SKX/CLX generation."""
+    if re.search(_AVX512_HEAVY_LICENSE_RE, (cpu_name or "").lower()):
+        return _AVX512_HEAVY_LICENSE_FACTOR
+    return 1.0
+
+
+def _avx2_fma_units(cpu_name: str) -> int:
+    return 1 if _matches_any(cpu_name, _AVX2_SINGLE_FMA_PATTERNS) else 2
+
+
+def _cpu_flags() -> set[str]:
+    """CPU feature flags as an exact-token set.
+
+    Returning a set (rather than the raw blob the old code substring-matched)
+    is what makes the ISA branches trustworthy: `"avx" in blob` is true on
+    every AVX-512 machine, and `"sse" in blob` is true merely because of
+    "sse2"/"ssse3"/"sse4_1". Exact membership removes both traps.
+    Handles the x86 "flags" line and the AArch64 "Features" line.
+    """
+    out = _run(["bash", "-c",
+                "grep -m1 -E '^(flags|Features)' /proc/cpuinfo | cut -d: -f2"])
+    if not out:
+        out = _run(["bash", "-c", "lscpu | grep -m1 -i '^Flags:' | cut -d: -f2"])
+    return {tok.strip().lower() for tok in (out or "").split() if tok.strip()}
+
+
+def _cpu_isa_profile(flags: set[str], cpu_name: str, machine: str) -> _CpuIsa:
+    """Pick the ISA class -- checked most-capable-first, on exact flag tokens."""
+    mach = str(machine or "").lower()
+    if mach.startswith(("aarch64", "arm64")):
+        if "asimd" in flags or "neon" in flags:
+            # SVE lands here too: its vector length is not discoverable from
+            # the flag list, so the NEON rate is used as a floor.
+            return _NEON_ISA
+        return _SCALAR_ISA
+
+    if "avx512f" in flags:
+        units = _avx512_fma_units(cpu_name)
+        return _CpuIsa(
+            "avx512", 16, units,
+            f"512-bit FMA x{units}" + ("" if units == 2 else " (assumed; no CPUID bit exposes this)"),
+        )
+    if "avx2" in flags and "fma" in flags:
+        units = _avx2_fma_units(cpu_name)
+        return _CpuIsa("avx2+fma", 8, units, f"256-bit FMA x{units}")
+    if "avx" in flags:
+        # Sandy/Ivy Bridge: 256-bit FP mul and FP add ports co-issue, no FMA.
+        return _CpuIsa("avx", 8, 1, "pre-FMA AVX: 256-bit FP mul + FP add co-issue")
+    if "sse2" in flags or "sse" in flags:
+        # Baseline x86-64 SSE2 has no FMA either; 128-bit mul + add co-issue.
+        return _CpuIsa("sse2", 4, 1, "pre-FMA SSE2: 128-bit FP mul + FP add co-issue")
+    return _SCALAR_ISA
+
+
+def _parse_float(text: str | None) -> float | None:
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _linux_cpu_name() -> str:
+    out = _run(["bash", "-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"])
+    if not out or not out.strip(" -"):
+        out = _run(["bash", "-c", "lscpu | grep -m1 -i '^Model name:' | cut -d: -f2"]) or out
+    name = (out or "").strip()
+    return name if name and name != "-" else "CPU"
+
+
+def _linux_sustained_clock_ghz(cpu_name: str) -> tuple[float, str] | None:
+    """All-core-sustainable clock, plus a label for where it came from.
+
+    Ordered best-to-worst. The old model read `lscpu`'s "CPU max MHz", which is
+    the *single-core* max turbo, and then multiplied it by every physical core
+    -- an operating point no machine ever reaches.
+    """
+    # 1. The true nominal base clock, published by intel_pstate (kHz).
+    khz = _parse_float(_run(["bash", "-c",
+                             "cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null"]))
+    if khz and khz > 0:
+        return khz / 1e6, "sysfs-base"
+
+    # 2. Intel/AMD brand strings encode the nominal clock: "... @ 2.30GHz".
+    m = re.search(r"@\s*([0-9]+(?:\.[0-9]+)?)\s*GHz", cpu_name or "", re.IGNORECASE)
+    val = _parse_float(m.group(1)) if m else None
+    if val and val > 0:
+        return val, "model-name-base"
+
+    # 3. Only the single-core turbo ceiling is known -- derate it toward
+    #    all-core rather than pretending every core sustains it.
+    mhz = _parse_float(_run(["bash", "-c", "lscpu | grep 'CPU max MHz' | awk '{print $NF}'"]))
+    if mhz and mhz > 0:
+        return (mhz / 1000.0) * _ALL_CORE_TURBO_DERATE, "max-turbo-derated"
+
+    # 4. Last resort: an instantaneous reading of one core. Not derated -- it
+    #    is already a spot value, not a ceiling.
+    mhz = _parse_float(_run(["bash", "-c", "grep -m1 'cpu MHz' /proc/cpuinfo | awk '{print $NF}'"]))
+    if mhz and mhz > 0:
+        return mhz / 1000.0, "cpuinfo-spot"
+    return None
+
 
 def _estimate_cpu_peaks() -> Peaks | None:
-    """Estimate CPU peaks from hardware specs (clock × cores × SIMD width)."""
+    """Model CPU peaks from cores x sustainable clock x FLOP/cycle.
+
+    This is the fallback for `_measured_cpu_peaks`; see the module section
+    header above for the FLOP/cycle rule behind every ISA entry.
+    """
     import multiprocessing
 
     sys_name = platform.system()
     cores: int | None = None
     clock_ghz: float | None = None
-    simd_width: int = 1  # FP32 ops per SIMD instruction
+    isa: _CpuIsa = _SCALAR_ISA
     cpu_name: str = "CPU"
 
     if sys_name == "Darwin":
@@ -788,9 +1017,8 @@ def _estimate_cpu_peaks() -> Peaks | None:
             except ValueError:
                 pass
 
-        # Apple Silicon NEON: 128-bit = 4 FP32 ops, 2 FMA units = 8 FLOP/cycle
         if "Apple" in cpu_name:
-            simd_width = 8  # 2 NEON FMA units × 4 FP32
+            isa = _APPLE_ISA
             # Apple Silicon doesn't report frequency via sysctl reliably
             # Use known frequencies for common chips
             for chip, freq_ghz in [("M1", 3.2), ("M2", 3.5), ("M3", 4.05), ("M4", 4.4)]:
@@ -813,15 +1041,13 @@ def _estimate_cpu_peaks() -> Peaks | None:
                     break
 
             if cores and clock_ghz:
-                peak_tflops = (cores * simd_width * clock_ghz) / 1000.0
+                peak_tflops = (cores * isa.flops_per_cycle * clock_ghz) / 1000.0
                 if bw_gbs is None:
                     bw_gbs = 68.0  # conservative
                 return Peaks(peak_tflops, bw_gbs, "cpu-spec", cpu_name)
 
     elif sys_name == "Linux":
-        # Linux: parse /proc/cpuinfo and lscpu
-        cpu_name = _run(["bash", "-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"]) or "CPU"
-        cpu_name = cpu_name.strip()
+        cpu_name = _linux_cpu_name()
 
         # Core count — physical cores, not logical: SMT doubles the logical
         # count but not the FMA pipelines, so logical count would
@@ -833,34 +1059,27 @@ def _estimate_cpu_peaks() -> Peaks | None:
             except (OSError, NotImplementedError):
                 pass
 
-        # Max clock
-        freq_str = _run(["bash", "-c", "lscpu | grep 'CPU max MHz' | awk '{print $NF}'"])
-        if freq_str:
-            try:
-                clock_ghz = float(freq_str) / 1000.0
-            except ValueError:
-                pass
-        if clock_ghz is None:
-            freq_str = _run(["bash", "-c", "grep -m1 'cpu MHz' /proc/cpuinfo | awk '{print $NF}'"])
-            if freq_str:
-                try:
-                    clock_ghz = float(freq_str) / 1000.0
-                except ValueError:
-                    pass
+        clock = _linux_sustained_clock_ghz(cpu_name)
+        clock_source = "unknown"
+        if clock is not None:
+            clock_ghz, clock_source = clock
 
-        # SIMD width detection from flags
-        flags = _run(["bash", "-c", "grep -m1 'flags' /proc/cpuinfo | tr ' ' '\\n'"]) or ""
-        if "avx512f" in flags:
-            simd_width = 32  # 512-bit / 32-bit × 2 (FMA) = 32 FLOP/cycle
-        elif "avx2" in flags or "avx" in flags or "fma" in flags:
-            simd_width = 16  # 256-bit / 32-bit × 2 (FMA) = 16 FLOP/cycle
-        elif "sse" in flags:
-            simd_width = 8   # 128-bit / 32-bit × 2 = 8 FLOP/cycle
-        else:
-            simd_width = 2   # scalar FMA
+        isa = _cpu_isa_profile(_cpu_flags(), cpu_name, platform.machine())
+        if isa.name == "avx512" and clock_ghz is not None:
+            # Heavy AVX-512 code licenses down on SKX/CLX; fold that into the
+            # clock rather than into the FLOP/cycle number, which is a
+            # microarchitectural constant.
+            factor = _avx512_clock_factor(cpu_name)
+            if factor != 1.0:
+                clock_ghz *= factor
+                clock_source += f"+avx512-license({factor:g})"
+        logger.debug(
+            "CPU peak model: cores=%s clock=%.3fGHz (%s) isa=%s %d FLOP/cycle (%s)",
+            cores, clock_ghz or 0.0, clock_source, isa.name, isa.flops_per_cycle, isa.note,
+        )
 
     if cores and clock_ghz and cores > 0 and clock_ghz > 0:
-        peak_tflops = (cores * simd_width * clock_ghz) / 1000.0
+        peak_tflops = (cores * isa.flops_per_cycle * clock_ghz) / 1000.0
         # Estimate bandwidth: default heuristic for DDR
         # Try to get from dmidecode or lshw, fall back to conservative estimate
         bw_gbs = None
@@ -889,9 +1108,365 @@ def _estimate_cpu_peaks() -> Peaks | None:
     return None
 
 
+# ===== Measured CPU peaks =====
+#
+# Bump this whenever the probe's methodology changes -- it is part of the
+# cache key, so old entries are ignored rather than silently reused.
+_CPU_PROBE_VERSION = 1
+
+_CPU_PROBE_TIMEOUT_S = 30.0   # hard wall on the child process
+_CPU_PROBE_BUDGET_S = 8.0     # self-imposed deadline inside the child
+_CPU_PROBE_WARMUP_S = 0.3     # per kernel, to reach a steady clock
+_CPU_PROBE_MIN_TRIAL_S = 0.05
+_CPU_PROBE_TRIALS = 7
+_CPU_PROBE_GEMM_N = 1024      # 3 x 4 MB operands; AI = N/6 ~ 170 FLOP/byte
+_CPU_PROBE_BW_MB = 64         # per buffer, x2 buffers -- far past any LLC
+
+# A run has to clear all of these to be believed.
+_CPU_PROBE_MIN_TRIALS = 3
+# max/median across trials. A wide spread means the machine was contended or
+# thermally unstable during the probe, so the number is not a peak of anything.
+_CPU_PROBE_MAX_SPREAD = 3.0
+# Absolute plausibility bounds. Deliberately *not* relative to the modeled
+# estimate: the model is the thing being distrusted, and a measurement that
+# comes in far below it is usually right (cgroup CPU quota, a single-threaded
+# BLAS, a shared VM) -- capping it against the model would reintroduce exactly
+# the fiction this probe exists to remove.
+_CPU_PROBE_TFLOPS_BOUNDS = (1e-4, 200.0)
+_CPU_PROBE_GBS_BOUNDS = (0.5, 5000.0)
+
+_CPU_PROBE_MARKER = "PERFLAB_CPU_PROBE "
+
+# Runs out-of-process on purpose: a hard timeout, isolation from BLAS crashes,
+# and -- the reason it cannot be done in-process -- BLAS thread-count env vars
+# are only read at numpy import time, so the parent cannot set them for an
+# already-imported numpy.
+_CPU_PROBE_SCRIPT = r'''
+import json
+import sys
+import time
+
+
+def _emit(obj):
+    sys.stdout.write("PERFLAB_CPU_PROBE " + json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def _timed_trials(call, units_per_call, cfg, deadline):
+    """Warm up to a steady clock, size an iteration batch, then time N trials."""
+    warm_end = time.perf_counter() + cfg["warmup_s"]
+    while time.perf_counter() < warm_end:
+        call()
+    t0 = time.perf_counter()
+    call()
+    one = time.perf_counter() - t0
+    iters = max(1, int(cfg["min_trial_s"] / one) + 1) if one > 0 else 1
+    rates = []
+    for _ in range(cfg["trials"]):
+        if time.perf_counter() > deadline:
+            break
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            call()
+        dt = time.perf_counter() - t0
+        if dt > 0:
+            rates.append(units_per_call * iters / dt)
+    return rates, iters
+
+
+def main():
+    cfg = json.loads(sys.argv[1])
+    deadline = time.perf_counter() + cfg["budget_s"]
+    try:
+        import numpy as np
+    except Exception as exc:
+        _emit({"error": "numpy-unavailable: " + repr(exc)})
+        return
+
+    out = {"numpy": np.__version__, "threads": cfg["threads"]}
+
+    # Compute roof: fp32 GEMM. 2*N^3 FLOP over 3*N^2 elements is an arithmetic
+    # intensity of N/6 (~170 FLOP/byte at N=1024), an order of magnitude past
+    # any CPU knee, and BLAS keeps the blocked tiles resident in L1/L2 -- so
+    # this measures the FMA pipelines, not the memory system.
+    try:
+        n = cfg["gemm_n"]
+        rng = np.random.default_rng(0)
+        a = rng.standard_normal((n, n), dtype=np.float32)
+        b = rng.standard_normal((n, n), dtype=np.float32)
+        c = np.empty((n, n), dtype=np.float32)
+
+        def gemm():
+            np.matmul(a, b, out=c)
+
+        rates, iters = _timed_trials(gemm, 2.0 * n * n * n, cfg, deadline)
+        out["gemm_tflops"] = [r / 1e12 for r in rates]
+        out["gemm_n"] = n
+        out["gemm_iters_per_trial"] = iters
+    except Exception as exc:
+        out["gemm_error"] = repr(exc)
+
+    # Bandwidth roof: streaming scale (read x, write y) over buffers far larger
+    # than any LLC, fanned out across threads because a single core cannot
+    # saturate a modern socket's DRAM controllers. numpy ufuncs drop the GIL,
+    # so plain threads really do run concurrently here.
+    try:
+        import concurrent.futures as cf
+
+        threads = max(1, int(cfg["threads"]))
+        nelem = (cfg["bw_mb"] * 1024 * 1024) // 4
+        x = np.ones(nelem, dtype=np.float32)
+        y = np.empty(nelem, dtype=np.float32)
+        s = np.float32(1.0000001)
+        step = max(1, nelem // threads)
+        bounds = []
+        for t in range(threads):
+            lo = t * step
+            hi = nelem if t == threads - 1 else min(nelem, (t + 1) * step)
+            if lo < hi:
+                bounds.append((lo, hi))
+
+        def _chunk(lohi):
+            lo, hi = lohi
+            np.multiply(x[lo:hi], s, out=y[lo:hi])
+
+        pool = cf.ThreadPoolExecutor(max_workers=len(bounds))
+        try:
+            def stream():
+                list(pool.map(_chunk, bounds))
+
+            rates, _ = _timed_trials(stream, 2.0 * x.nbytes, cfg, deadline)
+        finally:
+            pool.shutdown(wait=True)
+        out["stream_gbs"] = [r / 1e9 for r in rates]
+        out["stream_mb"] = cfg["bw_mb"]
+    except Exception as exc:
+        out["stream_error"] = repr(exc)
+
+    _emit(out)
+
+
+main()
+'''
+
+
+def _cpu_measure_enabled() -> bool:
+    return os.environ.get("PERFLAB_CPU_PEAK_MEASURE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _cpu_probe_threads() -> int:
+    import multiprocessing
+
+    n = _physical_cpu_count()
+    if not n:
+        try:
+            n = multiprocessing.cpu_count()
+        except (OSError, NotImplementedError):
+            n = 1
+    return max(1, int(n or 1))
+
+
+def _cpu_probe_thread_plan(threads: int) -> list[int]:
+    """Thread counts to try, best-of wins.
+
+    All cores is not always fastest: SMT oversubscription, vCPU contention
+    inside a VM, and P+E heterogeneity can each make a narrower run quicker.
+    Measured in this repo's aarch64 dev container, a 10-thread GEMM ran 2.3x
+    *slower* than a 5-thread one -- exactly the size of error this whole probe
+    exists to eliminate. A roof should be the best the machine can do, so try a
+    half-width configuration as well. Capped at two configurations to keep the
+    one-time cost near ~3s.
+    """
+    plan = [threads]
+    if threads >= 4:
+        plan.append(threads // 2)
+    return plan
+
+
+def _run_cpu_probe(threads: int) -> dict[str, Any] | None:
+    """Run the microbenchmark out-of-process. Returns None on any failure."""
+    if not sys.executable:
+        return None
+    cfg = {
+        "budget_s": _CPU_PROBE_BUDGET_S,
+        "warmup_s": _CPU_PROBE_WARMUP_S,
+        "min_trial_s": _CPU_PROBE_MIN_TRIAL_S,
+        "trials": _CPU_PROBE_TRIALS,
+        "gemm_n": _CPU_PROBE_GEMM_N,
+        "bw_mb": _CPU_PROBE_BW_MB,
+        "threads": threads,
+    }
+    env = dict(os.environ)
+    # Set before numpy is imported so the BLAS actually honors them; the roof
+    # is a whole-socket number, matching what the model computes.
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        env[var] = str(threads)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CPU_PROBE_SCRIPT, json.dumps(cfg)],
+            capture_output=True,
+            text=True,
+            timeout=_CPU_PROBE_TIMEOUT_S,
+            env=env,
+            # Never inherit a candidate workspace as cwd: `python -c` puts cwd
+            # on sys.path, and workspaces hold LLM-written files.
+            cwd=tempfile.gettempdir(),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        logger.info("CPU peak probe did not complete; falling back to the model", exc_info=True)
+        return None
+
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith(_CPU_PROBE_MARKER):
+            try:
+                payload = json.loads(line[len(_CPU_PROBE_MARKER):])
+            except json.JSONDecodeError:
+                logger.info("CPU peak probe emitted unparseable output")
+                return None
+            return payload if isinstance(payload, dict) else None
+    logger.info("CPU peak probe produced no result (exit=%s)", proc.returncode)
+    return None
+
+
+def _reduce_probe_rates(rates: Any, bounds: tuple[float, float], label: str) -> float | None:
+    """Peak = max across trials, but only if the trials are self-consistent."""
+    if not isinstance(rates, list):
+        return None
+    values = [float(r) for r in rates if isinstance(r, (int, float)) and r == r and r > 0]
+    if len(values) < _CPU_PROBE_MIN_TRIALS:
+        logger.info("CPU peak probe (%s): only %d usable trials", label, len(values))
+        return None
+    values.sort()
+    peak = values[-1]
+    median = values[len(values) // 2]
+    lo, hi = bounds
+    if not (lo <= peak <= hi):
+        logger.warning("CPU peak probe (%s): %.4g outside plausible range [%g, %g]", label, peak, lo, hi)
+        return None
+    if median <= 0 or peak / median > _CPU_PROBE_MAX_SPREAD:
+        logger.warning("CPU peak probe (%s): unstable trials (peak %.4g vs median %.4g)", label, peak, median)
+        return None
+    return peak
+
+
+def _cpu_measured_cache_key(device: str, threads: int) -> str:
+    return f"cpu-measured::v{_CPU_PROBE_VERSION}::{platform.machine()}::{device}::{threads}t"
+
+
+def _measured_cpu_peaks(model: Peaks | None) -> Peaks | None:
+    """Measure the CPU compute roof with a short calibrated fp32 GEMM.
+
+    Preferred over `_estimate_cpu_peaks` because it observes what the machine
+    actually sustains, which folds in all-core turbo behavior, AVX-512
+    licensing and FMA-port count without having to model any of them.
+
+    Degrades to None (caller falls back to the model) on every failure mode:
+    numpy missing, subprocess crash or timeout, too few trials, unstable
+    trials, or an implausible absolute result. Cached in the shared peaks
+    cache -- including failures, so a machine without numpy does not pay for
+    the probe on every run. `perflab peaks --refresh` /
+    PERFLAB_PEAKS_NO_CACHE=1 re-runs it.
+
+    Source labels: "cpu-measured" when both roofs are measured,
+    "cpu-measured-flops" when only the compute roof is (bandwidth then comes
+    from the model, which is the honest description of the mix).
+    """
+    if not _cpu_measure_enabled():
+        return None
+
+    device = model.device if model and model.device else (
+        platform.processor() or platform.machine() or "CPU"
+    )
+    threads = _cpu_probe_threads()
+    key = _cpu_measured_cache_key(device, threads)
+
+    cache = _load_cache()
+    entry = cache.get(key)
+    if isinstance(entry, dict):
+        if entry.get("failed"):
+            logger.debug("CPU peak probe previously failed (%s); using the model", entry.get("reason"))
+            return None
+        try:
+            return Peaks(
+                float(entry["peak_tflops"]),
+                float(entry["peak_mem_bw_gbs"]),
+                str(entry.get("source", "cpu-measured")),
+                str(entry.get("device", device)),
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Ignoring malformed measured-CPU cache entry %s", key)
+
+    tflops: float | None = None
+    gbs: float | None = None
+    for n_threads in _cpu_probe_thread_plan(threads):
+        result = _run_cpu_probe(n_threads)
+        if result is None:
+            # Process-level failure (timeout, exec error, crash) is
+            # environmental; retrying at another width would just burn a
+            # second full timeout.
+            break
+        if result.get("error"):
+            logger.info("CPU peak probe unavailable: %s", result["error"])
+            break  # numpy missing: retrying at another thread count is pointless
+        run_tflops = _reduce_probe_rates(
+            result.get("gemm_tflops"), _CPU_PROBE_TFLOPS_BOUNDS, f"gemm@{n_threads}t")
+        run_gbs = _reduce_probe_rates(
+            result.get("stream_gbs"), _CPU_PROBE_GBS_BOUNDS, f"stream@{n_threads}t")
+        if run_tflops is not None and (tflops is None or run_tflops > tflops):
+            tflops = run_tflops
+        if run_gbs is not None and (gbs is None or run_gbs > gbs):
+            gbs = run_gbs
+
+    if tflops is None:
+        _store_cpu_measured_failure(cache, key)
+        return None
+
+    if gbs is None:
+        if model is None or model.peak_mem_bw_gbs <= 0:
+            _store_cpu_measured_failure(cache, key)
+            return None
+        gbs = model.peak_mem_bw_gbs
+        source = "cpu-measured-flops"
+    else:
+        source = "cpu-measured"
+
+    peaks = Peaks(float(tflops), float(gbs), source, device)
+    if model is not None and model.peak_tflops > 0:
+        logger.info(
+            "CPU peak measured at %.3f TFLOPS (%.2fx the modeled %.3f), %.1f GB/s",
+            peaks.peak_tflops, peaks.peak_tflops / model.peak_tflops,
+            model.peak_tflops, peaks.peak_mem_bw_gbs,
+        )
+    cache[key] = {
+        "peak_tflops": peaks.peak_tflops,
+        "peak_mem_bw_gbs": peaks.peak_mem_bw_gbs,
+        "source": peaks.source,
+        "device": peaks.device,
+    }
+    _save_cache(cache)
+    return peaks
+
+
+def _store_cpu_measured_failure(cache: dict[str, Any], key: str) -> None:
+    cache[key] = {"failed": True, "reason": "probe-unavailable-or-implausible"}
+    _save_cache(cache)
+
+
 def infer_cpu_peaks() -> Peaks | None:
-    """Infer CPU peaks from hardware specs first, then torch calibration fallback."""
+    """Measured CPU peaks first, then the spec model, then torch calibration.
+
+    The model is computed first regardless: it is cheap (a few sysctl/lscpu
+    reads), it names the device, and it supplies the bandwidth roof if only the
+    compute half of the measurement survives validation.
+    """
     spec = _estimate_cpu_peaks()
+    measured = _measured_cpu_peaks(spec)
+    if measured:
+        return measured
     if spec:
         return spec
     calib = infer_torch_calibration(device="cpu")
@@ -1017,6 +1592,7 @@ def selection_hints() -> dict[str, str]:
         "cuda": "Use CUDA_VISIBLE_DEVICES or `perflab peaks --cuda-index N` to choose which GPU peaks are inferred for.",
         "mps": "Use PERFLAB_MPS_DEVICE_INDEX or PERFLAB_MPS_DEVICE_MATCH to influence which Metal device is referenced in reporting.",
         "cache": "Set PERFLAB_PEAKS_NO_CACHE=1 to bypass caching; set PERFLAB_PEAKS_CACHE to override cache path.",
+        "cpu": "CPU peaks are measured by a ~2s cached microbenchmark (source=cpu-measured); set PERFLAB_CPU_PEAK_MEASURE=0 to use the spec model (source=cpu-spec) instead.",
     }
 
 

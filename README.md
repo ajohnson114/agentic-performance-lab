@@ -81,6 +81,15 @@ perflab agent matmul/python/task.yaml                # LLM-driven optimization
 
 Each task is a self-contained directory with a naive implementation, a benchmark harness (`bench.py`), a correctness test (`tests.py`), and a config (`task.yaml`). The agent must discover and apply all optimizations through code edits.
 
+`tasks/` at the repo root is a **mirror** of `perflab/demo_tasks/`, which is the packaged source of truth (wheel package data has to live inside the package). Either path works for *running* a task. If you *edit* a bundled task, edit it under `perflab/demo_tasks/` and then run:
+
+```bash
+python scripts/sync_demo_tasks.py          # update the mirror
+python scripts/sync_demo_tasks.py --check  # what CI runs; exit 1 on drift
+```
+
+A test fails if the two trees diverge, so drift is caught before it ships.
+
 ### Featured tasks
 
 These are good starting points for seeing what the agent can do:
@@ -204,18 +213,34 @@ Checks applied to what a candidate produces, independent of edit policy or runti
 - **Correctness gate** — every candidate runs `tests.py`; rejected on failure
 - **Contract validation** — benchmark output checked against `contract.fixed_params` (prevents shrinking the problem to "optimize") and `min_repeats`/`min_warmup` (prevents dialing down measurement counts)
 - **Regression check** — candidates must beat baseline by `regression_tolerance` (default 2%)
+- **Noise gate** — an improvement must also be distinguishable from measurement noise: by default, the candidate's 95% confidence interval must not overlap the incumbent's. Without it, a 2% acceptance threshold on a machine with 8% run-to-run spread accepts noise as a win, and beam search then chases it. When a task's benchmark reports only an aggregate (no per-repeat samples), the gate cannot run and the decision is logged as unverified rather than silently downgraded. Which test is applied is selectable — see **Decision rules** below
 - **Anti-gaming** — determinism re-runs with a varied seed (reject on divergence), zero-variance timing detection, mode-aware single-iteration speedup alerts, and optional thread-count enforcement — configured via `anti_gaming:` in task.yaml
+
+**Decision rules.** One module answers "is this candidate better?" for the agent, `perflab optimize`, and `perflab ci-check`. Pick the rule with `constraints.decision_rule` in `task.yaml`:
+
+| `decision_rule` | What it requires, on top of `regression_tolerance` | Benchmark cost |
+|---|---|---|
+| `non_overlapping_ci` *(default)* | The candidate's 95% CI must not overlap the incumbent's | — |
+| `tolerance_only` | Nothing — the bare ratio. Correct for deterministic metrics (instruction counts, bytes moved). `constraints.noise_gate: false` selects it and takes precedence | — |
+| `paired_difference` | An exact Wilcoxon signed-rank test (p<0.05) over a block-interleaved A/B run | **2.6–10x** |
+
+`paired_difference` re-measures the candidate *against* the incumbent by alternating spawns in ABBA order (6 pairs by default) instead of comparing measurements taken minutes apart, so thermal and clock drift cancels between the arms instead of being attributed to the patch. It costs roughly 2.6x the authoritative benchmark's wall clock for a task with enough repeats to spread across the blocks, and up to ~10x for a task configured with very few repeats — so it is opt-in. It earns that on drift-prone hardware (datacenter GPUs, shared CI runners, cloud VMs) and not on a quiet laptop. Where an interleaved run cannot happen — `perflab ci-check`, `perflab optimize`, or a measurement that failed part-way — the rule falls back to the default `non_overlapping_ci` gate and reports the result as unverified; it never falls back to accepting.
+
+Why it exists and what it does and does not buy: [Why block-interleaved (paired) A/B measurement, and why is it opt-in?](ENGINEERING_RATIONALE.md#why-block-interleaved-paired-ab-measurement-and-why-is-it-opt-in)
 
 PerfLab also includes `perflab.harness`, a library of anti-gaming utilities for `bench.py` and `tests.py`:
 
-| Helper | What it does |
-|--------|-------------|
-| `SyncTimer` / `cuda_sync_guard` | Forces device synchronization around timing |
-| `ThreadGuard` | Rejects new background threads during execution |
-| `assert_real_tensor` | Validates exact `torch.Tensor` type with real storage |
-| `assert_deterministic` | Same inputs must match, different inputs must differ |
-| `assert_ulp_close` | ULP-distance check against fp64 reference |
-| `assert_no_memoization` | Overwrites input data in-place and re-runs |
+| Helper | What it does | Backends |
+|--------|-------------|----------|
+| `SyncTimer` / `cuda_sync_guard` | Forces device synchronization around timing | torch CUDA/MPS, JAX; with no device it drains every backend that is live |
+| `ThreadGuard` | Rejects new background threads during execution | any |
+| `assert_real_array` | Rejects proxy/unmaterialized output: exact type, real storage, non-null data pointer, no JAX tracers or deleted buffers | torch, numpy, JAX, Python |
+| `assert_real_tensor` | The torch-only form of the same check | torch |
+| `assert_deterministic` | Same inputs must match, different inputs must differ | torch, numpy, JAX, Python |
+| `assert_ulp_close` | ULP-distance check against fp64 reference | torch, numpy, JAX, Python |
+| `assert_no_memoization` | Overwrites input data in-place and re-runs | torch, numpy, lists (needs one mutable input) |
+
+*Python* means nested lists/tuples and plain numbers. `import perflab.harness` pulls in no optional dependency — backends are identified from the value's own type, so a torch task never imports numpy and vice versa; comparisons on numpy/JAX values import numpy on demand (`pip install "perflab[tasks-python]"`), while the list/number path needs it not at all. A value the harness cannot inspect makes the check **raise**, never quietly pass.
 
 ---
 
@@ -276,6 +301,8 @@ perflab ci-check tasks/matmul/cpp/task.yaml                    # check in CI (ex
 
 Compares against the stored baseline using `regression_tolerance` from `task.yaml` (default 2%).
 
+The same noise gate applies here: a drop only fails CI if it is statistically distinguishable from run-to-run spread, so the check does not fail at random on a shared or unpinned runner. `--save-baseline` records the per-repeat samples needed for that comparison; baselines saved by earlier versions have none, so they fall back to the plain ratio test and the result is reported as unverified.
+
 ---
 
 ## MCP Server
@@ -331,7 +358,7 @@ This writes a commented YAML template — uncomment and edit only the settings y
 | Section | What it controls | When to change it |
 |---------|-----------------|-------------------|
 | `llm` | Provider, model, temperature | Switch between OpenAI/Anthropic/Ollama |
-| `benchmark` | Warmup iterations, repeat count | More repeats for noisy benchmarks, fewer for fast iteration |
+| `benchmark` | Warmup iterations, repeat count, CPU pinning | More repeats for noisy benchmarks, fewer for fast iteration; `cpu_pinning: off` on a host with uncontrolled competing load (Linux-only; a logged no-op elsewhere) |
 | `agent` | Candidates per iteration, max iterations, wall-clock budget, history depth | More candidates if you have compute budget; shorter runs for CI |
 | `profiler` | FLOPS counting, roofline cache | Disable FLOPS if it adds overhead |
 | `analysis_thresholds` | Bottleneck detection sensitivity | Tune for your hardware — e.g., lower occupancy threshold for register-heavy HPC kernels |
@@ -363,6 +390,8 @@ PerfLab gracefully skips profilers that aren't installed. Install the ones relev
 | toplev | Intel TMA analysis | `pip install pmu-tools` |
 
 Compilers: `g++` for C++ tasks, `nvcc` for CUDA. Runtimes: `torch`, `jax`, `triton` as needed (`pip install -e ".[tasks-pytorch]"`).
+
+**A note on hardware coverage:** PerfLab's CI has no GPU or TPU runner, so the NVIDIA (`nsys`/`ncu`) and TPU analysis paths are tested against recorded-format fixtures rather than real devices. The CPU paths and the Linux isolation layer are exercised on real hardware. See [Validation Coverage: What Runs on Real Hardware](ENGINEERING_RATIONALE.md#validation-coverage-what-runs-on-real-hardware) for exactly what that does and does not guarantee.
 
 ---
 

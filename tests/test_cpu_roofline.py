@@ -69,8 +69,11 @@ def test_estimate_cpu_peaks_linux_avx512():
             result = _estimate_cpu_peaks()
         assert result is not None
         assert result.peak_tflops > 0
-        # 56 cores x 32 (avx512 FLOP/cycle) x 4.8 GHz / 1000
-        expected_tflops = (56 * 32 * 4.8) / 1000.0
+        # 56 cores x 64 FLOP/cycle x 3.6 GHz / 1000.
+        # 64 because Sapphire Rapids w9-3495X carries two 512-bit FMA units;
+        # 3.6 GHz because only single-core max turbo (4.8) is knowable here, so
+        # it is derated toward an all-core-sustainable clock.
+        expected_tflops = (56 * 64 * 4.8 * 0.75) / 1000.0
         assert abs(result.peak_tflops - expected_tflops) < 0.01
         assert result.source == "cpu-spec"
 
@@ -96,7 +99,9 @@ def test_estimate_cpu_peaks_linux_falls_back_to_logical():
         mock_run.side_effect = fake_run
         result = _estimate_cpu_peaks()
         assert result is not None
-        expected_tflops = (16 * 16 * 3.0) / 1000.0
+        # 16 cores x 32 FLOP/cycle (AVX2 + FMA, two 256-bit FMA units)
+        # x 3.0 GHz derated to 2.25 for all-core.
+        expected_tflops = (16 * 32 * 3.0 * 0.75) / 1000.0
         assert abs(result.peak_tflops - expected_tflops) < 0.01
 
 
@@ -158,8 +163,9 @@ class TestPhysicalCpuCount:
 
 
 def test_infer_cpu_peaks_prefers_spec():
-    """infer_cpu_peaks should use spec-based first, then torch fallback."""
-    with patch("perflab.roofline_peaks._estimate_cpu_peaks") as mock_spec:
+    """With no measurement available, infer_cpu_peaks falls back to the spec model."""
+    with patch("perflab.roofline_peaks._estimate_cpu_peaks") as mock_spec, \
+         patch("perflab.roofline_peaks._measured_cpu_peaks", return_value=None):
         from perflab.roofline_peaks import Peaks
         mock_spec.return_value = Peaks(1.0, 50.0, "cpu-spec", "Test CPU")
         result = infer_cpu_peaks()
@@ -169,8 +175,9 @@ def test_infer_cpu_peaks_prefers_spec():
 
 
 def test_infer_cpu_peaks_falls_back_to_torch():
-    """When spec estimation fails, should try torch calibration."""
+    """When measurement and spec estimation both fail, try torch calibration."""
     with patch("perflab.roofline_peaks._estimate_cpu_peaks", return_value=None), \
+         patch("perflab.roofline_peaks._measured_cpu_peaks", return_value=None), \
          patch("perflab.roofline_peaks.infer_torch_calibration") as mock_torch:
         mock_torch.return_value = None
         result = infer_cpu_peaks()

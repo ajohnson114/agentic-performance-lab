@@ -976,6 +976,8 @@ def show_task_schema():
         ("CONSTRAINTS", [
             ("constraints.max_iters", "int", "Max agent iterations (default: 10)"),
             ("constraints.regression_tolerance", "float", "Min improvement fraction to accept (default: 0.02)"),
+            ("constraints.noise_gate", "bool", "Require improvements to clear measurement noise, not just the tolerance (default: true)"),
+            ("constraints.cv_threshold", "float", "Override the derived noise budget; null = derive from regression_tolerance and repeats"),
             ("constraints.rlimit_as_gb", "float|null", "Memory limit in GB (null=auto, 0=disable)"),
             ("constraints.prompt_token_budget", "int", "Max prompt tokens (0=unlimited)"),
             ("constraints.top_n", "int", "Number of bottleneck diagnoses (default: 3)"),
@@ -1070,3 +1072,10 @@ def show_tuning_schema():
     typer.echo("  For CUDA, sweep ranges are centered on CUTLASS-optimal baselines.")
     typer.echo("  Each config is contract-validated (fixed_params enforced).")
     typer.echo()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # Without this, `python -m perflab.cli ...` silently does nothing and exits
+    # 0 -- indistinguishable from a successful run. The console script
+    # (`perflab`, see [project.scripts]) targets `app` directly.
+    app()

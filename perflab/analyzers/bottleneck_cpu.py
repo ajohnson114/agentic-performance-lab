@@ -214,7 +214,7 @@ def _analyze_perf(
                     "L2 cache is the memory bottleneck — tiles or working set spill from L2",
                     [
                         "Increase tile size to improve L1 reuse but ensure tiles still fit in L2 (256KB-1MB)",
-                        "Use software prefetching (_mm_prefetch) for L2-to-L1 data movement",
+                        "Software prefetch (_mm_prefetch) ONLY if the access pattern is indirect or irregular (gather through an index array, pointer chase). On a linear stride-1 walk the hardware prefetcher already covers it and the extra instructions are usually a small loss — measure, and revert if the delta is within noise",
                         "Consider blocking for L2 (outer tile for L2, inner tile for L1)",
                     ],
                 ),
@@ -222,7 +222,7 @@ def _analyze_perf(
                     "L3/LLC is the memory bottleneck — working set exceeds L3 capacity",
                     [
                         "Restructure algorithm for streaming access (process data in one pass)",
-                        "Use non-temporal stores (_mm_stream_ps) for write-only data to bypass cache",
+                        "Non-temporal stores (_mm_stream_ps) ONLY for output written once and never re-read in this loop nest — they skip the read-for-ownership, saving ~1/3 of traffic. They HURT when the buffer is accumulated into (C += over K-blocks), which is the matmul case. Requires 64-byte alignment and an _mm_sfence before the data is read back",
                         "Consider data compression or reduced precision to shrink working set",
                     ],
                 ),
@@ -230,7 +230,7 @@ def _analyze_perf(
                     "DRAM bandwidth is the memory bottleneck — data must be fetched from main memory",
                     [
                         "Reduce total data movement (operator fusion, lower precision, fewer passes)",
-                        "Use streaming stores for write-only data to avoid read-for-ownership",
+                        "Streaming stores to avoid read-for-ownership — write-once output only; a loss if the same buffer is read again later in the nest",
                         "Consider NUMA-aware allocation if on multi-socket system",
                         "Maximize SIMD width to improve bytes-per-instruction ratio",
                     ],
@@ -238,7 +238,7 @@ def _analyze_perf(
                 "Store": (
                     "Store operations dominate memory stalls — write-back pressure or store-to-load forwarding issues",
                     [
-                        "Use non-temporal stores for write-only arrays",
+                        "Non-temporal stores for arrays written once and not re-read (they bypass cache, so a later read pays full DRAM latency)",
                         "Ensure stores are aligned to cache line boundaries (64 bytes)",
                         "Avoid store-to-load forwarding hazards (read after write to same address)",
                     ],

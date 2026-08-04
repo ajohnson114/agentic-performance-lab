@@ -400,6 +400,16 @@ def wrap_command(
 
     if policy.workspace is not None:
         args += ["--bind", str(policy.workspace), str(policy.workspace)]
+        # Pin the sandbox cwd explicitly instead of inheriting it across the
+        # mount-namespace change. Without this, bwrap resolves the working
+        # directory by name in the new namespace, which silently lands at "/"
+        # when the inherited PWD names a path that isn't bound -- notably the
+        # repo's `tasks -> perflab/demo_tasks` symlink. Every task's relative
+        # command ("python bench.py --json out/bench.json") then dies with
+        # "can't open file '//bench.py'". TaskSpec resolves workspace to the
+        # physical path, so the documented invocation was unaffected, but
+        # `cd tasks/matmul/python && perflab agent task.yaml` reproduced it.
+        args += ["--chdir", str(policy.workspace)]
     if policy.run_output_dir is not None and policy.run_output_dir != policy.workspace:
         args += ["--bind", str(policy.run_output_dir), str(policy.run_output_dir)]
 

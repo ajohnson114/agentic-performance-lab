@@ -272,6 +272,42 @@ class TestWrapCommandFallbacks:
         assert "--die-with-parent" in result
         assert "--bind" in result and str(ws) in result
 
+    def test_workspace_bind_is_followed_by_explicit_chdir(self, tmp_path):
+        """Regression: the sandbox cwd must be pinned, not inherited.
+
+        bwrap otherwise resolves the working directory by name inside the new
+        mount namespace and silently lands at "/" when the inherited PWD names
+        an unbound path -- e.g. the repo's `tasks -> perflab/demo_tasks`
+        symlink. Every task's relative command ("python bench.py --json
+        out/bench.json") then fails with "can't open file '//bench.py'".
+        Reproduced on Linux via `cd tasks/matmul/python && perflab agent
+        task.yaml`; a silent cwd change is exactly the kind of failure that
+        looks like a broken candidate rather than a broken sandbox.
+        """
+        cmd = ["python3", "bench.py"]
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        with patch.object(isolation_mod.platform, "system", return_value="Linux"), \
+             patch.object(isolation_mod.shutil, "which", return_value="/usr/bin/bwrap"), \
+             patch.object(isolation_mod, "_bwrap_usable", return_value=True), \
+             patch.object(isolation_mod, "_readonly_bind_paths", return_value=[]), \
+             patch.object(isolation_mod, "_nvidia_device_paths", return_value=[]):
+            result = wrap_command(cmd, IsolationPolicy(level="restricted", workspace=ws))
+        assert "--chdir" in result, "sandbox cwd must be pinned explicitly"
+        assert result[result.index("--chdir") + 1] == str(ws)
+        # and it must point at the workspace we bound, not anywhere else
+        assert result.index("--bind") < result.index("--chdir")
+
+    def test_no_chdir_when_no_workspace(self, tmp_path):
+        """--chdir is meaningless (and would fail) without a bound workspace."""
+        with patch.object(isolation_mod.platform, "system", return_value="Linux"), \
+             patch.object(isolation_mod.shutil, "which", return_value="/usr/bin/bwrap"), \
+             patch.object(isolation_mod, "_bwrap_usable", return_value=True), \
+             patch.object(isolation_mod, "_readonly_bind_paths", return_value=[]), \
+             patch.object(isolation_mod, "_nvidia_device_paths", return_value=[]):
+            result = wrap_command(["true"], IsolationPolicy(level="restricted"))
+        assert "--chdir" not in result
+
     def test_network_true_omits_unshare_net(self, tmp_path):
         cmd = ["python3", "bench.py"]
         ws = tmp_path / "ws"

@@ -118,6 +118,8 @@ def show_task_schema() -> dict:
             {"section": "CONSTRAINTS", "fields": [
                 {"name": "constraints.max_iters", "type": "int", "desc": "Max agent iterations (default: 10)"},
                 {"name": "constraints.regression_tolerance", "type": "float", "desc": "Min improvement fraction (default: 0.02)"},
+                {"name": "constraints.noise_gate", "type": "bool", "desc": "Require improvements to clear measurement noise (default: true)"},
+                {"name": "constraints.cv_threshold", "type": "float", "desc": "Override derived noise budget; null = derive from tolerance and repeats"},
                 {"name": "constraints.rlimit_as_gb", "type": "float|null", "desc": "Memory limit in GB (null=auto)"},
                 {"name": "constraints.prompt_token_budget", "type": "int", "desc": "Max prompt tokens (0=unlimited)"},
                 {"name": "constraints.allow_fast_math", "type": "bool", "desc": "Permit -ffast-math (default: false)"},

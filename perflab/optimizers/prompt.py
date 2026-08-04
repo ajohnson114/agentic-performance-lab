@@ -434,11 +434,29 @@ _BOUND_ACTIONS: dict[tuple[str, str], list[str]] = {
         "Use jax.checkpoint to recompute activations rather than materializing them to HBM",
     ],
     ("memory-bound", "cpp"): [
-        "Tile loops for L1/L2 cache locality — inner tile should fit in L1 (32-64 KB)",
-        "Use streaming stores (_mm_stream_ps) for write-only data to bypass cache pollution",
-        "Add software prefetching (_mm_prefetch) for predictable access patterns",
-        "Reduce data precision (float→half, double→float) where accuracy permits",
-        "Reorder loops to make the stride-1 dimension innermost (row-major: iterate columns last)",
+        "Make the innermost loop stride-1 (row-major: i,k,j — not i,j,k). An i,j,k inner loop strides "
+        "B by N and wastes 15 of every 16 floats in each cache line; loop order alone is often 3-10x",
+        "Block for every cache level, not one: innermost working set ≤ half of L1 (32-48 KB), the "
+        "enclosing tile ≤ L2 (256 KB-2 MB), the outermost ≤ L3. A single L1-tuned tile leaves L2/L3 reuse unused",
+        "Pack each reused tile into a small contiguous, 64B-aligned scratch buffer before the inner loop — "
+        "turns strided multi-page access into one linear stream (far fewer TLB walks); the copy amortizes over every reuse",
+        "Fuse passes over the same array so each byte is read once, and write into preallocated buffers "
+        "instead of materializing a temporary per pass",
+        "Reduce precision where accuracy permits (double→float; fp16/bf16 for storage with fp32 accumulate) — "
+        "halves bytes moved. Convert to fp32 for the arithmetic unless AVX512-BF16 / NEON bf16 dot is available",
+        "Non-temporal stores (_mm256_stream_ps) ONLY for output written once and never re-read in this loop nest — "
+        "they skip the read-for-ownership, saving ~1/3 of traffic on a pure streaming write. If the buffer is "
+        "re-read or accumulated into (C += over K-blocks), they push every re-read to DRAM and lose. "
+        "Need full 64B-aligned cache-line writes plus _mm_sfence() before any consumer reads",
+        "Software prefetch (_mm_prefetch) rarely beats the hardware prefetcher on linear access — it tracks "
+        "many sequential streams already, and the extra uops plus cache pollution usually make it a wash or a loss. "
+        "Reach for it only on indirect/irregular access where the address is known early (gather through an index "
+        "array, hash or pointer chase): prefetch idx[i+8..16] with _MM_HINT_T0, then measure; revert if the delta is noise",
+        "First-touch NUMA: initialize each thread's slice from the thread that will compute on it, under the same "
+        "OpenMP schedule — otherwise all pages land on one socket and remote threads run at cross-socket bandwidth. "
+        "Pin with OMP_PROC_BIND=close OMP_PLACES=cores",
+        "Mark non-aliasing pointers __restrict__ and align allocations to 64 bytes — otherwise the compiler emits "
+        "runtime alias checks and split-cache-line accesses that inflate effective traffic",
     ],
     ("memory-bound", "python"): [
         "Use numpy operations that avoid temporary arrays (np.add(a, b, out=c) instead of a + b)",
@@ -485,11 +503,36 @@ _BOUND_ACTIONS: dict[tuple[str, str], list[str]] = {
         "Set XLA_FLAGS: --xla_gpu_enable_latency_hiding_scheduler=true for compute-comm overlap",
     ],
     ("compute-bound", "cpp"): [
-        "Maximize SIMD utilization — use AVX-512/AVX2/NEON intrinsics for inner loops",
-        "Use FMA instructions (vfmadd231ps) — 2 FLOPs per cycle instead of 1",
-        "Unroll inner loops (4-8x) for instruction-level parallelism",
-        "Parallelize across cores with OpenMP — compute-bound work scales linearly",
-        "Enable -O3 -march=native -ffast-math for aggressive compiler vectorization",
+        "Use 8-12 INDEPENDENT accumulator registers in the inner loop. FMA latency is ~4 cycles with 2 FMA "
+        "ports, so one dependent accumulator chain caps you at ~1/8 of peak no matter how well it vectorizes. "
+        "This is usually the single largest win — do it before anything else",
+        "Register-block the inner loop as an outer product: keep an MR×NR tile of the output live in vector "
+        "registers, broadcast one A element, load one B vector, FMA into the tile. Each B vector then feeds "
+        "MR FMAs, so the loop becomes FMA-limited instead of load-limited (BLIS/GotoBLAS microkernel)",
+        "Pick MR×NR from the register file, not by feel: accumulators (MR*NR/lanes) + 2-3 operand registers must "
+        "fit — 16 ymm on AVX2 (e.g. 6x16 floats = 12 ymm), 32 zmm on AVX-512 (e.g. 14x32 or 31x16), 32 v-regs on NEON "
+        "(e.g. 8x12). Overshoot and the accumulators spill; grep the asm for vmovups to (%rsp) to confirm",
+        "Keep the output out of the innermost loop: accumulate into registers across all of K, store the MR×NR "
+        "tile once after the K loop. Loading/storing C every k iteration adds a store-to-load dependency that "
+        "serializes the FMA chain",
+        "Pack A and B panels into contiguous aligned buffers in microkernel order before the kernel runs: a KC×NC "
+        "panel of B per L3 block, an MC×KC panel of A per L2 block. The kernel then walks both linearly (no "
+        "stride-N loads, few TLB misses) and each packed panel is reused enough times to repay the copy",
+        "Structure the nest around the microkernel like BLIS: jc(NC over N) → pc(KC over K) → ic(MC over M) → "
+        "ir/jr over MR×NR. Start at KC≈256, MC≈256-384, NC≈2048-4096 for FP32 — sized so the KC×NR micro-panel of B "
+        "sits in L1, the MC×KC block of A in L2, the KC×NC block of B in L3 — then tune",
+        "Unroll the K loop 2-4x over the packed panels and hoist all address arithmetic out of the body so ≥2 FMAs "
+        "issue per cycle — unrolling only pays once the accumulators are independent",
+        "Emit FMAs explicitly (_mm256_fmadd_ps / _mm512_fmadd_ps / vfmaq_f32): without -ffast-math or "
+        "#pragma omp simd the compiler is not allowed to contract a*b+c, which halves peak. Verify with "
+        "-fopt-info-vec or by grepping the asm for vfmadd/fmla",
+        "Parallelize the outer M (ic) or N (jc) block loop with OpenMP so each thread owns disjoint output tiles — "
+        "no reduction, no false sharing. #pragma omp parallel for schedule(static), one packed A buffer per thread, "
+        "OMP_PROC_BIND=close OMP_PLACES=cores",
+        "Allocate packed buffers 64-byte aligned (std::aligned_alloc) and use aligned loads on them; mark kernel "
+        "pointers __restrict__ so the compiler stops emitting alias checks and reloads across stores",
+        "Build with -O3 -march=native -funroll-loops and confirm the hot loop actually vectorized before "
+        "micro-tuning — scalar code loses 8-16x, which dwarfs every other item here",
     ],
     ("compute-bound", "python"): [
         "Vectorize with numpy — BLAS routines use optimized SIMD and threading",
@@ -529,6 +572,47 @@ _COMPUTE_REASONING: list[tuple[float, str]] = [
             "Hardware ALUs are well-utilized. Focus on algorithmic FLOPs reduction "
             "or precision reduction for higher Tensor Core throughput."),
 ]
+
+
+# CPU variants of the two tables above. The GPU wording (SM occupancy, warp divergence,
+# Tensor Cores, coalescing) is meaningless for a C++/CPU task and sends the agent after
+# non-existent knobs, so program_type == "cpp" gets its own causes in the same tiers.
+_BW_REASONING_CPU: list[tuple[float, str]] = [
+    (30.0, "Bandwidth utilization is very low ({bw_pct:.0f}% of peak DRAM bandwidth). "
+           "On CPU this usually means the access pattern is the limit, not the bus: strided or random "
+           "access using one useful float per 64-byte line, a working set thrashing L2/L3, or a single "
+           "thread that cannot keep enough misses in flight (one core typically reaches only ~1/3 of "
+           "socket bandwidth — saturating DRAM takes several threads)."),
+    (70.0, "Bandwidth utilization is moderate ({bw_pct:.0f}% of peak DRAM bandwidth). "
+           "Likely causes: partial cache-line utilization, blocking tuned for one cache level only, "
+           "read-for-ownership traffic on write-once output, or NUMA pages placed on a remote socket "
+           "by a first-touch mismatch."),
+    (100.1, "Bandwidth utilization is high ({bw_pct:.0f}% of peak DRAM bandwidth). "
+            "The memory subsystem is saturated — further gains must come from moving fewer bytes "
+            "(loop fusion, lower precision, blocking for more reuse), not better access patterns."),
+]
+
+
+_COMPUTE_REASONING_CPU: list[tuple[float, str]] = [
+    (30.0, "Compute utilization is very low ({compute_pct:.0f}% of peak). On CPU the usual causes, in "
+           "order of impact: the hot loop is scalar (never vectorized); the FMA chain runs through a "
+           "single accumulator (~4-cycle FMA latency × 2 FMA ports means ~8 independent accumulators are "
+           "needed to reach peak); operands are reloaded from memory each iteration instead of being held "
+           "in a register-blocked tile; or only one core is working."),
+    (70.0, "Compute utilization is moderate ({compute_pct:.0f}% of peak). Likely: too few independent "
+           "accumulators to cover FMA latency, a microkernel tile large enough to spill registers to the "
+           "stack, loads/stores of the output inside the innermost loop, or thread imbalance across cores."),
+    (100.1, "Compute utilization is high ({compute_pct:.0f}% of peak). The FMA units are well fed. "
+            "Further gains require algorithmic FLOP reduction or lower precision "
+            "(bf16/int8 dot-product instructions where the ISA has them)."),
+]
+
+
+def _reasoning_tiers(bound: str, program_type: str) -> list[tuple[float, str]]:
+    """Pick the utilization-reasoning table for this bound and program type."""
+    if program_type == "cpp":
+        return _BW_REASONING_CPU if bound == "memory-bound" else _COMPUTE_REASONING_CPU
+    return _BW_REASONING if bound == "memory-bound" else _COMPUTE_REASONING
 
 
 # Utilization tiers map GPU/compute utilization to the appropriate optimization strategy:
@@ -688,19 +772,24 @@ _TIER_ACTIONS: dict[tuple[str, str], list[str]] = {
         "Use -O3 -march=native compiler flags",
     ],
     ("standard", "cpp"): [
+        "Make the innermost loop stride-1 (row-major: i,k,j rather than i,j,k)",
         "Tile loops for L1/L2 cache locality (32-64 KB / 256 KB-1 MB)",
-        "Use SIMD intrinsics (AVX-512, NEON) for vectorization",
+        "Use SIMD intrinsics (AVX-512, NEON) for vectorization, with explicit FMA (_mm256_fmadd_ps / vfmaq_f32)",
         "Align data to cache line boundaries (64 bytes)",
         "Use restrict pointers for aliasing hints",
     ],
     ("kernel", "cpp"): [
-        "Implement blocking/tiling for matrix operations",
-        "Use software prefetching for streaming access",
+        "Use 8-12 independent accumulators in the inner loop to cover ~4-cycle FMA latency across 2 FMA ports",
+        "Register-block the inner loop: hold an MR×NR output tile in vector registers, broadcast A, load B, FMA",
+        "Pack reused panels into contiguous aligned scratch buffers so the kernel walks memory linearly (BLIS style)",
+        "Implement multi-level blocking for matrix operations (L1/L2/L3, not one tile size)",
         "Reduce branch mispredictions in inner loops",
         "Consider GPU offload for parallel workloads",
     ],
     ("fine_tune", "cpp"): [
         "Profile with perf/VTune for cache miss analysis",
+        "Tune microkernel MR×NR against the register file and KC/MC/NC against L1/L2/L3 sizes",
+        "Check the asm for accumulator spills (vmovups to (%rsp)) — the tile is too big if they appear",
         "Tune thread count and affinity for NUMA",
         "Use link-time optimization (LTO)",
         "Add __attribute__((hot)) to perf-identified hot functions for i-cache co-location",
@@ -708,7 +797,9 @@ _TIER_ACTIONS: dict[tuple[str, str], list[str]] = {
         "Use __builtin_expect(cond, 0) on unlikely branches so compiler can split cold paths",
     ],
     ("micro", "cpp"): [
-        "Tune prefetch distances for memory access patterns",
+        "Software-prefetch only irregular/indirect access (gather via index array, pointer chase) and tune the "
+        "distance; on linear streams the hardware prefetcher already wins and _mm_prefetch is usually a wash or a loss",
+        "Use non-temporal stores only for write-once output that is not re-read in this loop nest (never for accumulators)",
         "Align loop trip counts to SIMD register width",
         "Use compiler intrinsics for critical sections",
         "Force-inline small hot helpers: __attribute__((always_inline)) on functions called from hot loops",
@@ -769,6 +860,13 @@ _OPTIMIZATION_KEYWORDS: dict[str, str] = {
     "vectori": "vectorization",
     "simd": "SIMD intrinsics",
     "openmp": "OpenMP",
+    "microkernel": "register-blocked microkernel",
+    "register block": "register blocking",
+    "accumulator": "multiple accumulators",
+    "panel pack": "panel packing",
+    "software prefetch": "software prefetch",
+    "non-temporal": "non-temporal stores",
+    "streaming store": "non-temporal stores",
     "thread coarsening": "thread coarsening",
     "control divergence": "control divergence",
     "empty_cache": "torch.cuda.empty_cache",
@@ -892,13 +990,13 @@ def _build_optimization_playbook(
         # Bandwidth or compute reasoning
         if bound == "memory-bound" and bound_info["bw_pct"] is not None:
             bw_pct = bound_info["bw_pct"]
-            for threshold, template in _BW_REASONING:
+            for threshold, template in _reasoning_tiers(bound, ctx.program_type):
                 if bw_pct < threshold:
                     sections.append(template.format(bw_pct=bw_pct))
                     break
         elif bound == "compute-bound" and bound_info["compute_pct"] is not None:
             compute_pct = bound_info["compute_pct"]
-            for threshold, template in _COMPUTE_REASONING:
+            for threshold, template in _reasoning_tiers(bound, ctx.program_type):
                 if compute_pct < threshold:
                     sections.append(template.format(compute_pct=compute_pct))
                     break
@@ -2109,6 +2207,12 @@ def _add_perf_vs_peak(parts: list[str], ctx: PromptContext) -> None:
                              "Priority: reduce bytes moved per operation (operator fusion, lower precision, "
                              "better access patterns). Increasing FLOPs efficiency (e.g., Tensor Cores) won't help "
                              "until memory traffic is reduced enough to shift past the knee.\n")
+            elif ctx.program_type == "cpp":
+                parts.append("Performance scales with arithmetic throughput. "
+                             "Priority: keep the FMA units fed — vectorize the hot loop, run 8-12 independent "
+                             "accumulators to cover FMA latency, register-block an MR×NR output tile, and pack "
+                             "the panels it reads. Cache/access-pattern work beyond keeping the microkernel's "
+                             "panels resident has diminishing returns — the FMA pipeline is the bottleneck.\n")
             else:
                 parts.append("Performance scales with arithmetic throughput. "
                              "Priority: use Tensor Cores (FP16/BF16/TF32), reduce total FLOPs, "
