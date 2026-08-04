@@ -3,6 +3,7 @@
 // An optimizing agent should add shared-memory tiling, loop unrolling, etc.
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,7 +11,49 @@
 #include <string>
 #include <vector>
 
-#define CHECK_CUDA(call)                                                       \
+// --- Benchmark barriers (host side) -----------------------------------------
+// These constrain the HOST compiler only. What makes the timing of a kernel
+// launch correct is the cudaDeviceSynchronize() inside the timed region below --
+// a launch is asynchronous, so without the sync the host clock would measure
+// only the launch overhead. The barriers are here so the surrounding host code
+// (buffer setup, result handling) cannot be sunk out of or hoisted into the
+// timed region if this benchmark loop is ever restructured.
+//
+// do_not_optimize(v)  makes an opaque asm block consume `v`, so `v` must really
+//   be computed. The "r,m" multiple-alternative constraint lets the operand stay
+//   in a REGISTER when it fits in one and falls back to MEMORY only when it does
+//   not -- a bare "m" would force a spill to the stack on every call and inflate
+//   the measurement.
+// clobber_memory()    tells the compiler the asm may read and write any memory,
+//   so pending stores are committed before the clock is read and nothing stays
+//   cached in a register across the barrier.
+//
+// Both emit zero instructions; they constrain only the optimizer. They are host
+// functions (no __device__ annotation) and are never called from device code.
+#if defined(__GNUC__) || defined(__clang__)
+template <class T>
+inline void do_not_optimize(const T& value) {
+    asm volatile("" : : "r,m"(value) : "memory");
+}
+inline void clobber_memory() {
+    asm volatile("" : : : "memory");
+}
+#else
+// MSVC has no inline asm on x64/ARM64. These tasks build with nvcc over g++/clang,
+// so this path exists only to keep the file compilable; it is a weaker barrier.
+#include <atomic>
+inline void clobber_memory() {
+    std::atomic_signal_fence(std::memory_order_acq_rel);
+}
+template <class T>
+inline void do_not_optimize(const T& value) {
+    volatile const T* sink = &value;
+    (void)sink;
+    clobber_memory();
+}
+#endif
+
+#define CHECK_CUDA(call)                                                     \
     do {                                                                       \
         cudaError_t err = (call);                                              \
         if (err != cudaSuccess) {                                              \
@@ -37,6 +80,32 @@ __global__ void sgemm_kernel(int M, int N, int K,
 static double tflops(int M, int N, int K, double seconds) {
     double flops = 2.0 * M * N * K;
     return flops / seconds / 1e12;
+}
+
+// Ceiling-indexed percentile -- mirrors
+// perflab.harness.precision._ceil_percentile_index. Floor indexing
+// (static_cast<int>(fraction * (n - 1))) rounds toward the middle of the
+// distribution, so at small sample counts (n=2 during fast screening, n=10 by
+// default here) the extreme value falls just past the computed index and is
+// never reported -- e.g. n=2: floor(0.95*1)=0 returns the MINIMUM as "p95".
+static double ceil_percentile(const std::vector<double>& sorted_values, double fraction) {
+    int n = static_cast<int>(sorted_values.size());
+    int idx = static_cast<int>(std::ceil(fraction * (n - 1)));
+    if (idx > n - 1) idx = n - 1;
+    if (idx < 0) idx = 0;
+    return sorted_values[idx];
+}
+
+// True median: averages the middle pair for an even sample count.
+// sorted_values[n / 2] alone (the previous implementation here) is biased
+// high for even n -- at n=2 it always returns the larger of the two samples.
+// Matches perflab.analyzers.bench_stats.compute_bench_stats's median.
+static double true_median(const std::vector<double>& sorted_values) {
+    int n = static_cast<int>(sorted_values.size());
+    if (n % 2 == 0) {
+        return (sorted_values[n / 2 - 1] + sorted_values[n / 2]) / 2.0;
+    }
+    return sorted_values[n / 2];
 }
 
 static int selftest() {
@@ -151,10 +220,18 @@ int main(int argc, char** argv) {
         CHECK_CUDA(cudaMemset(d_C, 0, sC));
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        auto t0 = std::chrono::high_resolution_clock::now();
+        // steady_clock, not high_resolution_clock: on libstdc++ the latter is a
+        // typedef for system_clock, i.e. the wall clock, which is NOT monotonic
+        // -- an NTP step mid-benchmark yields a wrong or negative interval.
+        auto t0 = std::chrono::steady_clock::now();
+        clobber_memory();
         sgemm_kernel<<<grid, block>>>(M, N, K, d_A, d_B, d_C);
+        // The sync is what makes this measurement meaningful: the launch above
+        // is asynchronous, so without it t1 would capture launch overhead only.
         CHECK_CUDA(cudaDeviceSynchronize());
-        auto t1 = std::chrono::high_resolution_clock::now();
+        do_not_optimize(d_C);
+        clobber_memory();
+        auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         times_ms.push_back(ms);
     }
@@ -162,9 +239,15 @@ int main(int argc, char** argv) {
     // Percentiles
     std::vector<double> sorted_times = times_ms;
     std::sort(sorted_times.begin(), sorted_times.end());
-    double p50 = sorted_times[sorted_times.size() / 2];
-    double p95 = sorted_times[static_cast<int>(0.95 * (sorted_times.size() - 1))];
+    double p50 = true_median(sorted_times);
+    double p95 = ceil_percentile(sorted_times, 0.95);
     double tflops_med = tflops(M, N, K, p50 / 1000.0);
+
+    // Per-repeat tflops, in measurement order -- what the accept gate's
+    // variance check (extract_repeated_values) needs alongside the aggregate.
+    std::vector<double> tflops_list;
+    tflops_list.reserve(times_ms.size());
+    for (double ms : times_ms) tflops_list.push_back(tflops(M, N, K, ms / 1000.0));
 
     if (json_output) {
         printf("{\n");
@@ -176,8 +259,18 @@ int main(int argc, char** argv) {
             printf("%.4f", times_ms[i]);
         }
         printf("],\n");
-        printf("  \"latency_ms\": {\"p50\": %.4f, \"p95\": %.4f},\n", p50, p95);
-        printf("  \"tflops\": {\"median\": %.6f},\n", tflops_med);
+        printf("  \"latency_ms\": {\"p50\": %.4f, \"p95\": %.4f, \"raw_values\": [", p50, p95);
+        for (size_t i = 0; i < times_ms.size(); ++i) {
+            if (i) printf(", ");
+            printf("%.4f", times_ms[i]);
+        }
+        printf("]},\n");
+        printf("  \"tflops\": {\"median\": %.6f, \"raw_values\": [", tflops_med);
+        for (size_t i = 0; i < tflops_list.size(); ++i) {
+            if (i) printf(", ");
+            printf("%.6f", tflops_list[i]);
+        }
+        printf("]},\n");
         printf("  \"ok\": true\n");
         printf("}\n");
     } else {

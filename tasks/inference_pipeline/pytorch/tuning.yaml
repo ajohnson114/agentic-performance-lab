@@ -1,0 +1,5 @@
+# Inference pipeline configuration — realistic workload.
+# 256 images total, processed in batches.
+# Fixed by contract: num_images cannot be changed.
+num_images: 256
+batch_size: 64

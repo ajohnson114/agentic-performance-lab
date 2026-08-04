@@ -73,4 +73,8 @@ check_untyped_defs = true
 # library code -- CI's `mypy perflab` only swept them in because they now live
 # on disk under perflab/ for packaging (see [tool.setuptools.package-data]).
 # They were never mypy-checked before the move and aren't held to the same bar.
-exclude = ["^perflab/demo_tasks/"]
+# tasks/ is a byte-identical mirror of perflab/demo_tasks/ (enforced by
+# tests/test_demo_task_mirror.py). Excluding both keeps `mypy .` working: two
+# real copies otherwise collide as duplicate module names, which is what the
+# old tasks -> perflab/demo_tasks symlink did too.
+exclude = ["^perflab/demo_tasks/", "^tasks/", "^build/"]

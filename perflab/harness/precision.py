@@ -8,6 +8,16 @@ The fix: compare kernel output against an fp64 reference using ULP (units in
 last place) distance, which is more sensitive than simple allclose checks.
 Also checks that the output dtype matches the expected dtype.
 
+Backend-neutral: actual/reference may be torch tensors, numpy arrays, JAX
+arrays or nested Python lists, in any combination. Both operands are flattened
+to float32-rounded Python floats before the distances are taken -- the same
+normalization the torch-only version applied via ``.float()``, and the reason
+an fp32 kernel can pass against an fp64 reference at all (unrounded, a
+correctly-rounded fp32 value sits ~2**29 float64-ULPs from its fp64 original).
+
+``expected_dtype`` accepts a native dtype (``torch.float32``, ``numpy.float32``)
+or its name as a string, so the check is usable from a task that has no torch.
+
 Usage in tests.py:
     from perflab.harness.precision import assert_ulp_close
 
@@ -18,6 +28,10 @@ Usage in tests.py:
 from __future__ import annotations
 
 import math
+import random
+from typing import Any
+
+from perflab.harness import _array
 
 # A single corrupted element (as opposed to ordinary heavy-tail fp32
 # rounding) can blow the max ULP distance up far beyond max_ulp even when
@@ -25,31 +39,66 @@ import math
 HARD_MAX_ULP_FACTOR = 64
 
 
-def _ulp_distance(a_float: float, b_float: float) -> float:
-    """Compute ULP distance between two floats.
+def _ulp_distance(
+    a_float: float, b_float: float, precision: str = "float32"
+) -> float:
+    """Number of representable ``precision`` values between two floats.
 
-    ULP = Unit in the Last Place. Measures how many representable floats
-    apart two values are. More precise than absolute/relative tolerance
-    for catching precision downgrades.
+    ULP = Unit in the Last Place: how many representable steps apart two values
+    are. Sharper than an absolute or relative tolerance for catching a
+    precision downgrade, because it is scale-free.
+
+    The distance is measured in the WORKING precision -- the one the kernel
+    actually computed in -- not float64. Measuring float64 ULPs over values
+    that have been rounded to float32 inflates every distance by ~2**29: one
+    float32 step reads as 536,870,912, so a default budget of 16 silently
+    means "must be bit-identical" and rejects every honest fp32 kernel. (An
+    fp32 matmul against an fp64 reference measures p50=1, p99=6 float32-ULPs,
+    which is exactly what a budget of 16 was written for.)
+
+    Implemented by mapping IEEE bit patterns onto a monotonic integer ordering
+    and subtracting, which is exact at every magnitude including subnormals --
+    unlike dividing by a local ULP size, which is only an approximation once
+    the two values straddle an exponent boundary.
     """
     if math.isnan(a_float) or math.isnan(b_float):
         return float("inf")
-    if a_float == b_float:
-        return 0.0
-    # Use the smaller exponent's ULP as the reference
-    if a_float == 0.0:
-        return abs(b_float) / _float_ulp(b_float)
-    if b_float == 0.0:
-        return abs(a_float) / _float_ulp(a_float)
-    ulp_size = min(_float_ulp(a_float), _float_ulp(b_float))
-    if ulp_size == 0:
-        return float("inf")
-    return abs(a_float - b_float) / ulp_size
+    nbits = _array.FLOAT_PRECISIONS[precision][0]
+    key_a = _monotonic_key(_array.float_bits(a_float, precision), nbits)
+    key_b = _monotonic_key(_array.float_bits(b_float, precision), nbits)
+    return float(abs(key_a - key_b))
+
+
+def _monotonic_key(bits: int, nbits: int) -> int:
+    """Map an IEEE bit pattern onto a monotonically increasing integer.
+
+    Raw bits are not orderable across zero: negative floats ascend in magnitude
+    as their bit patterns ascend, so subtracting raw patterns is meaningless
+    for a mixed-sign pair. Flipping the negative half fixes that, and makes
+    +0.0 and -0.0 land on the same key (they are numerically equal).
+    """
+    sign = 1 << (nbits - 1)
+    return (1 << nbits) - bits if bits & sign else bits + sign
 
 
 def _float_ulp(x: float) -> float:
-    """Return the ULP (unit in last place) for float x."""
+    """Return the float64 ULP (unit in last place) for float x."""
     return math.ulp(abs(x)) if x != 0 else math.ulp(0.0)
+
+
+def _infer_precision(value, fallback: str = "float32") -> str:
+    """Working precision of ``value``, defaulting when it is not a float type.
+
+    Inferring from the kernel's own output is what makes the check usable under
+    mixed precision: a bf16 autocast result is compared in bf16 ULPs against a
+    bf16-rounded reference, so AMP -- the intended optimization for several
+    tasks -- passes, while a kernel materially worse than bf16 still fails.
+    """
+    try:
+        name = _array.dtype_name(value)
+    except Exception:  # noqa: BLE001 - dtype is advisory; fall back
+        return fallback
+    return name if name in _array.FLOAT_PRECISIONS else fallback
 
 
 def _ceil_percentile_index(fraction: float, n_s: int) -> int:
@@ -70,6 +119,7 @@ def assert_ulp_close(
     reference,
     max_ulp: float = 16.0,
     expected_dtype=None,
+    precision: str | None = None,
     sample_fraction: float = 0.01,
     min_samples: int = 1000,
     max_samples: int = 100000,
@@ -80,12 +130,13 @@ def assert_ulp_close(
     tensors) and asserts that the p99 ULP distance is within max_ulp.
 
     Args:
-        actual: Output tensor from the kernel.
-        reference: Reference tensor computed in fp64.
+        actual: Output array from the kernel (any supported backend).
+        reference: Reference array computed in fp64.
         max_ulp: Maximum allowed ULP distance (p99). Default 16 allows
                  for normal fp32 rounding but catches fp16→fp32 casts.
-        expected_dtype: If set, assert actual.dtype matches this.
-        sample_fraction: Fraction of elements to sample for large tensors.
+        expected_dtype: If set, assert actual's dtype matches this. Accepts a
+                 native dtype object or its name as a string.
+        sample_fraction: Fraction of elements to sample for large arrays.
         min_samples: Minimum number of elements to check.
         max_samples: Maximum number of elements to check.
 
@@ -93,56 +144,57 @@ def assert_ulp_close(
         Dict with statistics: {mean_ulp, p50_ulp, p95_ulp, p99_ulp, max_ulp}.
 
     Raises:
-        AssertionError if precision check fails.
+        AssertionError if precision check fails, or if either operand has a
+        type the harness cannot inspect.
     """
-    import torch
+    _array.require_backend(actual, "actual")
+    _array.require_backend(reference, "reference")
 
     # Dtype check
-    if expected_dtype is not None and actual.dtype != expected_dtype:
+    if expected_dtype is not None and not _array.dtype_matches(actual, expected_dtype):
         raise AssertionError(
-            f"Precision downgrade detected: output dtype is {actual.dtype}, "
-            f"expected {expected_dtype}. The kernel may be computing in lower "
-            f"precision and casting up."
+            f"Precision downgrade detected: output dtype is "
+            f"{_array.dtype_repr(actual)}, expected {expected_dtype}. The kernel "
+            f"may be computing in lower precision and casting up."
         )
 
-    # Flatten for sampling
-    a_flat = actual.detach().float().cpu().flatten()
-    r_flat = reference.detach().float().cpu().flatten()
-
-    if a_flat.shape != r_flat.shape:
+    a_shape = _array.shape_of(actual, "actual")
+    r_shape = _array.shape_of(reference, "reference")
+    if a_shape != r_shape:
         raise AssertionError(
-            f"Shape mismatch: actual {actual.shape} vs reference {reference.shape}"
+            f"Shape mismatch: actual {a_shape} vs reference {r_shape}"
         )
 
-    n = a_flat.numel()
+    n = math.prod(a_shape)
     n_samples = min(max(int(n * sample_fraction), min(min_samples, n)), min(max_samples, n))
 
-    if n_samples < n:
-        indices = torch.randperm(n)[:n_samples]
-        a_sampled = a_flat[indices]
-        r_sampled = r_flat[indices]
-    else:
-        a_sampled = a_flat
-        r_sampled = r_flat
+    # Sampled indices are drawn in pure Python (no torch.randperm), so the
+    # check works on a backend-free install; sorting keeps the subsequent
+    # gather sequential on every backend.
+    indices = sorted(random.sample(range(n), n_samples)) if n_samples < n else None
+    # The kernel's own dtype is the working precision; the reference is
+    # rounded down to it so an fp64 reference can be compared at all.
+    prec = precision or _infer_precision(actual)
+    a_list = _array.flat_float_list(actual, prec, indices, "actual")
+    r_list = _array.flat_float_list(reference, prec, indices, "reference")
 
-    # Compute ULP distances
+    # Compute ULP distances. a_list/r_list are always the same length (same
+    # shape, sampled with the same indices).
     ulp_dists = []
-    a_list = a_sampled.tolist()
-    r_list = r_sampled.tolist()
-    # a_list/r_list are always the same length (sliced/derived together above).
     for a_val, r_val in zip(a_list, r_list, strict=True):
-        ulp_dists.append(_ulp_distance(a_val, r_val))
+        ulp_dists.append(_ulp_distance(a_val, r_val, prec))
 
     ulp_dists.sort()
     n_s = len(ulp_dists)
 
-    stats = {
+    stats: dict[str, Any] = {
         "mean_ulp": sum(ulp_dists) / n_s if n_s > 0 else 0,
         "p50_ulp": ulp_dists[n_s // 2] if n_s > 0 else 0,
         "p95_ulp": ulp_dists[_ceil_percentile_index(0.95, n_s)] if n_s > 1 else (ulp_dists[0] if n_s else 0),
         "p99_ulp": ulp_dists[_ceil_percentile_index(0.99, n_s)] if n_s > 1 else (ulp_dists[0] if n_s else 0),
         "max_ulp_observed": ulp_dists[-1] if n_s > 0 else 0,
         "n_samples": n_s,
+        "precision": prec,
     }
 
     # Hard ceiling: a single corrupted element can leave p99 well within

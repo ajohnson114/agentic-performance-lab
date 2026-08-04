@@ -254,7 +254,9 @@ class TestPrecision:
         bits = struct.pack('d', 1.0)
         int_val = struct.unpack('Q', bits)[0]
         next_float = struct.unpack('d', struct.pack('Q', int_val + 1))[0]
-        dist = _ulp_distance(1.0, next_float)
+        # Explicit float64: the default measures in the *working* precision
+        # (float32), where these two adjacent float64s round to one value.
+        dist = _ulp_distance(1.0, next_float, "float64")
         assert dist == pytest.approx(1.0, abs=0.1)
 
     def test_exact_fp32_passes(self):
@@ -291,7 +293,8 @@ class TestPrecision:
         from perflab.harness import precision as precision_mod
 
         dists = iter([1.0, 2.0, 3.0, 5000.0])
-        monkeypatch.setattr(precision_mod, "_ulp_distance", lambda a, b: next(dists))
+        monkeypatch.setattr(precision_mod, "_ulp_distance",
+                            lambda a, b, precision="float32": next(dists))
 
         a = torch.zeros(4)
         b = torch.zeros(4)
@@ -308,7 +311,8 @@ class TestPrecision:
         n = 200
         values = [1.0] * (n - 1) + [10000.0]
         dists = iter(values)
-        monkeypatch.setattr(precision_mod, "_ulp_distance", lambda a, b: next(dists))
+        monkeypatch.setattr(precision_mod, "_ulp_distance",
+                            lambda a, b, precision="float32": next(dists))
 
         a = torch.zeros(n)
         b = torch.zeros(n)

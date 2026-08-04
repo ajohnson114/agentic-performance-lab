@@ -1,0 +1,57 @@
+name: gpu_inference_demo_pytorch
+workspace: tasks/gpu_inference_demo/pytorch
+program_type: pytorch
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: images_per_sec.median
+    mode: maximize
+  warmup: 3
+  repeats: 10
+
+profile_plan:
+  always: [cpu_flame, torch_trace, nsys]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+
+agent:
+  n_candidates: 3
+  top_k: 2
+
+contract:
+  fixed_params:
+    num_images: 4096
+  min_repeats: 3
+  required_bench_fields: ["ok", "images_per_sec"]
+
+edit_policy:
+  allowed_paths:
+    - "pipeline.py"
+    - "tuning.yaml"
+
+target_hardware: "NVIDIA H100"
+
+roofline:
+  peak_tflops: 989.0
+  peak_fp16_tflops: 1979.0
+  peak_mem_bw_gbs: 3350.0
+  title: "H100 GPU Inference Roofline"
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.5          # inference should be GPU-dominated
+  sync_count_warn: 3              # fewer syncs expected for inference
+  phase_dominance_pct: 50.0
+  mem_alloc_overhead_pct: 0.05    # tighter for H100
+  nsys_gpu_fraction_low: 0.6      # H100 should be busy
+  ncu_sm_util_low: 55.0           # ResNet-50 on H100 should hit this
+  host_device_gpu_active_low: 55.0  # tighter for H100
+
+out_dir: "../../out"

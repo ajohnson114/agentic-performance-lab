@@ -1,0 +1,43 @@
+name: "transformer_train_jax"
+workspace: "tasks/transformer_train/jax"
+program_type: "jax"
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tokens_per_sec.median"
+    mode: "maximize"
+  warmup: 2
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.3         # training overhead
+  jax_recompilation_warn: 1      # recompilation wastes training time
+  jax_compilation_time_high_ms: 10000.0  # XLA compiles more for training graphs
+  jax_compilations_excessive: 3
+  phase_dominance_pct: 40.0
+
+contract:
+  fixed_params: { batch_size: 8, seq_len: 128 }
+  min_repeats: 3
+  required_bench_fields: ["ok", "tokens_per_sec"]
+
+edit_policy:
+  allowed_paths:
+    - "model.py"
+
+out_dir: "../../out"

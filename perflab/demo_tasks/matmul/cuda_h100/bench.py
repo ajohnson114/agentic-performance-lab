@@ -27,23 +27,28 @@ def main():
     if not binary.exists():
         raise FileNotFoundError(f"Binary {binary} not found. Run the build step first.")
 
-    # Run
-    warmup = os.environ.get("PERFLAB_BENCH_WARMUP")
-    repeats = os.environ.get("PERFLAB_BENCH_REPEATS")
+    # Run. Defaults here mirror sgemm.cu's own hardcoded --warmup/--repeats
+    # defaults, but since we always pass them explicitly below, the binary's
+    # defaults never actually get exercised -- these are the real values.
+    warmup = int(os.environ.get("PERFLAB_BENCH_WARMUP", 3))
+    repeats = int(os.environ.get("PERFLAB_BENCH_REPEATS", 10))
     run_cmd = [
         str(binary.resolve()),
         "--M", str(M), "--N", str(N), "--K", str(K),
         "--threadsPerBlock", str(threadsPerBlock),
+        "--warmup", str(warmup), "--repeats", str(repeats),
         "--json",
     ]
-    if warmup is not None:
-        run_cmd += ["--warmup", warmup]
-    if repeats is not None:
-        run_cmd += ["--repeats", repeats]
     print(f"[bench] running: {' '.join(run_cmd)}")
     result = subprocess.run(run_cmd, capture_output=True, text=True, check=True)
 
     bench_data = json.loads(result.stdout)
+    # sgemm.cu's own JSON doesn't report the sampling counts it used --
+    # inject the actual (post-env-override) values for the contract's
+    # min_repeats/min_warmup anti-gaming check.
+    bench_data.setdefault("meta", {})
+    bench_data["meta"]["warmup"] = warmup
+    bench_data["meta"]["repeats"] = repeats
 
     out_path = Path(args.json)
     out_path.parent.mkdir(parents=True, exist_ok=True)

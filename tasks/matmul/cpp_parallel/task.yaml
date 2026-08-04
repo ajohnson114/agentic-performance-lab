@@ -1,0 +1,48 @@
+name: "matmul_cpp_parallel"
+workspace: "tasks/matmul/cpp_parallel"
+program_type: "cpp"
+target_hardware: null
+
+build:
+  cmd: "g++ -O2 -fopenmp -o matmul_bin matmul.cpp"
+  expected_exit: 0
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  secondary_metric:
+    name: "latency_ms.p95"
+    mode: "minimize"
+  warmup: 2
+  repeats: 5
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 12
+  regression_tolerance: 0.02
+  rlimit_as_gb: 4
+
+analysis_thresholds:
+  perf_ipc_low: 1.0              # lower bar due to threading sync overhead
+  perf_cache_miss_rate_high: 0.03 # slightly relaxed for multi-threaded access
+  perf_hotspot_dominance_pct: 30.0 # work spread across threads
+  perf_cpus_utilized_low: 2.0    # flag if not using multiple cores
+
+contract:
+  fixed_params: { M: 2048, N: 2048, K: 2048 }
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops"]
+
+edit_policy:
+  allowed_paths:
+    - "matmul.cpp"
+
+out_dir: "../../out"

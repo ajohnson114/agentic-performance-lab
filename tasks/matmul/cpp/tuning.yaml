@@ -1,0 +1,7 @@
+# Numeric knobs for the `perflab optimize` command (knob sweep mode).
+# These are NOT used by `perflab agent` — the agent edits source code directly.
+#
+# Problem dimensions — fixed by contract (task.yaml fixed_params).
+M: 512
+N: 512
+K: 512

@@ -1,0 +1,52 @@
+name: "inference_pipeline_pytorch"
+workspace: "tasks/inference_pipeline/pytorch"
+program_type: "pytorch"
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "images_per_sec.median"
+    mode: "maximize"
+  warmup: 2
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame", "torch_trace"]
+
+constraints:
+  max_iters: 10
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.5         # preprocessing and postprocessing on CPU
+  sync_count_warn: 10            # batched inference may have some syncs
+  phase_dominance_pct: 40.0      # preprocess/inference/postprocess phases
+  nsys_gpu_fraction_low: 0.5     # CPU-side pipeline work expected
+  mem_alloc_overhead_pct: 0.07   # tensor allocations for batches
+
+contract:
+  fixed_params: { num_images: 256 }
+  min_repeats: 5
+  required_bench_fields: ["ok", "images_per_sec"]
+
+data_hints:
+  dtype_safety: "fp16_safe"      # Inference tolerates FP16/INT8 well
+  batch_size_range: [1, 256]     # Includes batch_size=1 for latency testing
+  access_pattern: "sequential"
+  custom:
+    - "Image classification pipeline: preprocess → model → postprocess"
+    - "CPU preprocessing is a significant portion of total time"
+
+edit_policy:
+  allowed_paths:
+    - "pipeline.py"
+    - "tuning.yaml"
+
+out_dir: "../../out"

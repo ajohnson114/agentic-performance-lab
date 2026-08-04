@@ -31,3 +31,7 @@ docs/
 patch-safety-checks.md
 runpod-test.md
 CLA.md
+
+# macOS debug-symbol bundles left behind by the C++/CUDA task builds
+*.dSYM/
+

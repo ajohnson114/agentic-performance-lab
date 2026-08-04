@@ -1,0 +1,7 @@
+# Attention benchmark tuning knobs
+# These are fixed by the contract — the LLM cannot change them.
+
+batch_size: 16
+seq_len: 512
+d_model: 512
+n_heads: 8
