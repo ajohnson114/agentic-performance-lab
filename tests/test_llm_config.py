@@ -71,6 +71,108 @@ class TestApiKeyNeverLoadedFromFile:
         assert cfg.api_key == "sk-from-env"
 
 
+class TestApiKeyProviderEnvFallback:
+    """PERFLAB_API_KEY wins when set; otherwise fall back to the provider's
+    own conventional env var (OPENAI_API_KEY / ANTHROPIC_API_KEY) so a key
+    already exported for direct SDK use is picked up automatically."""
+
+    def test_perflab_api_key_wins_over_openai_api_key(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+
+        with patch.dict(
+            "os.environ",
+            {"PERFLAB_API_KEY": "sk-perflab", "OPENAI_API_KEY": "sk-openai"},
+            clear=True,
+        ):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == "sk-perflab"
+
+    def test_perflab_api_key_wins_over_anthropic_api_key(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "anthropic"}}))
+
+        with patch.dict(
+            "os.environ",
+            {"PERFLAB_API_KEY": "sk-perflab", "ANTHROPIC_API_KEY": "sk-ant-key"},
+            clear=True,
+        ):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == "sk-perflab"
+
+    def test_openai_api_key_used_when_perflab_api_key_absent(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-openai"}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == "sk-openai"
+
+    def test_anthropic_api_key_used_when_perflab_api_key_absent(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "anthropic"}}))
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-key"}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == "sk-ant-key"
+
+    def test_openai_provider_does_not_pick_up_anthropic_api_key(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-key"}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == ""
+
+    def test_anthropic_provider_does_not_pick_up_openai_api_key(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "anthropic"}}))
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-openai"}, clear=True):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == ""
+
+    def test_provider_env_override_resolved_before_fallback(self, tmp_path):
+        # Config file says openai, but PERFLAB_LLM_PROVIDER overrides to
+        # anthropic -- the fallback must read ANTHROPIC_API_KEY, not
+        # OPENAI_API_KEY, proving provider resolution happens first.
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+
+        with patch.dict(
+            "os.environ",
+            {
+                "PERFLAB_LLM_PROVIDER": "anthropic",
+                "ANTHROPIC_API_KEY": "sk-ant-key",
+                "OPENAI_API_KEY": "sk-openai",
+            },
+            clear=True,
+        ):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.provider == "anthropic"
+        assert cfg.api_key == "sk-ant-key"
+
+    def test_no_fallback_for_ollama(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "ollama"}}))
+
+        with patch.dict(
+            "os.environ",
+            {"OPENAI_API_KEY": "sk-openai", "ANTHROPIC_API_KEY": "sk-ant-key"},
+            clear=True,
+        ):
+            cfg = LLMConfig.load(config_path)
+
+        assert cfg.api_key == ""
+
+
 class TestPricingOverrides:
     def test_pricing_override_parsed_from_llm_section(self, tmp_path):
         config_path = tmp_path / "config.yaml"

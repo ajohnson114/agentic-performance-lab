@@ -6,6 +6,37 @@ from dataclasses import dataclass
 from perflab.llm.base import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT_S, CompletionResult, Message
 from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
+# Sampling parameters (temperature/top_p/top_k) were REMOVED from the Anthropic
+# API starting with Claude Opus 4.7: sending one is a hard 400, not a warning.
+# They remain valid on the older models below.
+#
+# This is an allowlist rather than a denylist on purpose -- it fails safe. A
+# request that omits temperature is valid on every model past and present, so
+# an unrecognized (i.e. newer) model id defaults to omitting it. A denylist
+# would silently start 400-ing the whole agent loop the next time Anthropic
+# ships a model.
+_SAMPLING_PARAM_MODELS: tuple[str, ...] = (
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4-0",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-0",
+    "claude-haiku-4-5",
+    "claude-3-",
+)
+
+
+def accepts_sampling_params(model: str) -> bool:
+    """True if this model still accepts temperature/top_p/top_k.
+
+    Note the ordering hazard this avoids: "claude-sonnet-4-6" must not be
+    matched by a "claude-sonnet-5" style check, so we compare against full
+    version-qualified prefixes rather than family names.
+    """
+    return model.startswith(_SAMPLING_PARAM_MODELS)
+
 
 @dataclass
 class AnthropicProvider:
@@ -58,8 +89,13 @@ class AnthropicProvider:
             "model": self.model,
             "messages": api_msgs,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # Omitted entirely on Opus 4.7+ / Opus 5 / Sonnet 5 / Fable 5, where any
+        # sampling parameter is a 400. The caller still passes one (it comes
+        # from llm.temperature, which has a dataclass default and so cannot be
+        # switched off from a config file) -- dropping it has to happen here.
+        if accepts_sampling_params(self.model):
+            kwargs["temperature"] = temperature
         if system_text:
             kwargs["system"] = system_text
         if stop:
@@ -101,8 +137,13 @@ class AnthropicProvider:
             "model": self.model,
             "messages": api_msgs,
             "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # Omitted entirely on Opus 4.7+ / Opus 5 / Sonnet 5 / Fable 5, where any
+        # sampling parameter is a 400. The caller still passes one (it comes
+        # from llm.temperature, which has a dataclass default and so cannot be
+        # switched off from a config file) -- dropping it has to happen here.
+        if accepts_sampling_params(self.model):
+            kwargs["temperature"] = temperature
         if system_text:
             kwargs["system"] = system_text
         if stop:

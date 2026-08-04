@@ -14,8 +14,8 @@ _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "perflab" / "config.yaml"
 # Single source of truth for per-provider default models. Referenced by
 # perflab.config, perflab.cli, and the provider defaults so they can't drift.
 PROVIDER_DEFAULT_MODELS = {
-    "openai": "gpt-5.6",
-    "anthropic": "claude-opus-4-8",
+    "openai": "gpt-5.6-sol",
+    "anthropic": "claude-opus-5",
     "ollama": "llama3.2",
 }
 DEFAULT_MODEL = PROVIDER_DEFAULT_MODELS["openai"]
@@ -131,6 +131,12 @@ class LLMConfig:
         legacy file with an ``api_key`` field still loads (the value is
         ignored) but emits a deprecation warning; run
         ``perflab init --scrub-key`` to remove it from the file.
+
+        If PERFLAB_API_KEY is unset, the provider's conventional env var is
+        used instead -- OPENAI_API_KEY for the openai provider,
+        ANTHROPIC_API_KEY for anthropic -- so a key already exported for
+        direct SDK use is picked up automatically. PERFLAB_API_KEY always
+        takes precedence when set.
         """
         config_path = path or _DEFAULT_CONFIG_PATH
         data: dict = {}
@@ -165,13 +171,30 @@ class LLMConfig:
             pricing=_parse_pricing_overrides(data) if isinstance(data, dict) else {},
         )
 
-        # Env var overrides
+        # Env var overrides. Provider must be resolved first (immediately
+        # below) so the provider-specific API key fallback further down
+        # reads the right conventional env var.
         if env_provider := os.environ.get("PERFLAB_LLM_PROVIDER"):
             cfg.provider = env_provider
         if env_model := os.environ.get("PERFLAB_LLM_MODEL"):
             cfg.model = env_model
         if env_key := os.environ.get("PERFLAB_API_KEY"):
             cfg.api_key = env_key
+        elif not cfg.api_key:
+            # PERFLAB_API_KEY is unset/empty and no api_key came from the
+            # config file (file-sourced keys are never honored -- see
+            # above). Fall back to the provider's own conventional env var
+            # so a user who already has OPENAI_API_KEY / ANTHROPIC_API_KEY
+            # exported doesn't hit an opaque "provider configured but not
+            # available" with no clue why. PERFLAB_API_KEY, when set, always
+            # wins -- this branch only runs when it's absent.
+            provider = cfg.provider.lower()
+            if provider == "openai":
+                if openai_key := os.environ.get("OPENAI_API_KEY"):
+                    cfg.api_key = openai_key
+            elif provider == "anthropic":
+                if anthropic_key := os.environ.get("ANTHROPIC_API_KEY"):
+                    cfg.api_key = anthropic_key
         if env_base := os.environ.get("PERFLAB_API_BASE"):
             cfg.api_base = env_base
 

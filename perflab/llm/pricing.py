@@ -25,42 +25,41 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 # usd_per_mtok_input, usd_per_mtok_output -- USD per 1,000,000 tokens.
-# ESTIMATES ONLY (see module docstring). Anthropic figures reflect this
-# environment's pricing as of 2026-07; OpenAI figures for the fictional
-# PROVIDER_DEFAULT_MODELS entry (gpt-5.6) are a rough guess at a flagship-tier
-# price since no public pricing exists for it -- override in config if wrong.
+# ESTIMATES ONLY (see module docstring). Sourced by transcription from the
+# official OpenAI and Anthropic pricing pages on 2026-08-02 -- prices change
+# over time and this is a point-in-time snapshot, not a live feed; override
+# via the ``pricing:`` config mapping if a number here goes stale.
 _BUILTIN_PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
-    # --- OpenAI ---
-    "gpt-5.6": (5.00, 20.00),  # fictional flagship default; GUESS, not sourced
-    "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4o": (2.50, 10.00),
-    "gpt-4-turbo": (10.00, 30.00),
-    "gpt-4": (30.00, 60.00),
-    "gpt-3.5-turbo": (0.50, 1.50),
-    "o1-mini": (3.00, 12.00),
-    "o1": (15.00, 60.00),
-    "o3-mini": (1.10, 4.40),
+    # --- OpenAI (standard tier, short-context column; sourced 2026-08-02) ---
+    # NOTE: a bare "gpt-5.6" and "gpt-5.2" are NOT real OpenAI models as of
+    # this snapshot -- the 5.6 family ships only as sol/terra/luna, and 5.2
+    # was removed/never existed. Do not add either as a table entry.
+    "gpt-5.6-sol": (5.00, 30.00),
+    "gpt-5.6-terra": (2.00, 12.00),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "gpt-5.5-pro": (30.00, 180.00),
+    "gpt-5.5": (5.00, 30.00),
+    "gpt-5.4-pro": (30.00, 180.00),
+    "gpt-5.4-mini": (0.75, 4.50),
+    "gpt-5.4-nano": (0.20, 1.25),
+    "gpt-5.4": (2.50, 15.00),
 
-    # --- Anthropic ---
+    # --- Anthropic (base input/output tokens; sourced 2026-08-02) ---
+    "claude-fable-5": (10.00, 50.00),
+    "claude-mythos-5": (10.00, 50.00),
+    "claude-opus-5": (5.00, 25.00),
     "claude-opus-4-8": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-6": (5.00, 25.00),
-    "claude-opus-4-5": (5.00, 25.00),  # inferred from the Opus 4.6+ tier
-    "claude-opus-4-1": (5.00, 25.00),  # inferred
-    "claude-opus-4-0": (5.00, 25.00),  # inferred
-    "claude-fable-5": (10.00, 50.00),
-    "claude-mythos-5": (10.00, 50.00),
-    "claude-sonnet-5": (3.00, 15.00),  # standard rate (post-intro-discount)
+    "claude-opus-4-5": (5.00, 25.00),
+    "claude-opus-4-1": (15.00, 75.00),  # deprecated
+    "claude-opus-4-0": (15.00, 75.00),  # retired except on Google Cloud
+    # Introductory rate, effective through 2026-08-31; rises to (3.00, 15.00)
+    # on 2026-09-01 -- update this entry then (or override via `pricing:`
+    # in the meantime if a run straddles the cutover).
+    "claude-sonnet-5": (2.00, 10.00),
     "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-sonnet-4-5": (3.00, 15.00),  # inferred
-    "claude-sonnet-4-0": (3.00, 15.00),  # inferred
     "claude-haiku-4-5": (1.00, 5.00),
-    "claude-3-opus": (15.00, 75.00),
-    "claude-3-5-sonnet": (3.00, 15.00),
-    "claude-3-5-haiku": (0.80, 4.00),
-    "claude-3-sonnet": (3.00, 15.00),
-    "claude-3-haiku": (0.25, 1.25),
-    "claude-2": (8.00, 24.00),
 
     # --- Ollama: local inference, no per-token API charge ---
     "llama3.2": (0.0, 0.0),
@@ -95,8 +94,8 @@ def _lookup_price(
 
     The longest-prefix rule is order-independent (unlike a substring/"in"
     check): among all table keys that are a prefix of ``model``, the longest
-    one always wins, so a more specific entry (e.g. "gpt-4o-mini") is never
-    shadowed by a shorter, more general one (e.g. "gpt-4o") regardless of
+    one always wins, so a more specific entry (e.g. "gpt-5.4-mini") is never
+    shadowed by a shorter, more general one (e.g. "gpt-5.4") regardless of
     dict insertion order.
     """
     if not model:

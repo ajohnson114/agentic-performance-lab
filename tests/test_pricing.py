@@ -15,10 +15,10 @@ class TestEstimateCostUsdKnownModels:
         assert cost == 30.00
 
     def test_exact_match_openai_default(self):
-        # gpt-5.6 is the PROVIDER_DEFAULT_MODELS openai entry -- must be priced
-        cost = estimate_cost_usd("gpt-5.6", 2_000_000, 0)
-        assert cost is not None
-        assert cost > 0
+        # gpt-5.6-sol is the PROVIDER_DEFAULT_MODELS openai entry -- must be
+        # priced. (5.00, 30.00) usd/mtok -> 2M input tokens = $10.00
+        cost = estimate_cost_usd("gpt-5.6-sol", 2_000_000, 0)
+        assert cost == 10.00
 
     def test_zero_tokens_is_zero_cost(self):
         assert estimate_cost_usd("claude-opus-4-8", 0, 0) == 0.0
@@ -68,23 +68,78 @@ class TestPrefixMatching:
         assert dated == base
 
     def test_longest_prefix_wins_over_shorter_one(self):
-        # "gpt-4o-mini" is a more specific (longer) key than "gpt-4o" -- a
-        # dated gpt-4o-mini snapshot must resolve to the mini pricing, not
-        # accidentally match the shorter "gpt-4o" prefix.
-        mini = estimate_cost_usd("gpt-4o-mini", 1_000_000, 1_000_000)
-        dated_mini = estimate_cost_usd("gpt-4o-mini-2024-07-18", 1_000_000, 1_000_000)
-        full = estimate_cost_usd("gpt-4o", 1_000_000, 1_000_000)
+        # "gpt-5.4-mini" is a more specific (longer) key than "gpt-5.4" -- a
+        # dated gpt-5.4-mini snapshot must resolve to the mini pricing, not
+        # accidentally match the shorter "gpt-5.4" prefix.
+        mini = estimate_cost_usd("gpt-5.4-mini", 1_000_000, 1_000_000)
+        dated_mini = estimate_cost_usd("gpt-5.4-mini-2026-08-01", 1_000_000, 1_000_000)
+        full = estimate_cost_usd("gpt-5.4", 1_000_000, 1_000_000)
         assert dated_mini == mini
         assert dated_mini != full
 
+    def test_gpt_5_4_mini_not_shadowed_by_gpt_5_4(self):
+        # Real prefix collision introduced by the 2026-08-02 pricing update:
+        # "gpt-5.4" is itself a priced entry AND a prefix of "gpt-5.4-mini",
+        # "gpt-5.4-nano", and "gpt-5.4-pro". Confirm the longer, more
+        # specific key wins for each -- not the shorter "gpt-5.4" entry.
+        mini = estimate_cost_usd("gpt-5.4-mini", 1_000_000, 1_000_000)
+        nano = estimate_cost_usd("gpt-5.4-nano", 1_000_000, 1_000_000)
+        pro = estimate_cost_usd("gpt-5.4-pro", 1_000_000, 1_000_000)
+        base = estimate_cost_usd("gpt-5.4", 1_000_000, 1_000_000)
+        assert mini == 5.25   # (0.75, 4.50)
+        assert nano == 1.45   # (0.20, 1.25)
+        assert pro == 210.00  # (30.00, 180.00)
+        assert base == 17.50  # (2.50, 15.00)
+        assert len({mini, nano, pro, base}) == 4  # all four resolve distinctly
+
+    def test_gpt_5_5_pro_not_shadowed_by_gpt_5_5(self):
+        # Same collision shape for "gpt-5.5" vs "gpt-5.5-pro".
+        pro = estimate_cost_usd("gpt-5.5-pro", 1_000_000, 1_000_000)
+        dated_pro = estimate_cost_usd("gpt-5.5-pro-2026-08-01", 1_000_000, 1_000_000)
+        base = estimate_cost_usd("gpt-5.5", 1_000_000, 1_000_000)
+        assert pro == 210.00  # (30.00, 180.00)
+        assert base == 35.00  # (5.00, 30.00)
+        assert dated_pro == pro
+        assert dated_pro != base
+
+    def test_gpt_5_6_family_shares_stem_but_resolves_distinctly(self):
+        # "gpt-5.6-sol" / "gpt-5.6-terra" / "gpt-5.6-luna" all share the
+        # "gpt-5.6-" stem but none is a prefix of another -- each must
+        # resolve to its own price.
+        sol = estimate_cost_usd("gpt-5.6-sol", 1_000_000, 1_000_000)
+        terra = estimate_cost_usd("gpt-5.6-terra", 1_000_000, 1_000_000)
+        luna = estimate_cost_usd("gpt-5.6-luna", 1_000_000, 1_000_000)
+        assert sol == 35.00   # (5.00, 30.00)
+        assert terra == 14.00  # (2.00, 12.00)
+        assert luna == 1.40   # (0.20, 1.20)
+        assert len({sol, terra, luna}) == 3
+
     def test_shared_prefix_matches_not_none(self):
-        # "gpt-4" is a genuine prefix of "gpt-4-some-variant" -- confirms the
-        # match resolves (0 tokens -> $0.00) rather than falling through to
-        # None, distinguishing "matched, zero cost" from "unknown model".
-        assert estimate_cost_usd("gpt-4-some-variant", 0, 0) == 0.0
+        # "gpt-5.4" is a genuine prefix of "gpt-5.4-some-variant" -- confirms
+        # the match resolves (0 tokens -> $0.00) rather than falling through
+        # to None, distinguishing "matched, zero cost" from "unknown model".
+        assert estimate_cost_usd("gpt-5.4-some-variant", 0, 0) == 0.0
 
     def test_no_match_returns_none(self):
         assert estimate_cost_usd("z-completely-unrelated", 1000, 1000) is None
+
+    def test_claude_opus_5_and_opus_4_8_resolve_to_own_entries(self):
+        # Both are distinct table entries -- each must resolve on its own
+        # (not fall through to None, and not accidentally match the other).
+        assert is_known_model("claude-opus-5")
+        assert is_known_model("claude-opus-4-8")
+        opus5 = estimate_cost_usd("claude-opus-5", 1_000_000, 1_000_000)
+        opus48 = estimate_cost_usd("claude-opus-4-8", 1_000_000, 1_000_000)
+        assert opus5 == 30.00   # (5.00, 25.00)
+        assert opus48 == 30.00  # (5.00, 25.00) -- same price, separate entries
+
+    def test_claude_opus_5_dated_snapshot_resolves_to_base_entry(self):
+        base = estimate_cost_usd("claude-opus-5", 1_000_000, 1_000_000)
+        dated = estimate_cost_usd("claude-opus-5-20260701", 1_000_000, 1_000_000)
+        assert dated == base
+
+    def test_unknown_model_returns_none_never_fabricated(self):
+        assert estimate_cost_usd("not-a-real-model-5000", 1_000_000, 1_000_000) is None
 
 
 class TestConfigOverrides:

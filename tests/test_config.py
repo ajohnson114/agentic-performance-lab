@@ -23,7 +23,7 @@ class TestDefaults:
     def test_default_config_values(self):
         cfg = PerfLabConfig()
         assert cfg.llm.provider == "openai"
-        assert cfg.llm.model == "gpt-5.6"
+        assert cfg.llm.model == "gpt-5.6-sol"
         assert cfg.benchmark.warmup == 3
         assert cfg.benchmark.repeats == 20
         assert cfg.profiler.torch_with_flops is True

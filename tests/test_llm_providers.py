@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from perflab.llm.anthropic_provider import AnthropicProvider
+from perflab.llm.anthropic_provider import AnthropicProvider, accepts_sampling_params
 from perflab.llm.base import DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT_S, Message
 from perflab.llm.ollama_provider import OllamaProvider, _validate_ollama_url
 from perflab.llm.openai_provider import OpenAIProvider
@@ -65,6 +65,64 @@ class TestAnthropicProvider:
         create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
         assert create_kwargs["system"] == "be terse"
         assert create_kwargs["messages"] == [{"role": "user", "content": "hi"}]
+
+
+class TestAnthropicSamplingParams:
+    """Sampling params are a hard 400 on Opus 4.7+ -- they must be dropped.
+
+    Regression guard: llm.temperature has a dataclass default, so it is always
+    passed down from generate.py and cannot be switched off in a config file.
+    If the provider forwards it to a current model, every LLM call 400s and the
+    whole agent loop fails.
+    """
+
+    @pytest.mark.parametrize("model", [
+        "claude-opus-5", "claude-opus-5-20260701", "claude-opus-4-8",
+        "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
+        "some-unreleased-future-model",  # unknown => fail safe, omit
+    ])
+    def test_rejecting_models_omit_temperature(self, model):
+        assert accepts_sampling_params(model) is False
+        mock_anthropic = MagicMock()
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            AnthropicProvider(api_key="sk-x", model=model).complete(
+                [Message("user", "hi")], temperature=0.8
+            )
+        kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        assert "temperature" not in kwargs
+        assert "top_p" not in kwargs and "top_k" not in kwargs
+
+    @pytest.mark.parametrize("model", [
+        "claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-4-5",
+    ])
+    def test_legacy_models_still_send_temperature(self, model):
+        assert accepts_sampling_params(model) is True
+        mock_anthropic = MagicMock()
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            AnthropicProvider(api_key="sk-x", model=model).complete(
+                [Message("user", "hi")], temperature=0.8
+            )
+        kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        assert kwargs["temperature"] == 0.8
+
+    def test_sonnet_5_not_confused_with_sonnet_4_6(self):
+        # "claude-sonnet-5" and "claude-sonnet-4-6" share a family prefix but
+        # differ in sampling-param support -- a family-name check would break.
+        assert accepts_sampling_params("claude-sonnet-5") is False
+        assert accepts_sampling_params("claude-sonnet-4-6") is True
+
+    def test_stream_also_omits_temperature(self):
+        mock_anthropic = MagicMock()
+        stream_cm = mock_anthropic.Anthropic.return_value.messages.stream
+        stream_cm.return_value.__enter__.return_value.text_stream = iter(["a", "b"])
+        with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
+            chunks = list(
+                AnthropicProvider(api_key="sk-x", model="claude-opus-5").stream(
+                    [Message("user", "hi")], temperature=0.8
+                )
+            )
+        assert chunks == ["a", "b"]
+        assert "temperature" not in stream_cm.call_args.kwargs
 
 
 class TestOpenAIProvider:
