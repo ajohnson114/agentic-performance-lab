@@ -7,9 +7,15 @@ from pathlib import Path
 
 from perflab.runners.benchmark import _resolve_rlimit
 from perflab.tools.isolation import IsolationPolicy, wrap_command
-from perflab.tools.shell import CmdResult, run_cmd
+from perflab.tools.shell import CmdResult, resolve_cpu_plan, run_cmd
 
 _logger = logging.getLogger(__name__)
+
+# Correctness runs get the session CPU plan's *affinity* (so candidate test
+# code stays confined to the benchmark's cores and cannot perturb a
+# measurement) but deliberately not its OMP_PROC_BIND/OMP_PLACES/
+# OMP_NUM_THREADS overlay: thread binding is a measurement concern and nothing
+# here is timed. run_benchmark is where the OMP env is applied.
 
 
 def _passthrough_env(
@@ -66,6 +72,8 @@ def run_correctness(
 
     rlimit_as_gb overrides the default when set in task.yaml constraints.
     skip_preexec: If True, skip preexec_fn (use when called from threads).
+    That also skips CPU pinning -- harmless here because correctness runs are
+    not timed, unlike run_benchmark, which never skips preexec.
 
     This runs candidate-patched (LLM-authored) tests.py, so the subprocess
     environment is built via the allowlist (agent_subprocess_env), not the
@@ -80,6 +88,7 @@ def run_correctness(
     """
     import shlex
     rlimit = _resolve_rlimit(program_type, rlimit_as_gb)
+    cpu_plan = resolve_cpu_plan()
     extra = _passthrough_env(env_passthrough, accuracy_tolerance)
     spawn_fds: list[int] = []
     cmd_args = _maybe_wrap(shlex.split(cmd), cwd, isolation, extra_fds=spawn_fds)
@@ -87,6 +96,7 @@ def run_correctness(
         cmd_args, cwd=cwd, env=extra if extra else None,
         timeout_s=60, rlimit_as_bytes=rlimit, skip_preexec=skip_preexec,
         env_mode="allowlist", pass_fds=spawn_fds,
+        cpu_affinity=cpu_plan.cpus, nice_adj=cpu_plan.nice_adj,
     )
 
 
@@ -118,6 +128,7 @@ def run_correctness_twice(
     """
     import shlex
     rlimit = _resolve_rlimit(program_type, rlimit_as_gb)
+    cpu_plan = resolve_cpu_plan()
     extra = _passthrough_env(env_passthrough, accuracy_tolerance)
 
     # Wrapped argvs are single-use under strict isolation (run_cmd closes the
@@ -130,6 +141,7 @@ def run_correctness_twice(
         args1, cwd=cwd, env=extra if extra else None,
         timeout_s=60, rlimit_as_bytes=rlimit, skip_preexec=skip_preexec,
         env_mode="allowlist", pass_fds=fds1,
+        cpu_affinity=cpu_plan.cpus, nice_adj=cpu_plan.nice_adj,
     )
 
     if res1.returncode != expected_exit:
@@ -144,6 +156,7 @@ def run_correctness_twice(
         skip_preexec=skip_preexec,
         env=res2_env,
         env_mode="allowlist", pass_fds=fds2,
+        cpu_affinity=cpu_plan.cpus, nice_adj=cpu_plan.nice_adj,
     )
 
     warnings: list[str] = []

@@ -58,8 +58,42 @@ class ProfilePlan:
 
 @dataclass
 class Constraints:
+    """Run limits and the accept-gate configuration.
+
+    regression_tolerance / decision_rule / noise_gate / cv_threshold work
+    together:
+
+    * ``regression_tolerance`` is the *materiality* floor — how big a win has
+      to be before it is worth keeping (2% by default). Every decision rule
+      applies it.
+    * ``decision_rule`` picks *how* "better" is decided on top of that floor.
+      The default ``non_overlapping_ci`` adds the *resolvability* requirement:
+      the candidate's 95% confidence interval must clear the incumbent's, so a
+      difference the machine cannot actually measure is never accepted. It only
+      engages when the benchmark publishes per-repeat samples. ``tolerance_only``
+      is the bare ratio. See ``perflab.analyzers.decision`` for the rules and
+      ``decision.rule_names()`` for the current list.
+    * ``noise_gate: false`` is the explicit "turn the statistical gate off"
+      switch and means exactly ``decision_rule: tolerance_only``; it takes
+      precedence over ``decision_rule``.
+    * ``cv_threshold`` is the run-to-run spread above which the environment is
+      declared the bottleneck. ``None`` (the default) derives it from
+      regression_tolerance and benchmark.repeats via
+      ``bench_stats.cv_budget_for_gate`` — with the default 2% gate and 20
+      repeats that is 2.2%, which is the honest answer and 5x tighter than the
+      old hardcoded 10% alarm that the gate never consulted anyway.
+    """
     max_iters: int = 10
     regression_tolerance: float = 0.02
+    # Statistical accept gate (see class docstring). Turn off only for a
+    # deterministic metric (instruction counts, bytes moved) or when you
+    # knowingly accept noise-driven accepts on an unpinnable machine.
+    noise_gate: bool = True
+    # None = the default rule (non_overlapping_ci). Validated at load time
+    # against perflab.analyzers.decision.rule_names().
+    decision_rule: str | None = None
+    # None = derive from regression_tolerance + benchmark.repeats.
+    cv_threshold: float | None = None
     rlimit_as_gb: float | None = None  # None = auto (4 GB for CPU, disabled for GPU)
     prompt_token_budget: int = 0  # 0 means unlimited
     top_n: int = 3  # number of bottleneck diagnoses to report
@@ -67,6 +101,13 @@ class Constraints:
     allow_fast_math: bool = False  # allow -ffast-math, --use_fast_math (breaks IEEE compliance)
     accuracy_tolerance: str | None = None  # "exact", "1e-3", "1e-1" — how much error is acceptable
     env_passthrough: list[str] = field(default_factory=list)  # extra env vars to forward to candidate subprocesses
+    # CPU environment for measured subprocesses: "auto" (default) | "off" |
+    # an int ("1" = one physical core, for a single-threaded task) | an explicit
+    # CPU list ("2-5", "2,4,6"). Linux only; elsewhere it degrades to a no-op
+    # with a logged reason. Published process-wide at load time so the baseline
+    # and every candidate are measured on identical cores — see
+    # perflab.tools.shell.set_task_cpu_pinning.
+    cpu_pinning: str = "auto"
 
 @dataclass
 class RooflineSpec:
@@ -255,9 +296,23 @@ class TaskSpec:
             pass
 
         accuracy_tolerance_raw = constraints_data.get("accuracy_tolerance")
+        cv_threshold_raw = constraints_data.get("cv_threshold")
+        decision_rule_raw = constraints_data.get("decision_rule")
+        if decision_rule_raw is not None:
+            # Fail at load time, not at the first accept decision: a typo here
+            # would otherwise silently keep the default gate for a whole run.
+            from perflab.analyzers.decision import get_rule
+            get_rule(str(decision_rule_raw))
         constraints = Constraints(
             max_iters=int(constraints_data.get("max_iters", 10)),
             regression_tolerance=float(constraints_data.get("regression_tolerance", 0.02)),
+            noise_gate=bool(constraints_data.get("noise_gate", True)),
+            decision_rule=(
+                str(decision_rule_raw) if decision_rule_raw is not None else None
+            ),
+            cv_threshold=(
+                float(cv_threshold_raw) if cv_threshold_raw is not None else None
+            ),
             rlimit_as_gb=float(rlimit_raw) if rlimit_raw is not None else None,
             prompt_token_budget=int(constraints_data.get("prompt_token_budget", _cfg_token_budget)),
             top_n=int(constraints_data.get("top_n", 3)),
@@ -267,6 +322,17 @@ class TaskSpec:
                 str(accuracy_tolerance_raw) if accuracy_tolerance_raw is not None else None
             ),
             env_passthrough=list(constraints_data.get("env_passthrough", [])),
+            cpu_pinning=str(constraints_data.get("cpu_pinning", "auto")),
+        )
+        # Publish the task's CPU pinning setting process-wide. The benchmark
+        # and correctness runners read it from there instead of taking it as a
+        # per-call argument, which is what guarantees the baseline and every
+        # candidate are measured under the identical CPU environment.
+        # None when the task didn't set it, so the config/env default applies.
+        from perflab.tools.shell import set_task_cpu_pinning
+        set_task_cpu_pinning(
+            str(constraints_data["cpu_pinning"])
+            if "cpu_pinning" in constraints_data else None
         )
 
         edit_policy = EditPolicy(

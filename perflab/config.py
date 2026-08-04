@@ -48,6 +48,16 @@ class BenchmarkSection:
     """Benchmark harness defaults (can be overridden per-task via task.yaml)."""
     warmup: int = 3
     repeats: int = 20
+    # CPU environment for measured subprocesses (Linux only; a no-op with a
+    # logged reason elsewhere). Accepted values:
+    #   "auto" (default) — pin to every physical core that survives the policy
+    #                      in perflab.tools.shell._select_cpus (one logical CPU
+    #                      per physical core, single socket, core 0 avoided)
+    #   "off"            — leave scheduling alone
+    #   an integer, e.g. "1" — that many physical cores (single-threaded tasks)
+    #   a CPU list, e.g. "2-5" or "2,4,6" — pin exactly there
+    # task.yaml constraints.cpu_pinning and PERFLAB_CPU_PINNING override this.
+    cpu_pinning: str = "auto"
 
 
 @dataclass
@@ -191,6 +201,11 @@ def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
             _safe_set(cfg.benchmark, "warmup", bench["warmup"], int)
         if "repeats" in bench:
             _safe_set(cfg.benchmark, "repeats", bench["repeats"], int)
+        if "cpu_pinning" in bench:
+            # str() rather than _safe_set's type-cast: YAML turns a bare `off`
+            # or `2-5` into a bool/str respectively, and both must survive as
+            # text for _build_cpu_plan to parse.
+            cfg.benchmark.cpu_pinning = str(bench["cpu_pinning"])
 
     prof = data.get("profiler", {})
     if isinstance(prof, dict):
@@ -258,6 +273,8 @@ def _overlay_env(cfg: PerfLabConfig) -> None:
             cfg.benchmark.repeats = int(v)
         except ValueError:
             pass
+    if v := os.environ.get("PERFLAB_CPU_PINNING"):
+        cfg.benchmark.cpu_pinning = v
 
     # Profiler
     if v := os.environ.get("PERFLAB_PEAKS_CACHE"):
@@ -372,6 +389,37 @@ llm:
 benchmark:
   warmup: 3                  # Warmup iterations before timing
   repeats: 20                # Timed repetitions per benchmark
+  cpu_pinning: auto          # CPU environment for measured subprocesses (Linux only;
+                             # a logged no-op on macOS/Windows). The same policy is
+                             # applied to the baseline and to every candidate -- it is
+                             # process-wide by design, because measuring the baseline
+                             # on different cores than the candidates would bias every
+                             # comparison.
+                             # auto:  (default) one logical CPU per physical core, all
+                             #        from one socket, avoiding the core that hosts
+                             #        CPU 0 (kernel/IRQ work). SMT siblings are never
+                             #        both used. Sets OMP_PROC_BIND=close and
+                             #        OMP_PLACES=cores so OpenMP threads bind too.
+                             # off:   leave scheduling alone.
+                             # <int>: that many physical cores, e.g. 1 for a
+                             #        single-threaded task.
+                             # <list>: an explicit CPU list, e.g. "2-5" or "2,4,6",
+                             #        intersected with the process affinity mask.
+                             # Override per task with constraints.cpu_pinning, or for
+                             # one session with PERFLAB_CPU_PINNING.
+                             # WHEN TO TURN THIS OFF: pinning removes the scheduler's
+                             # ability to migrate the benchmark away from a congested
+                             # core. On a dedicated host that is the point. On a box
+                             # with uncontrolled competing load (a busy laptop, a
+                             # shared VM, a noisy CI runner) it can make the tail
+                             # WORSE -- measured here: with 8 competing spinners, a
+                             # 1-core pin produced 4 samples past 1.25x the median vs
+                             # 1 unpinned, and a 2.6x worst case vs 1.25x. Set `off`
+                             # on such a host.
+                             # NOTE: PerfLab detects the CPU scaling governor and
+                             # turbo/boost state and warns when they will add spread,
+                             # but never changes a machine-wide setting for you -- it
+                             # prints the exact command instead.
 
 profiler:
   torch_with_flops: true     # Enable per-operator FLOPS counting

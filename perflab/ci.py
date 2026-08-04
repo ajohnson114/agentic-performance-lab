@@ -4,9 +4,17 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+from perflab.analyzers.bench_stats import extract_repeated_values
 from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds
+from perflab.analyzers.decision import (
+    DEFAULT_RULE,
+    Comparison,
+    DecisionRule,
+    ImprovementVerdict,
+    rule_for_constraints,
+)
 from perflab.runners.benchmark import (
     metric_value,
     run_benchmark,
@@ -124,21 +132,70 @@ def _run_bench(task: TaskSpec) -> float:
     return metric_value(bench, task.benchmark.metric.name)
 
 
+def _assess_regression(
+    current: float,
+    baseline: float,
+    mode: str,
+    tolerance: float,
+    *,
+    current_samples: list[float] | None = None,
+    baseline_samples: list[float] | None = None,
+    rule: DecisionRule = DEFAULT_RULE,
+) -> tuple[float, bool, ImprovementVerdict | None]:
+    """Regression check, statistically gated whenever samples are available.
+
+    A regression is an improvement in the opposite direction, so this asks
+    ``perflab.analyzers.decision`` the same question with the mode flipped,
+    rather than reimplementing the interval arithmetic. Whatever rule the
+    optimizer accepts a patch with is the rule CI rejects it with -- that
+    symmetry is the whole reason the decision lives in one module.
+
+    CI is where a bare ratio does the most damage. A 2% tolerance on a machine
+    with 8% run-to-run spread fails at random, and a gate that cries wolf gets
+    switched off -- at which point real regressions land unchallenged. Requiring
+    the drop to be distinguishable from noise is what makes the gate worth
+    leaving on. With no samples (an old baseline, or a harness that reports only
+    an aggregate) the behavior is exactly the historical ratio test, and the
+    verdict records ``verified=False`` so the caller can say so.
+
+    Returns (regression_pct, regressed, verdict).
+    """
+    if baseline == 0:
+        return 0.0, False, None
+    if mode == "maximize":
+        regression_pct = (1.0 - current / baseline) * 100
+    else:
+        regression_pct = (current / baseline - 1.0) * 100
+
+    # Flip the mode: "significantly worse" is "significantly better" measured
+    # the other way, so the same rule applies unchanged.
+    flipped: Literal["maximize", "minimize"] = (
+        "minimize" if mode == "maximize" else "maximize"
+    )
+    verdict = rule.decide(Comparison(
+        candidate=current,
+        incumbent=baseline,
+        mode=flipped,
+        tolerance=tolerance,
+        candidate_samples=current_samples,
+        incumbent_samples=baseline_samples,
+    ))
+    return regression_pct, verdict.improved, verdict
+
+
 def _check_regression(
     current: float, baseline: float, mode: str, tolerance: float,
 ) -> tuple[float, bool]:
     """Check if current value is a regression vs baseline.
 
+    Thin wrapper over :func:`_assess_regression` for callers that only need the
+    decision. Without samples this is the historical ratio test, unchanged.
+
     Returns (regression_pct, regressed).
     """
-    if baseline == 0:
-        return 0.0, False
-    if mode == "maximize":
-        regression_pct = (1.0 - current / baseline) * 100
-        regressed = current < baseline * (1.0 - tolerance)
-    else:
-        regression_pct = (current / baseline - 1.0) * 100
-        regressed = current > baseline * (1.0 + tolerance)
+    regression_pct, regressed, _ = _assess_regression(
+        current, baseline, mode, tolerance
+    )
     return regression_pct, regressed
 
 
@@ -222,12 +279,21 @@ def save_baseline(
         "metric_mode": task.benchmark.metric.mode,
         "value": primary_value,
     }
+    # Persist the per-repeat samples so a later ci-check can tell a real
+    # regression from run-to-run spread. Absent on baselines saved by older
+    # versions, which simply fall back to the ratio test.
+    primary_samples = extract_repeated_values(bench, task.benchmark.metric.name)
+    if primary_samples:
+        data["samples"] = primary_samples
     sec = task.benchmark.secondary_metric
     if sec:
         try:
             data["secondary_metric_name"] = sec.name
             data["secondary_metric_mode"] = sec.mode
             data["secondary_value"] = metric_value(bench, sec.name)
+            sec_samples = extract_repeated_values(bench, sec.name)
+            if sec_samples:
+                data["secondary_samples"] = sec_samples
         except (KeyError, TypeError):
             pass  # secondary metric not in bench output — skip
 
@@ -297,8 +363,12 @@ def run_ci_check(
     baseline_data = json.loads(bp.read_text(encoding="utf-8"))
     baseline_value = baseline_data["value"]
 
-    regression_pct, primary_regressed = _check_regression(
+    rule = rule_for_constraints(task.constraints)
+    regression_pct, primary_regressed, primary_verdict = _assess_regression(
         current_value, baseline_value, metric_mode, tol,
+        current_samples=extract_repeated_values(bench, metric_name),
+        baseline_samples=baseline_data.get("samples"),
+        rule=rule,
     )
 
     # Secondary metric check
@@ -308,8 +378,11 @@ def run_ci_check(
         try:
             sec_current = metric_value(bench, sec.name)
             sec_baseline = baseline_data["secondary_value"]
-            sec_regression_pct, sec_regressed = _check_regression(
+            sec_regression_pct, sec_regressed, _ = _assess_regression(
                 sec_current, sec_baseline, sec.mode, tol,
+                current_samples=extract_repeated_values(bench, sec.name),
+                baseline_samples=baseline_data.get("secondary_samples"),
+                rule=rule,
             )
             secondary_regressed = sec_regressed
             secondary_result = MetricCheckResult(

@@ -3,6 +3,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from perflab.analyzers.decision import (
+    NON_OVERLAPPING_CI,
+    TOLERANCE_ONLY,
+    Comparison,
+    ImprovementVerdict,
+)
+
+# `ImprovementVerdict` and the accept rule itself now live in
+# `perflab.analyzers.decision`, which is the single module every accept/reject
+# call site depends on. Re-exported here because this module's names are public
+# and used across the codebase; see decision.py for the rule and its rationale.
+__all__ = [
+    "Decision",
+    "ImprovementVerdict",
+    "RunSummary",
+    "assess_improvement",
+    "calc_speedup",
+    "compute_run_summary",
+    "improvement_factor",
+    "is_improvement",
+]
+
 
 @dataclass
 class Decision:
@@ -21,11 +43,64 @@ class RunSummary:
     total_iterations: int
 
 
-def is_improvement(new: float, best: float, mode: Literal["maximize","minimize"], tol: float) -> bool:
-    if mode == "maximize":
-        return new > best * (1.0 + tol)
-    else:
-        return new < best * (1.0 - tol)
+def assess_improvement(
+    new: float,
+    best: float,
+    mode: Literal["maximize", "minimize"],
+    tol: float,
+    *,
+    new_samples: list[float] | None = None,
+    best_samples: list[float] | None = None,
+    noise_gate: bool = True,
+) -> ImprovementVerdict:
+    """Decide whether ``new`` is a real improvement over ``best``.
+
+    Compatibility wrapper: the rule lives in
+    :mod:`perflab.analyzers.decision`, which every accept/reject call site now
+    depends on directly. This signature is kept because it is public and
+    already used elsewhere; new code should build a
+    :class:`~perflab.analyzers.decision.Comparison` and pick a rule explicitly.
+
+    ``noise_gate=True`` selects
+    :class:`~perflab.analyzers.decision.NonOverlappingCI` (materiality floor
+    AND non-overlapping 95% CIs); ``noise_gate=False`` selects
+    :class:`~perflab.analyzers.decision.ToleranceOnly` (the bare ratio). See
+    those classes for the rule and its rationale.
+    """
+    rule = NON_OVERLAPPING_CI if noise_gate else TOLERANCE_ONLY
+    return rule.decide(Comparison(
+        candidate=new,
+        incumbent=best,
+        mode=mode,
+        tolerance=tol,
+        candidate_samples=new_samples,
+        incumbent_samples=best_samples,
+    ))
+
+
+def is_improvement(
+    new: float,
+    best: float,
+    mode: Literal["maximize", "minimize"],
+    tol: float,
+    *,
+    new_samples: list[float] | None = None,
+    best_samples: list[float] | None = None,
+    noise_gate: bool = True,
+) -> bool:
+    """Boolean form of `assess_improvement` (see it for the rule).
+
+    Backward compatible: called with the original four positional arguments and
+    no samples it is exactly the old ratio test,
+    ``new > best * (1 + tol)`` / ``new < best * (1 - tol)``.
+    Callers that need to explain a rejection should use `assess_improvement`
+    directly — the boolean cannot distinguish "did not beat the incumbent"
+    from "beat it by less than the machine can measure".
+    """
+    return assess_improvement(
+        new, best, mode, tol,
+        new_samples=new_samples, best_samples=best_samples, noise_gate=noise_gate,
+    ).improved
 
 
 def calc_speedup(value: float, baseline: float) -> float:

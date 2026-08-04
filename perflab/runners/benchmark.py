@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from perflab.tools.isolation import IsolationPolicy, wrap_command
-from perflab.tools.shell import CmdResult, run_cmd
+from perflab.tools.shell import CmdResult, resolve_cpu_plan, run_cmd
 
 _GPU_PROGRAM_TYPES = {"cuda", "pytorch", "jax", "triton"}
 
@@ -117,6 +117,13 @@ def run_benchmark(
     task.yaml-declared vars (task.constraints.env_passthrough) to forward
     from the current process environment.
 
+    CPU environment: the benchmark subprocess is pinned to a stable set of
+    physical cores and given OMP_PROC_BIND/OMP_PLACES, per the process-wide
+    plan from perflab.tools.shell.resolve_cpu_plan(). That plan is resolved
+    once per session from config/task/env and is deliberately NOT a parameter
+    of this function: baseline and candidate runs must be measured on the same
+    cores or every candidate gains/loses speed for free. See CpuPlan.
+
     isolation (Fix 2b): optional OS-level sandboxing (see perflab.tools.
     isolation) layered on top of the rlimit/env-allowlist protections above.
     Defaults to None (no sandboxing beyond rlimits), matching pre-Fix-2b
@@ -153,6 +160,13 @@ def run_benchmark(
         except Exception:  # noqa: BLE001 -- best-effort, defaults still come from bench.py
             pass
 
+    # CPU environment gate (the CPU-side counterpart of the GPU thermal gate
+    # below). setdefault, so a caller-supplied or task-declared OMP setting
+    # still wins over the plan's defaults.
+    cpu_plan = resolve_cpu_plan()
+    for key, value in cpu_plan.omp_env.items():
+        run_env.setdefault(key, value)
+
     # Thermal gate: wait for GPU to cool if above throttle threshold
     if program_type in _GPU_PROGRAM_TYPES:
         _wait_for_gpu_cooldown()
@@ -179,6 +193,7 @@ def run_benchmark(
         cmd_args, cwd=cwd, env=run_env if run_env else None,
         timeout_s=300, rlimit_as_bytes=rlimit, env_mode="allowlist",
         pass_fds=spawn_fds,
+        cpu_affinity=cpu_plan.cpus, nice_adj=cpu_plan.nice_adj,
     )
     # A nonzero exit is a failed run even if a bench.json exists — without
     # this, a bench that writes results and then crashes (or a candidate that

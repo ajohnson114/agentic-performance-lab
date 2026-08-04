@@ -9,11 +9,23 @@ import shutil
 import tempfile
 import zipfile
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from perflab.analyzers.metrics_rollup import improvement_factor, is_improvement
+from perflab.analyzers.bench_stats import (
+    cv_budget_for_gate,
+    extract_repeated_values,
+    repeats_needed_for_gate,
+)
+from perflab.analyzers.decision import (
+    SCREENING_RULE,
+    Comparison,
+    ImprovementVerdict,
+    is_paired_rule,
+    rule_for_constraints,
+)
+from perflab.analyzers.metrics_rollup import improvement_factor
 from perflab.memory.run_store import snapshot_workspace
 from perflab.optimizers.history import make_history_entry
 from perflab.optimizers.patch import (
@@ -29,6 +41,7 @@ from perflab.runners.benchmark import (
     validate_contract,
 )
 from perflab.runners.correctness import run_correctness, run_correctness_twice
+from perflab.runners.paired import PairedRun, run_paired_benchmark
 from perflab.runners.pipeline import run_pipeline_for_ctx
 from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
 from perflab.tools.shell import run_cmd
@@ -48,6 +61,11 @@ class BeamCandidate:
     reasoning: str = ""
     value: float | None = None
     accepted: bool = False
+    # Per-repeat measurements behind `value`, when the harness published them
+    # (see bench_stats.extract_repeated_values). Feeds the statistical accept
+    # gate; empty means "no variance information", which degrades the gate to
+    # the bare ratio test rather than blocking acceptance.
+    samples: list[float] = field(default_factory=list)
 
 
 @contextlib.contextmanager
@@ -318,7 +336,261 @@ def evaluate_single_candidate(
         return BeamCandidate(
             iteration=it, index=ci, blocks=blocks,
             description=desc, reasoning=reasoning, value=val,
+            samples=extract_repeated_values(bench, task.benchmark.metric.name),
         ), errors
+
+
+@contextlib.contextmanager
+def _paired_workspaces(
+    ws: Path, blocks: list[SearchReplaceBlock], out_dir: Path,
+) -> Iterator[tuple[Path, Path]]:
+    """Two *equivalent* disposable copies: incumbent (unpatched) and candidate.
+
+    Both come from the same routine, the same source tree and the same
+    tempfile root, and differ only in whether the patch was applied. That
+    symmetry is load-bearing: benchmarking the incumbent in the real workspace
+    while the candidate ran from a temp copy would put a systematic
+    between-arm difference (different page-cache state, possibly a different
+    filesystem) straight back into the comparison the interleaving exists to
+    clean up -- on top of the usual reason candidate code never runs in the
+    real workspace.
+    """
+    with _patched_workspace_copy(ws, [], "perflab_paired_a_", out_dir) as incumbent_ws, \
+         _patched_workspace_copy(ws, blocks, "perflab_paired_b_", out_dir) as candidate_ws:
+        yield incumbent_ws, candidate_ws
+
+
+def _build_arm(ctx: AgentContext, cwd: Path) -> str:
+    """Build one arm's workspace. Returns "" on success, else an error string."""
+    build = ctx.task.build
+    if build is None:
+        return ""
+    res = run_cmd(
+        shlex.split(build.cmd), cwd=cwd,
+        timeout_s=build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+    )
+    if res.returncode != build.expected_exit:
+        return f"build failed (rc={res.returncode})"
+    return ""
+
+
+def _validate_paired_contract(ctx: AgentContext, run: PairedRun) -> list[str]:
+    """Contract-check every spawn of an interleaved run.
+
+    ``enforce_min_sampling=False`` per spawn, for the same reason the fast
+    screen is exempted: the framework -- not the candidate -- chose the block
+    size, and a block is deliberately shorter than a full run. The floor is not
+    dropped, it is moved to the aggregate below, where it belongs: what
+    ``contract.min_repeats`` is defending against is a candidate quietly
+    reducing how much evidence backs its number, and the interleaved design
+    collects at least as many repeats in total, on *both* arms.
+
+    Everything else in the contract (fixed_params, required fields) is checked
+    on every single spawn, so a candidate that changes problem size partway
+    through a sequence is still caught.
+    """
+    errors: list[str] = []
+    for spawn in run.spawns:
+        for err in validate_contract(
+            spawn.measurement.bench, ctx.task.contract, enforce_min_sampling=False,
+        ):
+            errors.append(f"{spawn.arm} block {spawn.pair}: {err}")
+    measured = run.plan.measured_repeats_per_arm
+    minimum = ctx.task.contract.min_repeats
+    if measured < minimum:
+        errors.append(
+            f"interleaved run measured {measured} repeats per arm "
+            f"({run.plan.blocks} blocks x {run.plan.repeats_per_block}), "
+            f"below contract min_repeats={minimum}"
+        )
+    return errors[:5]
+
+
+def _remeasure_paired(
+    ctx: AgentContext, cand: BeamCandidate,
+) -> tuple[PairedRun | None, str]:
+    """Authoritative measurement by block-interleaved A/B (see runners.paired).
+
+    On success, mutates ``cand.value``/``cand.samples`` to the interleaved
+    candidate measurement and returns ``(run, "")``. On any failure returns
+    ``(None, reason)``; the caller then falls back to the ordinary full
+    re-benchmark, and the paired decision rule -- seeing no pairs -- falls back
+    to the unpaired gate with ``verified=False``. Nothing about that path is
+    silent, and none of it accepts a candidate the unpaired gate would reject.
+    """
+    task = ctx.task
+    progress = ctx.progress
+    try:
+        with _paired_workspaces(ctx.ws, cand.blocks, task.out_dir) as (arm_a, arm_b):
+            for label, cwd in (("incumbent", arm_a), ("candidate", arm_b)):
+                err = _build_arm(ctx, cwd)
+                if err:
+                    return None, f"{label} arm {err}"
+
+            def _on_spawn(arm: str, block: int, position: int) -> None:
+                progress.on_message(
+                    f"[agent]     block {position + 1}: arm {arm}"
+                )
+
+            run = run_paired_benchmark(
+                task.benchmark.cmd,
+                incumbent_cwd=arm_a, candidate_cwd=arm_b,
+                metric_name=task.benchmark.metric.name,
+                total_repeats=task.benchmark.repeats,
+                warmup=task.benchmark.warmup,
+                program_type=task.program_type,
+                rlimit_as_gb=task.constraints.rlimit_as_gb,
+                env_passthrough=task.constraints.env_passthrough,
+                isolation=ctx.config.isolation,
+                on_spawn=_on_spawn,
+            )
+    except Exception as exc:  # noqa: BLE001 -- an untrusted candidate's benchmark can fail in arbitrary ways; degrade to the unpaired path, never crash the run
+        logger.debug("Interleaved measurement failed", exc_info=True)
+        return None, f"interleaved measurement failed ({type(exc).__name__}: {exc})"
+
+    contract_errors = _validate_paired_contract(ctx, run)
+    if contract_errors:
+        return None, f"contract violation in interleaved run: {contract_errors[0]}"
+
+    cand.value = run.candidate_value
+    cand.samples = run.candidate_samples
+
+    metric = task.benchmark.metric.name
+    paired_cv = run.paired_cv
+    arm_cv = run.arm_cv("A")
+    progress.on_message(
+        f"[agent]   Interleaved A/B: {run.plan.blocks} pairs x "
+        f"{run.plan.repeats_per_block} repeats, order "
+        f"{''.join(run.order)} (drift imbalance {run.plan.imbalance:+.2f} slots), "
+        f"{run.wall_s:.1f}s"
+    )
+    progress.on_message(
+        f"[agent]   {metric}: candidate {run.candidate_value:.6g} vs "
+        f"incumbent {run.incumbent_value:.6g}"
+        + (f"; per-arm CV {arm_cv:.1%}" if arm_cv is not None else "")
+        + (f", paired-difference CV {paired_cv:.1%}" if paired_cv is not None else "")
+    )
+    # The incumbent was last measured under different conditions; saying how
+    # far it moved is the honest version of the periodic drift check, and it
+    # costs nothing here because both numbers were just measured.
+    if ctx.best_value:
+        drift = abs(run.incumbent_value - ctx.best_value) / abs(ctx.best_value)
+        if drift > 0.02:
+            progress.on_message(
+                f"[agent]   Incumbent re-measured at {run.incumbent_value:.6g} vs "
+                f"tracked best {ctx.best_value:.6g} ({drift:.1%} machine drift since "
+                f"it was last benchmarked) — the paired comparison uses the fresh "
+                f"measurement, so this drift does not reach the decision"
+            )
+    return run, ""
+
+
+def _remeasure_full(ctx: AgentContext, cand: BeamCandidate) -> str:
+    """Ordinary (unpaired) full-precision re-benchmark of one candidate.
+
+    Returns "" on success, else a rejection reason. Mutates
+    ``cand.value``/``cand.samples``.
+    """
+    task = ctx.task
+    with _patched_workspace_copy(
+        ctx.ws, cand.blocks, "perflab_rebench_", task.out_dir,
+    ) as temp_ws:
+        err = _build_arm(ctx, temp_ws)
+        if err:
+            ctx.progress.on_message(f"[agent]   Build failed on full re-bench ({err})")
+            return "build failed on full re-bench"
+        _, bench_full = run_benchmark(
+            task.benchmark.cmd, cwd=temp_ws, fast_mode=False,
+            program_type=task.program_type,
+            rlimit_as_gb=task.constraints.rlimit_as_gb,
+            env_passthrough=task.constraints.env_passthrough,
+            isolation=ctx.config.isolation,
+            warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
+        )
+        contract_errors = validate_contract(bench_full, task.contract)
+        if contract_errors:
+            ctx.progress.on_message(
+                f"[agent]   Contract violation on full re-bench: {contract_errors}"
+            )
+            return "contract violation on full re-bench"
+        full_val = metric_value(bench_full, task.benchmark.metric.name)
+        ctx.progress.on_message(
+            f"[agent]   Full benchmark: {task.benchmark.metric.name} = {full_val:.6g}"
+        )
+        cand.value = full_val
+        cand.samples = extract_repeated_values(bench_full, task.benchmark.metric.name)
+    return ""
+
+
+def _incumbent_samples(ctx: AgentContext) -> list[float]:
+    """Per-repeat samples for the *current best* program, or [] if unavailable.
+
+    run_dir/bench.json is written by run_pipeline_for_ctx, which runs on the
+    real workspace at baseline and again after every accepted patch -- i.e. it
+    always describes the incumbent. It is only trusted here when its metric
+    still equals ctx.best_value: the auto-tune phase can move best_value
+    without rewriting bench.json, and stale samples would misstate the
+    incumbent's spread. On any mismatch (or any I/O or parse failure) we return
+    [] and the gate degrades to a one-sided interval test against the incumbent
+    as a point estimate -- still stricter than the bare ratio it replaced.
+    """
+    try:
+        path = ctx.rp.run_dir / "bench.json"
+        if not path.exists():
+            return []
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        val = metric_value(blob, ctx.task.benchmark.metric.name)
+    except Exception:  # noqa: BLE001 -- best-effort variance lookup; a missing/garbled bench.json must not abort the run
+        logger.debug("Incumbent sample lookup failed", exc_info=True)
+        return []
+    if not math.isclose(val, ctx.best_value, rel_tol=1e-9, abs_tol=0.0):
+        return []
+    return extract_repeated_values(blob, ctx.task.benchmark.metric.name)
+
+
+def _report_noise_rejection(ctx: AgentContext, verdict: ImprovementVerdict) -> None:
+    """Explain a candidate rejected for being inside the measurement noise.
+
+    This is the message the whole statistical gate exists to produce: the
+    candidate DID beat the tolerance, and was still thrown away, because this
+    machine cannot tell the difference. Say so, and say what would fix it --
+    the environment is the bottleneck here, not the kernel.
+    """
+    task = ctx.task
+    progress = ctx.progress
+    progress.on_message(f"[agent]   Rejected: {verdict.reason}")
+    if verdict.cv is None:
+        return
+    if verdict.paired:
+        # The advice below is derived from the UNPAIRED resolution formula
+        # (resolvable ~ 2*t*CV/sqrt(n) across two independent arms), and a
+        # paired design does not obey it: its dispersion is the spread of the
+        # differences and its n is the pair count. Quoting a repeats number
+        # from the wrong model would be worse than saying nothing, so this
+        # says the thing that is actually actionable for a paired run.
+        progress.on_message(
+            f"[agent]   Paired-difference CV is {verdict.cv:.1%} across "
+            f"{verdict.n} interleaved pair(s) — the candidate's effect is not "
+            f"consistently signed across blocks. More blocks (or a quieter "
+            f"machine) would resolve it; more repeats inside a block would not, "
+            f"since the spread here is between blocks, not within them."
+        )
+        return
+    configured = getattr(task.constraints, "cv_threshold", None)
+    tol = task.constraints.regression_tolerance
+    repeats = task.benchmark.repeats
+    budget = configured if configured is not None else cv_budget_for_gate(tol, repeats)
+    if verdict.cv <= budget:
+        return
+    needed = repeats_needed_for_gate(verdict.cv, tol)
+    progress.on_message(
+        f"[agent]   Measurement noise (CV={verdict.cv:.1%}) exceeds the {budget:.1%} "
+        f"this machine would need to resolve a {tol:.1%} gate at repeats={repeats}: "
+        f"raise benchmark.repeats to ~{needed}, quiet the machine (pin clocks, "
+        f"stop background load), or widen constraints.regression_tolerance. "
+        f"Until then the measurement environment -- not the kernel -- is the "
+        f"limiting factor."
+    )
 
 
 def accept_best(
@@ -365,68 +637,173 @@ def accept_best(
     # first improving candidate as before.
     rebench_budget = ctx.config.top_k
 
+    # Two strategies, deliberately (perflab.analyzers.decision owns both):
+    #
+    #   accept_rule  -- what the task configured (default: non-overlapping 95%
+    #                   CIs on top of the tolerance floor). Applied to the
+    #                   *authoritative* measurement, and to it only.
+    #   SCREENING_RULE -- tolerance only. The fast screen benchmarks at
+    #                   repeats=2 purely to rank candidates; running the
+    #                   variance test on 2 samples would veto genuine wins
+    #                   before they are ever measured properly. The full
+    #                   re-bench below is the gate that decides.
+    #
+    # Non-fast mode never re-benches, so its single check is authoritative and
+    # uses accept_rule with the samples.
+    mode = task.benchmark.metric.mode
+    tol = task.constraints.regression_tolerance
+    accept_rule = rule_for_constraints(task.constraints)
+    incumbent_samples = _incumbent_samples(ctx)
+    reject_reasons: dict[int, str] = {}
+
+    # A paired rule needs a block-interleaved measurement, so selecting it also
+    # selects how the authoritative benchmark is taken (see runners.paired for
+    # why that cannot be bolted on afterwards -- pairing is a property of the
+    # experiment, not of the arithmetic applied to it). The fast screen is
+    # deliberately untouched: it is a cheap ranking pass, and doubling its cost
+    # to make it rigorous would defeat the reason it exists.
+    paired_enabled = is_paired_rule(accept_rule)
+    # Both modes now route through the same "screen, then measure
+    # authoritatively" shape when pairing is on; without it, behavior is
+    # exactly as before.
+    needs_remeasure = use_fast or paired_enabled
+
+    def _comparison(
+        c: BeamCandidate, paired_run: PairedRun | None = None,
+    ) -> Comparison:
+        """The measured facts. Which of them matter is the rule's business."""
+        if paired_run is not None:
+            # The incumbent value comes from the interleaved run, not from
+            # ctx.best_value: the entire point is that both sides were measured
+            # under the same conditions, moments apart. Using the tracked best
+            # here would smuggle the stale-baseline bias back into the one
+            # comparison that was built to exclude it.
+            return Comparison(
+                candidate=paired_run.candidate_value,
+                incumbent=paired_run.incumbent_value,
+                mode=mode,
+                tolerance=tol,
+                candidate_samples=paired_run.candidate_samples or None,
+                incumbent_samples=paired_run.incumbent_samples or None,
+                pairs=paired_run.pairs,
+            )
+        assert c.value is not None
+        return Comparison(
+            candidate=c.value,
+            incumbent=ctx.best_value,
+            mode=mode,
+            tolerance=tol,
+            candidate_samples=c.samples or None,
+            incumbent_samples=incumbent_samples or None,
+        )
+
+    def _assess(
+        c: BeamCandidate, paired_run: PairedRun | None = None,
+    ) -> ImprovementVerdict:
+        return accept_rule.decide(_comparison(c, paired_run))
+
+    def _screen(c: BeamCandidate) -> bool:
+        return SCREENING_RULE.decide(_comparison(c)).improved
+
     for idx, cand in enumerate(scored):
         assert cand.value is not None  # guaranteed by the `scored` filter above
-        if not is_improvement(
-            cand.value, ctx.best_value,
-            task.benchmark.metric.mode,
-            task.constraints.regression_tolerance,
-        ):
-            continue
-
-        # If we used fast screening, re-benchmark with full precision --
-        # in a temp workspace copy, same as the initial evaluation, so the
-        # re-bench can't leak candidate writes into the real workspace.
-        if use_fast:
-            if ctx.config.top_k > 0 and rebench_budget <= 0:
-                remaining = sum(
-                    1 for c in scored[idx:]
-                    if is_improvement(
-                        _cand_value(c), ctx.best_value,
-                        task.benchmark.metric.mode,
-                        task.constraints.regression_tolerance,
-                    )
+        paired_run: PairedRun | None = None
+        if needs_remeasure:
+            # Cheap directional screen (SCREENING_RULE) -- see the note above.
+            if not _screen(cand):
+                screen_name = "fast screen" if use_fast else "screen"
+                reject_reasons[idx] = (
+                    f"{screen_name} did not beat the incumbent by {tol:.1%}"
                 )
+                continue
+            verdict = None
+        else:
+            verdict = _assess(cand)
+            if not verdict.improved:
+                reject_reasons[idx] = verdict.reason
+                if verdict.beats_tolerance:
+                    _report_noise_rejection(ctx, verdict)
+                continue
+
+        # Authoritative re-measurement, in temp workspace copies (same as the
+        # initial evaluation, so it can't leak candidate writes into the real
+        # workspace). Either an ordinary full-precision benchmark or, when a
+        # paired rule is selected, a block-interleaved A/B against the
+        # incumbent.
+        if needs_remeasure:
+            if ctx.config.top_k > 0 and rebench_budget <= 0:
+                # Counted with the screening rule, since that is the bar these
+                # candidates cleared to get here -- none of them has an
+                # authoritative measurement yet.
+                remaining = sum(1 for c in scored[idx:] if _screen(c))
                 progress.on_message(
                     f"[agent]   Re-bench budget (top_k={ctx.config.top_k}) exhausted; "
                     f"{remaining} improving candidate(s) left unexamined"
                 )
                 break
             rebench_budget -= 1
-            progress.on_message("[agent]   Re-benchmarking top candidate with full precision...")
-            with _patched_workspace_copy(ws, cand.blocks, "perflab_rebench_", task.out_dir) as temp_ws:
-                if task.build is not None:
-                    build_res = run_cmd(
-                        shlex.split(task.build.cmd), cwd=temp_ws,
-                        timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
-                    )
-                    if build_res.returncode != task.build.expected_exit:
-                        progress.on_message(f"[agent]   Build failed on full re-bench (rc={build_res.returncode})")
-                        continue
-                _, bench_full = run_benchmark(
-                    task.benchmark.cmd, cwd=temp_ws, fast_mode=False,
-                    program_type=task.program_type,
-                    rlimit_as_gb=task.constraints.rlimit_as_gb,
-                    env_passthrough=task.constraints.env_passthrough,
-                    isolation=ctx.config.isolation,
-                    warmup=task.benchmark.warmup, repeats=task.benchmark.repeats,
-                )
-                contract_errors = validate_contract(bench_full, task.contract)
-                if contract_errors:
-                    progress.on_message(f"[agent]   Contract violation on full re-bench: {contract_errors}")
-                    continue
-                full_val = metric_value(bench_full, task.benchmark.metric.name)
-                progress.on_message(f"[agent]   Full benchmark: {task.benchmark.metric.name} = {full_val:.6g}")
-                cand.value = full_val
 
-            # Re-check improvement with full benchmark value
-            if not is_improvement(
-                cand.value, ctx.best_value,
-                task.benchmark.metric.mode,
-                task.constraints.regression_tolerance,
-            ):
-                progress.on_message("[agent]   Full benchmark did not confirm improvement, skipping")
+            paired_error = ""
+            if paired_enabled:
+                progress.on_message(
+                    "[agent]   Re-benchmarking top candidate, block-interleaved "
+                    "against the incumbent..."
+                )
+                paired_run, paired_error = _remeasure_paired(ctx, cand)
+                if paired_run is None:
+                    # Fail closed, and loudly: fall back to the ordinary
+                    # re-bench, which leaves the comparison with no pairs, so
+                    # PairedDifference degrades to the unpaired gate and
+                    # reports verified=False.
+                    progress.on_message(
+                        f"[agent]   Paired measurement unavailable ({paired_error}); "
+                        f"falling back to an unpaired full benchmark"
+                    )
+            if paired_run is None:
+                if not paired_enabled:
+                    progress.on_message(
+                        "[agent]   Re-benchmarking top candidate with full precision..."
+                    )
+                rebench_error = _remeasure_full(ctx, cand)
+                if rebench_error:
+                    reject_reasons[idx] = rebench_error
+                    continue
+
+            # Re-check improvement with the authoritative measurement. This is
+            # the gate that decides, so it carries the samples (and the pairs).
+            verdict = _assess(cand, paired_run)
+            if not verdict.improved:
+                reject_reasons[idx] = verdict.reason
+                if verdict.beats_tolerance:
+                    progress.on_message(
+                        "[agent]   Full benchmark improved the metric but not beyond noise"
+                    )
+                    _report_noise_rejection(ctx, verdict)
+                else:
+                    progress.on_message("[agent]   Full benchmark did not confirm improvement, skipping")
                 continue
+
+        assert verdict is not None  # set by whichever branch reached here
+        if verdict.rule == accept_rule.name and paired_enabled and not verdict.paired:
+            # Never silent, and distinct from the missing-samples note below:
+            # the interleaved measurement did not happen, so this accept rests
+            # on the unpaired gate and carries the drift bias pairing removes.
+            progress.on_message(
+                "[agent]   NOTE: accepted WITHOUT the paired test — the interleaved "
+                "measurement produced no usable pairs, so the decision fell back to "
+                "the unpaired interval gate (still stricter than the bare ratio, but "
+                "the incumbent and candidate were not measured under matched conditions)"
+            )
+        elif not verdict.verified:
+            # Never silent: the accept happened on a bare ratio because the
+            # harness published no per-repeat samples for this metric (see
+            # bench_stats.extract_repeated_values for the shapes we accept).
+            progress.on_message(
+                "[agent]   NOTE: accepted without variance verification — bench.json "
+                f"exposed no per-repeat samples for {task.benchmark.metric.name}; "
+                "emit a 'raw_values'/'samples' array beside the metric (or a "
+                "top-level 'times_ms') to enable the statistical gate"
+            )
 
         # Compute relative improvement BEFORE updating best_value
         old_best = ctx.best_value
@@ -514,6 +891,12 @@ def accept_best(
     # No candidate improved
     progress.on_message("[agent]   No improving candidate this iteration")
     best_desc = scored[0].description if scored else "no valid candidates"
+    # Carry the top candidate's rejection reason into the history/report so
+    # "did not beat baseline" and "beat it but within measurement noise" stay
+    # distinguishable after the run.
+    top_reason = reject_reasons.get(0, "")
+    if top_reason:
+        best_desc = f"{best_desc}: {top_reason}"
     # Explicit None check: a genuine 0.0 metric value must be recorded, not
     # silently replaced by ctx.best_value.
     best_val = scored[0].value if scored else None
