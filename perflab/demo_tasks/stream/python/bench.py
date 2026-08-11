@@ -1,10 +1,24 @@
-"""Benchmark harness for stream operations."""
+"""Benchmark harness for stream operations.
+
+Buffer ownership lives HERE, not in stream.py, and deliberately so. This file
+is protected (PROTECTED_FILENAMES), stream.py is agent-editable.
+
+Originally run_stream() allocated three 134 MB arrays and called
+np.random.randn twice on every invocation, all inside the timed region. Once
+the scalar loops are vectorized that setup *dominates*: measured 0.299 s of
+alloc+RNG against ~0.295 s total for an honestly-vectorized run. The metric
+then rewards caching the buffers in module globals -- worth ~10x -- which is
+not a streaming optimization at all. Allocating once here, and restoring the
+inputs between repeats OUTSIDE the timer, leaves the timed region measuring
+only the four stream kernels.
+"""
 import argparse
 import json
 import os
 import time
 from pathlib import Path
 
+import numpy as np
 from stream import N, run_stream
 
 
@@ -16,16 +30,33 @@ def main():
     warmup = int(os.environ.get("PERFLAB_BENCH_WARMUP", "1"))
     repeats = int(os.environ.get("PERFLAB_BENCH_REPEATS", "5"))
 
+    # Allocated once, outside every timed region.
+    rng = np.random.default_rng(0xC0FFEE)
+    A = np.zeros((N, N), dtype=np.float64)
+    B = np.empty((N, N), dtype=np.float64)
+    C = np.empty((N, N), dtype=np.float64)
+    # Pristine sources: the kernels overwrite A/B/C, so inputs are restored
+    # before each repeat to keep every measurement identical.
+    b_src = rng.standard_normal((N, N), dtype=np.float64)
+    c_src = rng.standard_normal((N, N), dtype=np.float64)
+
+    def reset():
+        np.copyto(B, b_src)
+        np.copyto(C, c_src)
+        A.fill(0.0)
+
     # Warmup
     for _ in range(warmup):
-        run_stream()
+        reset()
+        run_stream(A, B, C)
 
     # Timed runs
     times = []
     total_bytes = None
     for _ in range(repeats):
+        reset()  # outside the timer
         t0 = time.perf_counter()
-        total_bytes, _ = run_stream()
+        total_bytes = run_stream(A, B, C)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
 

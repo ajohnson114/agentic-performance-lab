@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis
+from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis, Evidence
 
 
 def _analyze_perf(
@@ -34,6 +34,7 @@ def _analyze_perf(
                 "Reduce branch mispredictions with branchless code",
                 "Consider SIMD vectorization for data-parallel work",
             ],
+            evidence=Evidence(level="derived", rule_id="perf_ipc_low", metrics={"ipc": ipc, "threshold": thresholds.perf_ipc_low}),
         ))
 
     if cache_miss_rate is not None and cache_miss_rate > thresholds.perf_cache_miss_rate_high:
@@ -50,6 +51,7 @@ def _analyze_perf(
                 "Use structure-of-arrays instead of array-of-structures",
                 "Align data to cache line boundaries",
             ],
+            evidence=Evidence(level="derived", rule_id="perf_cache_miss_rate_high", metrics={"cache_miss_rate": cache_miss_rate, "threshold": thresholds.perf_cache_miss_rate_high}),
         ))
 
     if branch_miss_rate is not None and branch_miss_rate > thresholds.perf_branch_miss_rate_high:
@@ -66,6 +68,7 @@ def _analyze_perf(
                 "Consider profile-guided optimization (PGO)",
                 "Sort data to improve branch prediction accuracy",
             ],
+            evidence=Evidence(level="derived", rule_id="perf_branch_miss_rate_high", metrics={"branch_miss_rate": branch_miss_rate, "threshold": thresholds.perf_branch_miss_rate_high}),
         ))
 
     if hotspots and hotspots[0].get("pct", 0) > thresholds.perf_hotspot_dominance_pct:
@@ -80,6 +83,7 @@ def _analyze_perf(
                 "Check if this function can be vectorized (SIMD)",
                 "Profile with ncu/VTune for micro-architectural insights",
             ],
+            evidence=Evidence(level="derived", rule_id="perf_hotspot_dominance_pct", metrics={"hotspot_pct": hs.get("pct", 0), "threshold": thresholds.perf_hotspot_dominance_pct}),
         ))
 
     # Rule A — Single-threaded execution
@@ -107,6 +111,7 @@ def _analyze_perf(
                 "Compile with -fopenmp to enable OpenMP support",
                 "Distribute independent loop iterations across threads",
             ],
+            evidence=Evidence(level="derived", rule_id="perf_cpus_utilized_low", metrics={"cpus_utilized": cpus_utilized, "cpu_count": cpu_count, "threshold": thresholds.perf_cpus_utilized_low}),
         ))
 
     # Rule B — No SIMD vectorization
@@ -128,6 +133,7 @@ def _analyze_perf(
                 "Add auto-vectorization hints (#pragma GCC ivdep, __restrict__)",
                 "Use __restrict__ pointers to help the compiler prove no aliasing",
             ],
+            evidence=Evidence(level="inferred", rule_id="perf_no_simd_source_hint", metrics={"hotspot_pct": hotspots[0].get("pct", 0), "threshold": thresholds.perf_hotspot_dominance_pct}),
         ))
 
     # Rule C — Vectorization width mismatch (from compiler remarks)
@@ -155,6 +161,7 @@ def _analyze_perf(
                             "Add __restrict__ qualifiers to pointer parameters",
                             f"Ensure data is aligned to {max_simd // 8}-byte boundaries",
                         ],
+                        evidence=Evidence(level="derived", rule_id="vec_width_gap_ratio", metrics={"remark_width_bits": remark.width, "max_simd_width_bits": max_simd, "gap_ratio": gap, "threshold_ratio": thresholds.vec_width_gap_ratio}),
                     ))
                     break  # one diagnosis is enough
 
@@ -188,6 +195,7 @@ def _analyze_perf(
                             "Restructure loop for unit-stride access",
                             "Add #pragma GCC ivdep or #pragma omp simd",
                         ],
+                        evidence=Evidence(level="inferred", rule_id="perf_annotate_compiler_remark_cross_ref", metrics={"remark_line": remark.line, "hot_line_pct_threshold": thresholds.perf_annotate_hot_line_pct, "window_lines": thresholds.cross_ref_hotspot_window}),
                     ))
                     break  # one diagnosis is enough
 
@@ -253,6 +261,7 @@ def _analyze_perf(
                     root_cause=root,
                     confidence="high" if level_pct > 30 else "medium",
                     suggested_actions=actions,
+                    evidence=Evidence(level="derived", rule_id="tma_level3_memory_bound", metrics={"memory_bound_pct": mem_bound, "level_pct": level_pct, "threshold": 20.0}),
                 ))
 
         # Core bound diagnosis
@@ -274,6 +283,7 @@ def _analyze_perf(
                 root_cause="Execution units are the bottleneck — not enough ILP or SIMD utilization",
                 confidence="medium",
                 suggested_actions=actions,
+                evidence=Evidence(level="derived", rule_id="tma_level2_core_bound", metrics={"core_bound_pct": core_bound, "threshold": 25.0}),
             ))
 
     return findings
@@ -312,6 +322,7 @@ def _analyze_io_bottleneck(
                 "Use persistent_workers=True to avoid worker restart overhead",
                 "Consider memory-mapped datasets or pre-loaded tensors",
             ],
+            evidence=Evidence(level="inferred", rule_id="io_hotspot_pct_high", metrics={"io_hotspot_pct": io_hotspot_pct, "threshold": thresholds.io_hotspot_pct_high}),
         ))
 
     # Check nsys: if most time is NOT in CUDA kernels AND NOT in CUDA API
@@ -336,6 +347,7 @@ def _analyze_io_bottleneck(
                     "Move preprocessing to GPU (torchvision transforms on GPU)",
                     "Use async data prefetching",
                 ],
+                evidence=Evidence(level="inferred", rule_id="io_non_gpu_fraction_high", metrics={"non_gpu_fraction": non_gpu_fraction, "threshold": thresholds.io_non_gpu_fraction_high}),
             ))
 
     return findings

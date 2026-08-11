@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from perflab.optimizers.forbidden import compile_rules
 from perflab.optimizers.patch import (
     SearchReplaceBlock,
     apply_patch,
@@ -48,7 +49,11 @@ def _prescreen_candidate(
 
     # Validate patch
     validation_errors = validate_patch(
-        blocks, task.edit_policy.allowed_paths, ws, notices=result["notices"]
+        blocks, task.edit_policy.allowed_paths, ws, notices=result["notices"],
+        forbidden_rules=compile_rules(
+            task.anti_gaming.forbidden_constructs,
+            task.anti_gaming.forbidden_patterns,
+        ),
     )
     if validation_errors:
         result["error"] = {"type": "validation", "description": validation_errors[0], "output": ""}

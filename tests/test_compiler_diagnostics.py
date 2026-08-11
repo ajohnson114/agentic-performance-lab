@@ -30,7 +30,11 @@ class TestGetDiagnosticBuildFlags:
     def test_cpp_gcc(self):
         flags = get_diagnostic_build_flags("cpp", compiler="gcc")
         assert "-fopt-info-all-optall" in flags
-        assert "-gline-tables-only" in flags
+        # -g1, not -gline-tables-only: the latter is Clang-only and real GCC
+        # fails the build with "unrecognized debug output level", which broke
+        # every C++ task on Linux while passing on macOS (Apple Clang).
+        assert "-g1" in flags
+        assert "-gline-tables-only" not in flags
 
     def test_cpp_default(self):
         flags = get_diagnostic_build_flags("cpp")

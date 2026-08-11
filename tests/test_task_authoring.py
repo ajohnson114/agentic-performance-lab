@@ -509,7 +509,7 @@ class TestValidateTaskTool:
         """Validate the existing _sample task."""
         from perflab.server.mcp_server import validate_task
 
-        result = validate_task("tasks/_sample/task.yaml")
+        result = validate_task("perflab/demo_tasks/_sample/task.yaml")
         assert result["valid"] is True, f"Errors: {result['errors']}"
 
     def test_warns_missing_bench_py(self, tmp_path):
@@ -549,7 +549,7 @@ class TestLintBenchScriptTool:
     def test_lints_sample_bench(self):
         from perflab.server.mcp_server import lint_bench_script
 
-        result = lint_bench_script("tasks/_sample/task.yaml")
+        result = lint_bench_script("perflab/demo_tasks/_sample/task.yaml")
         assert "error" not in result
         assert result["passed"] is True
 
@@ -575,7 +575,7 @@ class TestSuggestContractTool:
     def test_analyzes_sample_bench(self):
         from perflab.server.mcp_server import suggest_contract
 
-        result = suggest_contract("tasks/_sample/task.yaml")
+        result = suggest_contract("perflab/demo_tasks/_sample/task.yaml")
         assert "error" not in result
         assert "fixed_params" in result
         assert "required_bench_fields" in result

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from perflab.optimizers.forbidden import CompiledRule, check_text
+
 if TYPE_CHECKING:
     from perflab.task_spec import TaskSpec
 
@@ -361,6 +363,7 @@ def validate_patch(
     allowed_paths: list[str],
     workspace: Path,
     notices: list[str] | None = None,
+    forbidden_rules: list[CompiledRule] | None = None,
 ) -> list[str]:
     """Validate patch blocks against policy and file contents.
 
@@ -370,6 +373,12 @@ def validate_patch(
     a note whenever a block's SEARCH text did not match exactly and was
     auto-corrected via fuzzy matching, so the correction is visible in logs
     rather than silent.
+
+    `forbidden_rules` (from task.anti_gaming, compiled by
+    perflab.optimizers.forbidden) rejects candidates that introduce constructs
+    the task rules out — e.g. an optimization pragma that would override a
+    pinned build command. Only the REPLACE side is checked: what the candidate
+    *adds*, never what the baseline already contains.
     """
     errors: list[str] = []
     workspace_root = workspace.resolve()
@@ -418,6 +427,13 @@ def validate_patch(
                 errors.append(
                     f"Block {idx}: path '{block.file_path}' not in allowed_paths {allowed_paths}"
                 )
+                continue
+
+        # Reject constructs the task forbids, checking only the introduced text.
+        if forbidden_rules:
+            violations = check_text(block.replace, forbidden_rules)
+            if violations:
+                errors.extend(f"Block {idx}: {v}" for v in violations)
                 continue
 
         # Check that the file exists and contains the search text

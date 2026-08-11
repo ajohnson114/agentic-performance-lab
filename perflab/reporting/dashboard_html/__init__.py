@@ -41,6 +41,7 @@ from .widgets import (
     _fmt_pct,
     _metric_pill,
     _render_bar_chart,
+    _render_markdown,
     _render_speedscope_link,
     _summary_ok,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "_render_diagnostics",
     "_render_environment",
     "_render_jax_section",
+    "_render_markdown",
     "_render_memray_section",
     "_render_metal_section",
     "_render_ncu_section",

@@ -28,8 +28,13 @@ def _has_torch_data(prof: ProfilerData) -> bool:
 
 
 def _has_pyspy_data(prof: ProfilerData) -> bool:
+    # Keyed on hotspots, NOT returncode: py-spy routinely exits non-zero while
+    # still writing a complete speedscope file (teardown races under --native,
+    # or an RLIMIT_AS/env-allowlist trip in perflab's own bench wrapper). A
+    # parsed hotspot list is proof the profile is usable, so gating on the exit
+    # code silently threw away good multi-thousand-sample profiles.
     for s in (prof.pyspy_summary, prof.baseline_pyspy_summary):
-        if s and s.get("returncode") == 0 and s.get("hotspots"):
+        if s and s.get("hotspots"):
             return True
     return False
 
@@ -234,8 +239,9 @@ def _render_pyspy_hotspots(parts: list[str], summary: dict | None, esc, color: s
 def _render_pyspy_section(parts: list[str], prof: ProfilerData, esc) -> None:
     ps = prof.pyspy_summary
     bps = prof.baseline_pyspy_summary
-    has_opt = ps and ps.get("returncode") == 0 and ps.get("hotspots")
-    has_base = bps and bps.get("returncode") == 0 and bps.get("hotspots")
+    # Hotspots are the usability signal, not the exit code -- see _has_pyspy_data.
+    has_opt = bool(ps and ps.get("hotspots"))
+    has_base = bool(bps and bps.get("hotspots"))
     scope_path = prof.speedscope_json_path
     if not (scope_path and scope_path.exists()):
         scope_path = None

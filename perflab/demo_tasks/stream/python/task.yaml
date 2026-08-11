@@ -25,5 +25,10 @@ contract:
     - ok
     - throughput
   min_repeats: 3
+  # N lives in stream.py, which is editable. Without this pin the agent could
+  # shrink the arrays until they fit in cache and report a huge GB/s that is a
+  # cache-residency artifact, not an optimization. bench.py is protected
+  # (PROTECTED_FILENAMES) and reports meta.N, so this is enforceable.
+  fixed_params: { N: 4096 }
 
 out_dir: "../../out"

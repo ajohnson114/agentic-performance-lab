@@ -45,6 +45,7 @@ def get_bottlenecks(run_id: str, out_dir: str = "out") -> list[dict]:
             "root_cause": d.root_cause,
             "confidence": d.confidence,
             "suggested_actions": d.suggested_actions,
+            "evidence": d.evidence.to_dict(),
         }
         for d in diags
     ]

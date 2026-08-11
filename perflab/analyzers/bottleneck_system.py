@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis
+from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis, Evidence
 
 
 def _analyze_tpu(
@@ -30,6 +30,7 @@ def _analyze_tpu(
                 "Use jax.lax.scan instead of Python loops to fuse operations into one XLA program",
                 "Check for host callbacks or jax.debug.print in the hot path — they stall the pipeline",
             ],
+            evidence=Evidence(level="derived", rule_id="tpu_mxu_util_low", metrics={"mxu_utilization_pct": mxu_util, "threshold": thresholds.tpu_mxu_util_low}),
         ))
 
     # Rule 2: Padding waste from HLO analysis
@@ -50,6 +51,7 @@ def _analyze_tpu(
                     "For attention: use sequence lengths that are multiples of 128",
                     "Check if reshape/transpose ops are causing unnecessary padding",
                 ],
+                evidence=Evidence(level="derived", rule_id="tpu_padding_waste_pct_high", metrics={"pad_pct": pad_pct, "pad_count": pad_count, "total_ops": total_ops, "threshold": thresholds.tpu_padding_waste_pct_high}),
             ))
 
     # Rule 3: Infeed stalls (data loading bottleneck)
@@ -66,6 +68,7 @@ def _analyze_tpu(
                 "Pre-process and cache data in host memory or on GCS",
                 "Use grain dataloader for JAX-native data loading",
             ],
+            evidence=Evidence(level="derived", rule_id="tpu_infeed_stall_pct_high", metrics={"infeed_stall_pct": infeed_pct, "threshold": thresholds.tpu_infeed_stall_pct_high}),
         ))
 
     # Rule 4: Too many small HLO modules (fragmented computation)
@@ -82,6 +85,7 @@ def _analyze_tpu(
                 "Use jax.lax.scan/fori_loop to fuse iterative computation",
                 "Avoid mixing jitted and un-jitted code in the hot path",
             ],
+            evidence=Evidence(level="derived", rule_id="tpu_hlo_module_fragmentation", metrics={"hlo_module_count": hlo_modules, "threshold": 10.0}),
         ))
 
     # Rule 5: Not using bfloat16 (check HLO for f32 dominance)
@@ -99,6 +103,7 @@ def _analyze_tpu(
                 "Use jax.default_matmul_precision('bfloat16') for automatic bf16 matmuls",
                 "For training: bf16 forward + fp32 gradient accumulation is standard on TPU",
             ],
+            evidence=Evidence(level="derived", rule_id="tpu_fp32_dominant", metrics={"f32_ops": f32_ops, "bf16_ops": bf16_ops, "total_ops": total_ops, "ratio_threshold": 3.0}),
         ))
 
     return findings
@@ -126,6 +131,7 @@ def _analyze_jax(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Use jax.lax.scan instead of Python loops over varying-length sequences",
                 "Check for accidental Python-level tracing (e.g., data-dependent control flow)",
             ],
+            evidence=Evidence(level="derived", rule_id="jax_recompilation_warn", metrics={"recompilations": recomps, "threshold": thresholds.jax_recompilation_warn}),
         ))
 
     # Rule 2: High compilation overhead
@@ -144,6 +150,7 @@ def _analyze_jax(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Use donate_argnums to reduce memory copies and avoid recompilation",
                 "Consider AOT compilation with jax.jit(...).lower(...).compile()",
             ],
+            evidence=Evidence(level="derived", rule_id="jax_compilation_overhead_high", metrics={"compile_time_ms": compile_time_ms, "compile_fraction": (compile_time_ms / 1000.0) / duration_s, "time_threshold_ms": thresholds.jax_compilation_time_high_ms, "fraction_threshold": thresholds.jax_compilation_fraction_high}),
         ))
 
     # Rule 3: Excessive compilations
@@ -159,6 +166,7 @@ def _analyze_jax(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Avoid calling jnp operations outside of jitted functions",
                 "Consolidate small jitted functions into larger ones",
             ],
+            evidence=Evidence(level="derived", rule_id="jax_compilations_excessive", metrics={"compilations": compilations, "threshold": thresholds.jax_compilations_excessive}),
         ))
 
     return findings
@@ -192,6 +200,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "batching, reducing Python overhead",
                     "Use float16 / channels_last for faster MPS kernel dispatch",
                 ],
+                evidence=Evidence(level="observed", rule_id="torch_mps_gpu_timing_unavailable", metrics={"gpu_kernel_us": gpu_us}),
             ))
         elif gpu_us == 0 and not summary.get("top_gpu_kernels"):
             # No GPU kernels were recorded at all (e.g. torch.device("cpu") on
@@ -213,6 +222,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "If a GPU is expected, check torch.cuda.is_available() and device placement",
                     "Focus on CPU-side optimizations: vectorization, batching, reducing Python overhead",
                 ],
+                evidence=Evidence(level="observed", rule_id="torch_cpu_only_run", metrics={"gpu_kernel_us": gpu_us}),
             ))
         elif ratio < thresholds.gpu_cpu_ratio_low:
             findings.append(BottleneckDiagnosis(
@@ -226,6 +236,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "Reduce Python-level overhead in the training loop",
                     "Increase batch size to amortize per-step CPU overhead",
                 ],
+                evidence=Evidence(level="derived", rule_id="gpu_cpu_ratio_low", metrics={"gpu_cpu_ratio": ratio, "threshold": thresholds.gpu_cpu_ratio_low}),
             ))
 
     # Excessive synchronization
@@ -244,6 +255,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                 "Avoid printing/logging tensor values during timed runs",
                 "Defer result collection to after the training loop",
             ],
+            evidence=Evidence(level="derived", rule_id="sync_count_warn", metrics={"sync_count": sync_count, "sync_ms": sync_ms, "threshold": thresholds.sync_count_warn}),
         ))
 
     # Memory allocation overhead
@@ -263,6 +275,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                 "Use CUDA memory pools (set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True)",
                 "Avoid creating temporary tensors in hot loops",
             ],
+            evidence=Evidence(level="derived", rule_id="mem_alloc_overhead_pct", metrics={"alloc_us": total_alloc_us, "op_us": total_op_us, "threshold_ratio": thresholds.mem_alloc_overhead_pct}),
         ))
 
     # Dominant GPU kernel
@@ -279,6 +292,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                 "Profile with ncu for detailed per-kernel metrics",
                 "Consider using torch.compile() for kernel fusion",
             ],
+            evidence=Evidence(level="derived", rule_id="gpu_kernel_dominance_pct", metrics={"kernel_pct": k.get("pct", 0), "threshold": thresholds.gpu_kernel_dominance_pct}),
         ))
 
     # -- Per-phase training breakdown analysis --
@@ -324,6 +338,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     root_cause=f"The {pname} phase accounts for the majority of per-step time",
                     confidence="high",
                     suggested_actions=suggestions,
+                    evidence=Evidence(level="derived", rule_id="phase_dominance_pct", metrics={"phase_pct": pct, "threshold": thresholds.phase_dominance_pct}),
                 ))
 
             # GPU underutilization within forward/backward
@@ -341,6 +356,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                             "Apply torch.compile() to fuse operators and reduce dispatch overhead",
                             "Increase batch size to amortize per-step CPU overhead",
                         ],
+                        evidence=Evidence(level="derived", rule_id="phase_gpu_fraction_low", metrics={"gpu_fraction": gpu_frac, "threshold": thresholds.phase_gpu_fraction_low}),
                     ))
 
     # -- Non-contiguous tensor detection --
@@ -362,6 +378,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "Preallocate output tensors with the right layout to avoid implicit copies",
                     "Use torch.empty with the correct memory_format instead of clone()",
                 ],
+                evidence=Evidence(level="derived", rule_id="torch_noncontiguous_ops", metrics={"op_pct": op_pct, "threshold": 3.0}),
             ))
             break  # One finding is enough
 
@@ -389,6 +406,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "Use torch.nn.functional.pad() before matmul operations",
                     "Design model dimensions (d_model, n_heads, vocab_size) as multiples of 64 or 128",
                 ],
+                evidence=Evidence(level="derived", rule_id="torch_tensor_core_misalignment", metrics={"misaligned_count": len(misaligned)}),
             ))
             break
 
@@ -416,6 +434,7 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                     "Use torch.cuda.memory.CUDAPluggableAllocator for custom allocation strategies",
                     "Reduce dynamic tensor creation — use fixed-size buffers where possible",
                 ],
+                evidence=Evidence(level="inferred", rule_id="torch_memory_fragmentation_heuristic", metrics={"peak_memory_mb": peak_mb, "alloc_count": alloc_count, "alloc_time_us": alloc_time_us, "peak_threshold_mb": 1024.0, "alloc_count_threshold": 500.0, "alloc_time_threshold_us": 50000.0}),
             ))
 
     return findings
@@ -446,6 +465,7 @@ def _analyze_nvtx_phases(nsys_summary: dict, thresholds: AnalysisThresholds) -> 
                     "Profile this phase in detail with ncu for GPU-side analysis",
                     "Consider algorithmic improvements within this phase",
                 ],
+                evidence=Evidence(level="derived", rule_id="nvtx_phase_dominance_pct", metrics={"phase_pct": top_pct, "threshold": thresholds.nvtx_phase_dominance_pct}),
             ))
 
     # Rule 2: Many short NVTX ranges
@@ -461,6 +481,7 @@ def _analyze_nvtx_phases(nsys_summary: dict, thresholds: AnalysisThresholds) -> 
                     "Coarsen work granularity to reduce overhead",
                     "Batch small work units into larger chunks",
                 ],
+                evidence=Evidence(level="derived", rule_id="nvtx_fine_grained_partitioning", metrics={"range_count": len(ranges), "avg_range_ms": avg_ms, "count_threshold": thresholds.nvtx_range_count_high, "avg_threshold_ms": thresholds.nvtx_avg_range_dur_low_ms}),
             ))
 
     return findings
@@ -482,6 +503,7 @@ def _analyze_memray(summary: dict, thresholds: AnalysisThresholds) -> list[Bottl
                 "Process data in chunks rather than loading all at once",
                 "Check for memory leaks in loops (appending without clearing)",
             ],
+            evidence=Evidence(level="derived", rule_id="memray_peak_mb_warn", metrics={"peak_memory_mb": peak_mb, "threshold": thresholds.memray_peak_mb_warn}),
         ))
 
     top_allocs = summary.get("top_allocators", [])
@@ -501,6 +523,7 @@ def _analyze_memray(summary: dict, thresholds: AnalysisThresholds) -> list[Bottl
                     "Use memory pools or object recycling to reduce allocation pressure",
                     "Consider in-place operations to avoid temporary copies",
                 ],
+                evidence=Evidence(level="derived", rule_id="memray_top_allocator_dominance_pct", metrics={"allocator_pct": top_pct, "threshold": thresholds.memray_top_allocator_dominance_pct}),
             ))
 
     return findings
@@ -528,6 +551,7 @@ def _analyze_ebpf(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                     "Add prefetching or async I/O for data loading",
                     "Check if data is on a slow storage device (HDD, NFS)",
                 ],
+                evidence=Evidence(level="derived", rule_id="ebpf_read_p99_us_high", metrics={"read_p99_us": read_p99_us, "threshold": thresholds.ebpf_read_p99_us_high}),
             ))
 
     # High write latency
@@ -545,6 +569,7 @@ def _analyze_ebpf(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                     "Use async I/O or background writer thread",
                     "Check if filesystem sync is being called too frequently",
                 ],
+                evidence=Evidence(level="derived", rule_id="ebpf_write_p99_us_high", metrics={"write_p99_us": write_p99_us, "threshold": thresholds.ebpf_write_p99_us_high}),
             ))
 
     # Excessive syscall count
@@ -562,6 +587,7 @@ def _analyze_ebpf(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                 "Batch small reads into larger reads (e.g., read full blocks)",
                 "Use mmap for random access patterns",
             ],
+            evidence=Evidence(level="derived", rule_id="ebpf_syscall_count_high", metrics={"total_syscalls": total_syscalls, "threshold": thresholds.ebpf_syscall_count_high}),
         ))
 
     return findings
@@ -594,6 +620,7 @@ def _analyze_lock_contention(summary: dict, thresholds: AnalysisThresholds) -> l
                     "Partition shared data to reduce lock scope",
                     "Consider reader-writer locks if reads dominate",
                 ],
+                evidence=Evidence(level="derived", rule_id="lock_contention_ratio_high", metrics={"contention_ratio": contention_ratio, "threshold": thresholds.lock_contention_ratio_high}),
             ))
 
     if total_wait_ms > thresholds.lock_total_wait_ms_high:
@@ -607,6 +634,7 @@ def _analyze_lock_contention(summary: dict, thresholds: AnalysisThresholds) -> l
                 "Use fine-grained locking instead of a single global lock",
                 "Consider lock-free algorithms for hot paths",
             ],
+            evidence=Evidence(level="derived", rule_id="lock_total_wait_ms_high", metrics={"total_wait_ms": total_wait_ms, "threshold": thresholds.lock_total_wait_ms_high}),
         ))
 
     # False sharing detection
@@ -623,6 +651,7 @@ def _analyze_lock_contention(summary: dict, thresholds: AnalysisThresholds) -> l
                 "Use thread-local accumulators and reduce at the end",
                 "Align per-thread data with alignas(64) or __attribute__((aligned(64)))",
             ],
+            evidence=Evidence(level="derived", rule_id="lock_false_sharing_hitm_high", metrics={"hitm_count": hitm, "threshold": thresholds.lock_false_sharing_hitm_high}),
         ))
 
     return findings
@@ -653,6 +682,7 @@ def _analyze_thread_sched(summary: dict, thresholds: AnalysisThresholds) -> list
                         "Reduce the number of active threads to match physical cores",
                         "Increase thread priority for latency-sensitive threads",
                     ],
+                    evidence=Evidence(level="derived", rule_id="thread_sched_avg_delay_ms_high", metrics={"max_avg_delay_ms": max_avg_delay, "threshold": thresholds.thread_sched_avg_delay_ms_high}),
                 ))
 
     # Check for excessive migrations
@@ -668,6 +698,7 @@ def _analyze_thread_sched(summary: dict, thresholds: AnalysisThresholds) -> list
                 "Use NUMA-aware allocation to keep data near the processing core",
                 "Reduce thread count to reduce scheduler pressure",
             ],
+            evidence=Evidence(level="derived", rule_id="thread_sched_migrations_high", metrics={"migrations": migrations, "threshold": thresholds.thread_sched_migrations_high}),
         ))
 
     return findings
@@ -702,6 +733,7 @@ def _analyze_power(summary: dict, thresholds: AnalysisThresholds) -> list[Bottle
                         "Improve GPU cooling or reduce sustained load",
                         "Set GPU power limit higher if headroom exists",
                     ],
+                    evidence=Evidence(level="inferred", rule_id="power_gpu_throttle_drop_pct", metrics={"power_drop_pct": drop_pct, "early_avg_watts": early_avg, "late_avg_watts": late_avg, "threshold": thresholds.power_gpu_throttle_drop_pct}),
                 ))
 
     return findings

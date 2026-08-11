@@ -98,6 +98,10 @@ class PromptContext:
     roofline: dict | None = None
     history: list[dict] = field(default_factory=list)
     allowed_paths: list[str] = field(default_factory=list)
+    # Human-readable lines from forbidden.describe() -- constructs this task
+    # rules out. Surfaced in the prompt so the model doesn't burn an iteration
+    # discovering the rule via a rejected patch.
+    forbidden_descriptions: list[str] = field(default_factory=list)
     n_candidates: int = 6
     target_hardware: str | None = None
     program_type: str = "python"
@@ -971,7 +975,17 @@ def _build_optimization_playbook(
         bn = diag.get("bottleneck", "")
         rc = diag.get("root_cause", "")
         conf = diag.get("confidence", "")
-        sections.append(f"**Diagnosed bottleneck: {bn} ({rc}) [{conf} confidence]**\n")
+        # Defensive: older report JSON has no "evidence" key at all.
+        evidence = diag.get("evidence") or {}
+        level = evidence.get("level", "derived")
+        rule_id = evidence.get("rule_id", "")
+        measured = _format_evidence_metrics(evidence.get("metrics") or {})
+        assessment = f"{bn} [{level}: {rule_id}]" if rule_id else bn
+        measured_part = f" — measured: {measured}" if measured else ""
+        sections.append(
+            f"**Diagnosed bottleneck: {assessment}{measured_part}"
+            f" — likely cause (inferred): {rc} [{conf} confidence]**\n"
+        )
     else:
         sections.append("")
 
@@ -1068,7 +1082,14 @@ def _build_optimization_playbook(
     if ctx.bottleneck_diagnoses:
         actions = ctx.bottleneck_diagnoses[0].get("suggested_actions", [])
         if actions:
-            sections.append("### Priority actions (from bottleneck analysis)")
+            # suggested_actions is always inferred, whatever the diagnosis's
+            # evidence level -- say so, since a numbered list otherwise reads
+            # as instruction rather than suggestion.
+            sections.append("### Priority actions (inferred from bottleneck analysis)")
+            sections.append(
+                "Heuristic suggestions from a threshold rule, not measurements — "
+                "check them against the profiler data above before committing to one."
+            )
             for i, action in enumerate(actions, 1):
                 sections.append(f"{i}. {action}")
             sections.append("")
@@ -1161,6 +1182,21 @@ def _add_source_files(parts: list[str], ctx: PromptContext) -> None:
 
     for path, content in ctx.source_files.items():
         parts.append(f"### FILE: {path}\n```\n{content}\n```\n")
+
+
+def _add_forbidden_constructs(parts: list[str], ctx: PromptContext) -> None:
+    """Constructs this task forbids — stated up front, not discovered by rejection."""
+    if not ctx.forbidden_descriptions:
+        return
+    parts.append("## FORBIDDEN — patches using these are rejected before benchmarking\n")
+    for line in ctx.forbidden_descriptions:
+        parts.append(f"- {line}")
+    parts.append(
+        "\nThis task deliberately withholds the above. Do not introduce them in any "
+        "form, including indirectly (e.g. a pragma or attribute that changes the "
+        "compiler's optimization level set by the build command). Earn the speedup "
+        "by changing the algorithm, memory access pattern, or data layout instead.\n"
+    )
 
 
 def _add_data_hints(parts: list[str], ctx: PromptContext) -> None:
@@ -1682,17 +1718,49 @@ def _add_roofline_json(parts: list[str], ctx: PromptContext) -> None:
         parts.append("\n```\n")
 
 
+def _format_evidence_metrics(metrics: dict) -> str:
+    """Render an evidence ``metrics`` dict as ``key=value`` facts for the prompt table.
+
+    ``threshold`` (when present) is rendered as a trailing "(threshold N)" note
+    rather than another bare key=value pair, matching how the rules describe
+    "measured value vs. the threshold it was compared against".
+    """
+    if not metrics:
+        return ""
+    threshold = metrics.get("threshold")
+    rendered = ", ".join(f"{k}={v:g}" for k, v in metrics.items() if k != "threshold")
+    if threshold is not None:
+        suffix = f"(threshold {threshold:g})"
+        rendered = f"{rendered} {suffix}" if rendered else suffix
+    return rendered
+
+
 def _add_bottleneck_diagnosis(parts: list[str], ctx: PromptContext) -> str | None:
     """Bottleneck diagnosis table. Returns the primary bottleneck type (if any)."""
     primary_bottleneck: str | None = None
     if ctx.bottleneck_diagnoses:
         parts.append("## Bottleneck diagnosis\n")
-        parts.append("| Rank | Bottleneck | Root cause | Confidence | Suggested actions |")
-        parts.append("|---:|---|---|:---:|---|")
+        parts.append(
+            "Measured values are facts read from the profiler. \"Likely cause\" is a "
+            "heuristic inference from a threshold rule and may be wrong even when the "
+            "measurement is correct.\n"
+        )
+        parts.append("| Rank | Measured | Assessment | Likely cause (inferred) | Confidence | Suggested actions |")
+        parts.append("|---:|---|---|---|:---:|---|")
         for diag in ctx.bottleneck_diagnoses:
             actions = "; ".join(diag.get("suggested_actions", []))
+            # Defensive: older report JSON has no "evidence" key at all.
+            evidence = diag.get("evidence") or {}
+            level = evidence.get("level", "derived")
+            rule_id = evidence.get("rule_id", "")
+            measured = _format_evidence_metrics(evidence.get("metrics") or {})
+            bottleneck_text = diag.get("bottleneck", "")
+            # Every diagnosis is tagged with its evidence level; "inferred" ones
+            # get the same bracket, but the word itself is the visible warning
+            # that even the assessment (not just the root cause) is a guess.
+            assessment = f"{bottleneck_text} [{level}: {rule_id}]" if rule_id else bottleneck_text
             parts.append(
-                f"| {diag.get('rank', '?')} | {diag.get('bottleneck', '')} "
+                f"| {diag.get('rank', '?')} | {measured} | {assessment} "
                 f"| {diag.get('root_cause', '')} | {diag.get('confidence', '')} "
                 f"| {actions} |"
             )
@@ -1965,6 +2033,7 @@ def build_prompt(ctx: PromptContext) -> list[Message]:
 
     parts: list[str] = []
     _add_source_files(parts, ctx)
+    _add_forbidden_constructs(parts, ctx)
     _add_data_hints(parts, ctx)
     _add_profiler_summaries(parts, ctx)
     _add_profiler_context(parts, ctx)  # GPU-aware profiler annotation

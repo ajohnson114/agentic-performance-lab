@@ -12,6 +12,7 @@ from perflab.analyzers.compiler_diagnostics import CompilerDiagnostics, cross_re
 from perflab.analyzers.user_actions import extract_build_suggestions
 from perflab.memory.run_store import load_profiler_summaries
 from perflab.optimizers.event_log import AgentEventLog
+from perflab.optimizers.forbidden import describe as describe_forbidden
 from perflab.optimizers.patch import SearchReplaceBlock, read_source_files
 from perflab.optimizers.progress import (
     AgentProgress,
@@ -310,6 +311,7 @@ def _build_diagnostics_context(
                     "root_cause": d.root_cause,
                     "confidence": d.confidence,
                     "suggested_actions": d.suggested_actions,
+                    "evidence": d.evidence.to_dict(),
                 }
                 for d in diags
             ]
@@ -561,6 +563,10 @@ def build_iteration_prompt(ctx: AgentContext) -> tuple[list, list[dict] | None]:
         roofline=roofline_dict,
         history=ctx.history,
         allowed_paths=task.edit_policy.allowed_paths,
+        forbidden_descriptions=describe_forbidden(
+            task.anti_gaming.forbidden_constructs,
+            task.anti_gaming.forbidden_patterns,
+        ),
         n_candidates=ctx.config.n_candidates,
         target_hardware=task.target_hardware,
         program_type=task.program_type,

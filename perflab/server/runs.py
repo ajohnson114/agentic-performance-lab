@@ -82,7 +82,15 @@ def get_run_section(run_id: str, section: str, out_dir: str = "out") -> dict:
 
 @mcp.tool(annotations={"readOnlyHint": True})
 def compare_runs(run_a: str, run_b: str, out_dir: str = "out") -> dict:
-    """Compare two runs: values, delta, speedup, bottleneck diff."""
+    """Compare two runs: values, delta, speedup, bottleneck diff.
+
+    Also includes an ``environment`` block (verdict: comparable/advisory/
+    incomparable/unverified) gating whether the two runs were even measured
+    on the same hardware -- see perflab.tools.env_fingerprint. This tool does
+    not enforce the gate itself (there is no CLI-style ``--force`` here); a
+    caller comparing numbers across runs should check ``environment.verdict``
+    before trusting the delta/ratio.
+    """
     from perflab.memory.run_store import RunStore
     store = RunStore(Path(out_dir))
     return store.compare_runs(run_a, run_b)

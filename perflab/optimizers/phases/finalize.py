@@ -130,7 +130,15 @@ def generate_optimization_summary(
         Message(role="user", content=user_content),
     ]
     t0 = time.monotonic()
-    result = provider.complete(messages, temperature=0.3, max_tokens=512)
+    # Use the configured budget, not a hardcoded cap. On reasoning models
+    # (Opus 5 has thinking ON by default) max_tokens caps thinking AND response
+    # text together, so a tight cap is spent entirely on thinking and returns a
+    # few characters of prose -- observed 14- and 104-byte summaries truncated
+    # mid-word. This is an upper bound, not a target: the summary is short, so
+    # the extra headroom costs nothing when thinking is off.
+    result = provider.complete(
+        messages, temperature=0.3, max_tokens=ctx.llm_config.max_tokens,
+    )
     latency = time.monotonic() - t0
     text = result.content.strip() if result.content else None
     return text, result.usage, latency

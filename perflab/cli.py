@@ -5,6 +5,7 @@ import importlib.resources
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ import yaml
 from perflab.analyzers.bottleneck_analyzer import AnalysisThresholds
 from perflab.doctor import run_doctor
 from perflab.llm.config import DEFAULT_MODEL, PROVIDER_DEFAULT_MODELS
+from perflab.optimizers.forbidden import FORBIDDEN_CONSTRUCTS
 from perflab.orchestrator import optimize, profile_only
 from perflab.roofline_peaks import (
     cache_path,
@@ -87,8 +89,9 @@ def _demo_tasks_root() -> Path:
     """Resolve the bundled demo-tasks directory.
 
     Works both from an installed wheel (perflab/demo_tasks/ ships as package
-    data) and from an editable install (perflab/demo_tasks/ is the real
-    directory on disk; tasks/ at the repo root is just a symlink to it).
+    data) and from an editable install, where it is a plain directory in the
+    checkout. It is the single source of truth either way: user-authored tasks
+    live outside the package entirely, scaffolded by ``perflab tasks init``.
     """
     return Path(str(importlib.resources.files("perflab") / "demo_tasks"))
 
@@ -98,9 +101,16 @@ def _iter_bundled_tasks() -> list[tuple[str, Path]]:
     root = _demo_tasks_root()
     if not root.is_dir():
         return []
+    # Skip generated artifacts that live next to task sources in an editable
+    # install -- mirrors _COPY_IGNORE below. A run whose out_dir resolves
+    # inside demo_tasks/ writes run_dir/protected_snapshot/task.yaml (the
+    # tamper-detection snapshot), which otherwise gets listed as a real
+    # bundled task by `perflab tasks list`.
+    skip = {"out", "__pycache__"}
     pairs = [
         (str(p.parent.relative_to(root)), p)
         for p in root.rglob("task.yaml")
+        if not skip & set(p.relative_to(root).parts)
     ]
     return sorted(pairs, key=lambda pair: pair[0])
 
@@ -162,6 +172,59 @@ def tasks_copy_cmd(
 
     typer.echo(f"Copied {name} -> {target}/")
     typer.echo(f"\nNext: perflab agent {target}/task.yaml")
+
+
+#: task.yaml lines rewritten when scaffolding, so a new task is named after the
+#: directory it lands in rather than "sample_task". Matched line-wise on purpose:
+#: _sample/task.yaml is ~10KB of explanatory comments and a yaml round-trip
+#: would silently delete all of them.
+_SCAFFOLD_REWRITES = (
+    (re.compile(r'^name:\s*.*$', re.M), 'name: "{name}"'),
+    (re.compile(r'^workspace:\s*.*$', re.M), 'workspace: "{workspace}"'),
+)
+
+
+@tasks_app.command(name="init")
+def tasks_init_cmd(
+    dest: str = typer.Argument(..., help="Directory for the new task, e.g. ./my-kernel"),
+    name: str = typer.Option(None, "--name", help="Task name (default: the directory's name)"),
+):
+    """Create a new task in DEST from the bundled _sample template.
+
+    Copies the sample task's files directly into DEST so you own every file.
+    Nothing inside the installed perflab package is ever edited — the bundled
+    demo tasks are package data and live in site-packages on a pip install.
+    """
+    target = Path(dest)
+    if (target / "task.yaml").exists():
+        typer.echo(f"Error: {target / 'task.yaml'} already exists -- refusing to overwrite.")
+        raise typer.Exit(code=1)
+
+    src = _demo_tasks_root() / "_sample"
+    if not (src / "task.yaml").is_file():
+        typer.echo(f"Error: bundled _sample template not found at {src}")
+        raise typer.Exit(code=1)
+
+    task_name = name or target.resolve().name
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, target, ignore=_COPY_IGNORE, dirs_exist_ok=True)
+
+    task_yaml = target / "task.yaml"
+    text = task_yaml.read_text(encoding="utf-8")
+    for pattern, replacement in _SCAFFOLD_REWRITES:
+        text = pattern.sub(
+            replacement.format(name=task_name, workspace=target.as_posix()), text, count=1,
+        )
+    task_yaml.write_text(text, encoding="utf-8")
+
+    typer.echo(f"Created task {task_name!r} in {target}/\n")
+    for f in sorted(p.name for p in target.iterdir() if p.is_file()):
+        typer.echo(f"  {f}")
+    typer.echo(
+        "\nEdit sample.py (the code being optimized), tests.py (correctness), and\n"
+        "bench.py (must write the metric to --json). task.yaml documents every option.\n"
+        f"\nThen: perflab profile {task_yaml}"
+    )
 
 
 @app.command()
@@ -456,6 +519,14 @@ def ci_check(
         None, "--tolerance",
         help="Override the task's regression tolerance (fraction, e.g. 0.15 = 15%) — for noisy CI runners",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help=(
+            "Downgrade an environment mismatch (baseline recorded on different "
+            "hardware) from a hard failure to an advisory warning, and run the "
+            "check anyway."
+        ),
+    ),
 ):
     """Run a CI regression check against a saved baseline."""
     from perflab.ci import run_ci_check
@@ -469,20 +540,46 @@ def ci_check(
         typer.echo(f"Baseline saved to {saved}")
         raise typer.Exit(code=0)
 
-    result = run_ci_check(task, bp, tolerance=tolerance)
+    result = run_ci_check(task, bp, tolerance=tolerance, force=force)
     typer.echo(json.dumps(result.to_dict(), indent=2))
 
-    # Surface advisory warnings
+    # The environment gate is the *only* path that returns a baseline value
+    # without ever computing a regression_pct (see run_ci_check) -- it is a
+    # more precise signal than "verdict == incomparable" alone, because with
+    # --force the verdict stays "incomparable" even when the check ran to
+    # completion and failed (or passed) for an unrelated, regression reason.
+    env_blocked = result.baseline_value is not None and result.regression_pct is None
+
+    # Surface advisory warnings. When the environment gate blocked the check
+    # outright (no --force), its message is about to be printed as the
+    # failure reason below -- skip it here so it is not shown twice.
     if result.bench_variance_warnings:
         for w in result.bench_variance_warnings:
             typer.echo(f"  WARNING (bench variance): {w}")
     if result.profiler_regressions:
         for r in result.profiler_regressions:
             typer.echo(f"  WARNING (profiler): {r.metric} {r.direction} ({r.baseline:.1f} -> {r.current:.1f})")
+    if result.environment_warnings and not env_blocked:
+        for w in result.environment_warnings:
+            typer.echo(f"  WARNING (environment): {w}")
+    if result.verified is False:
+        typer.echo(
+            "  WARNING (unverified): the baseline has no per-repeat samples, so this "
+            "used the plain ratio test — the result is not known to be distinguishable "
+            "from run-to-run noise. Re-record with --save-baseline to enable the gate."
+        )
 
     if result.passed:
-        typer.echo("CI check PASSED")
+        typer.echo("CI check PASSED (unverified)" if result.verified is False else "CI check PASSED")
     else:
+        if env_blocked:
+            # The environment gate fired -- there is no regression verdict to
+            # report at all (it was never computed on unverified hardware),
+            # so don't print a regression detail that would misstate why
+            # this failed.
+            reason = result.environment_warnings[0] if result.environment_warnings else "environment mismatch"
+            typer.echo(f"CI check FAILED: {reason}")
+            raise typer.Exit(code=1)
         reasons = []
         if result.regression_pct is not None and result.baseline_value is not None:
             from perflab.ci import _check_regression
@@ -634,6 +731,297 @@ def replay(
     typer.echo(output)
 
 
+def _newest_run(runs_root: Path) -> Path:
+    """Return the newest run directory under *runs_root*.
+
+    Run IDs are ``YYYYMMDD-HHMMSS-<hex>``, so a lexicographic sort is already
+    chronological — no stat() needed, and no dependence on mtimes that copying
+    a run around would scramble.
+    """
+    if not runs_root.is_dir():
+        typer.echo(f"Error: no runs directory at {runs_root}")
+        raise typer.Exit(code=1)
+    runs = sorted(p for p in runs_root.iterdir() if p.is_dir())
+    if not runs:
+        typer.echo(f"Error: no runs found in {runs_root}")
+        raise typer.Exit(code=1)
+    return runs[-1]
+
+
+def _resolve_run_dir(target: str | None) -> Path:
+    """Resolve a ``perflab view`` target to a single run directory.
+
+    Accepts a run directory, a task.yaml (newest run for that task), a runs
+    root, or nothing at all (newest run under ./out/runs).
+    """
+    if target is None:
+        return _newest_run(Path("out") / "runs")
+
+    path = Path(target)
+    if path.suffix in (".yaml", ".yml"):
+        return _newest_run(_load_task(target).out_dir / "runs")
+    if not path.exists():
+        typer.echo(f"Error: not found: {path}")
+        raise typer.Exit(code=1)
+    # A run directory always carries meta.json; dashboard.html only appears
+    # once reporting has run, so meta.json is the reliable marker.
+    if (path / "meta.json").is_file():
+        return path
+    if (path / "runs").is_dir():
+        return _newest_run(path / "runs")
+    if path.name == "runs":
+        return _newest_run(path)
+    typer.echo(f"Error: {path} is not a run directory, a runs root, or a task.yaml")
+    raise typer.Exit(code=1)
+
+
+@app.command()
+def view(
+    target: str = typer.Argument(
+        None, help="Run directory, task.yaml, or nothing for the newest run under ./out/runs"
+    ),
+    port: int = typer.Option(0, "--port", help="Port to bind (default: any free port)"),
+    reveal: bool = typer.Option(
+        False, "--reveal", help="Show the profile in your file manager, ready to drag"
+    ),
+    no_open: bool = typer.Option(False, "--no-open", help="Print URLs without opening a browser"),
+):
+    """Serve a run over loopback and open its dashboard and profiles.
+
+    Run directories are timestamped hashes several levels down, so the hard part
+    of looking at a profile is finding it. This serves the whole run and prints
+    every URL.
+
+    For the flame graph, open speedscope.app and use its Browse button to pick
+    the profile this prints. That is the only route that always works: the
+    click is a user gesture, so the browser gets a read grant for that one
+    file. The alternatives both fail here -- current Chrome refuses to let
+    speedscope.app fetch from loopback (Local Network Access, a user
+    permission no server header can grant), and dragging out of a sandboxed or
+    Gatekeeper-translocated editor is refused before the drop lands.
+    """
+    import webbrowser
+
+    from perflab.reporting import view_server
+
+    run_dir = _resolve_run_dir(target).resolve()
+    profiles = view_server.find_profiles(run_dir)
+    has_dashboard = (run_dir / "dashboard.html").is_file()
+    if not profiles and not has_dashboard:
+        typer.echo(f"Error: {run_dir} has no profile and no dashboard to serve.")
+        raise typer.Exit(code=1)
+
+    server = view_server.make_server(run_dir, port=port)
+    root = view_server.base_url(server)
+    dash_url = f"{root}/dashboard.html" if has_dashboard else None
+
+    typer.echo(f"Serving {run_dir}\n  at {root}  (loopback only -- Ctrl-C to stop)\n")
+    if dash_url:
+        typer.echo(f"  Dashboard    {dash_url}")
+    for prof in profiles:
+        typer.echo(f"  Profile      {prof.label}: {root}/{prof.rel}")
+
+    if profiles:
+        # Browse (a file <input>) is the route that survives everything: the
+        # click is a user gesture, so the browser gets a read grant for exactly
+        # that file. Dragging depends on the source app being allowed to hand
+        # over the path, and fetching loopback needs a permission Chrome will
+        # not give a public origin.
+        typer.echo(
+            "\nFor a flame graph: open https://www.speedscope.app, click Browse, and pick\n"
+            f"  {profiles[0].path}\n"
+            "(Browse works where dragging and #profileURL= do not -- see `perflab view --help`.)"
+        )
+        if sys.platform == "darwin":
+            typer.echo("In the file dialog, press Cmd+Shift+G and paste that path.")
+        if reveal and view_server.reveal_in_file_manager(profiles[0].path):
+            typer.echo(f"Revealed {profiles[0].path.name} in your file manager.")
+
+    # The dashboard is the only thing worth auto-opening: the profile URLs are
+    # for a viewer to fetch, not for a human to stare at as raw JSON.
+    if not no_open and dash_url:
+        typer.echo("\nOpening the dashboard...")
+        webbrowser.open(dash_url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        typer.echo("\nStopped.")
+    finally:
+        server.server_close()
+
+
+def _resolve_run_dir_or_id(target: str | None, out_dir: str) -> Path:
+    """Resolve an export target, which may additionally be a bare run ID.
+
+    ``perflab list-runs`` prints run IDs, so pasting one straight back in is
+    the obvious next move even though it names nothing in the current
+    directory. A bare ID is looked up under *out_dir*; everything else (a run
+    directory, a task.yaml, or nothing at all) defers to _resolve_run_dir.
+    """
+    from perflab.memory.run_store import validate_run_id
+
+    runs_root = Path(out_dir) / "runs"
+    if target is None:
+        return _newest_run(runs_root)
+
+    path = Path(target)
+    if not path.exists() and path.suffix not in (".yaml", ".yml"):
+        try:
+            candidate = runs_root / validate_run_id(target)
+        except ValueError:
+            candidate = None
+        if candidate is not None and (candidate / "meta.json").is_file():
+            return candidate
+    return _resolve_run_dir(target)
+
+
+@app.command()
+def export(
+    target: str = typer.Argument(
+        None,
+        help="Run ID, run directory, or task.yaml. Defaults to the newest run.",
+    ),
+    dest: str = typer.Option(
+        None, "--dest", "-o", help="Archive path (default: ./<run_id>.tgz)"
+    ),
+    slim: bool = typer.Option(
+        False,
+        "--slim",
+        help="Drop raw profiler captures that need their original tool and host to open",
+    ),
+    out_dir: str = typer.Option("out", "--out-dir", help="Output root directory"),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing archive"),
+):
+    """Bundle a run into a .tgz for copying off a remote machine.
+
+    Runs happen wherever the accelerator is -- usually a rented GPU box -- and
+    get read somewhere else, so this exists to make that one command instead of
+    a hand-written tar exclude list.
+
+    --slim keeps what a different machine can actually open. Dropped: Nsight
+    reports (.ncu-rep/.nsys-rep/.sqlite), perf captures (which need perf plus
+    the original binaries and kernel symbols), Instruments .trace bundles, and
+    xplane .pb traces. Kept: the self-contained dashboard.html, every parsed
+    <profiler>_summary.json, the speedscope profile, the torch and perfetto
+    Chrome traces, the memray flame graph, the HLO dump, and the source
+    snapshots.
+    """
+    from perflab.memory.run_export import export_run, human_bytes
+
+    run_dir = _resolve_run_dir_or_id(target, out_dir)
+    archive = Path(dest) if dest else Path(f"{run_dir.name}.tgz")
+    if archive.exists() and not force:
+        typer.echo(f"Error: {archive} already exists -- pass --force to overwrite.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Exporting {run_dir}{' (slim)' if slim else ''} ...")
+    try:
+        result = export_run(run_dir, archive, slim=slim)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"Wrote {result.path}  ({result.file_count} files, "
+        f"{human_bytes(result.source_bytes)} -> {human_bytes(result.archive_bytes)})"
+    )
+    if result.skipped_count:
+        typer.echo(
+            f"Slim dropped {result.skipped_count} raw capture(s), "
+            f"{human_bytes(result.skipped_bytes)}."
+        )
+    typer.echo(f"\nCopy it:  scp <host>:{result.path} .")
+    typer.echo(f"Then:     tar xzf {result.path.name} && perflab view {run_dir.name}")
+
+
+def _colorize_diff(text: str) -> str:
+    """ANSI-colour a unified diff, but only when a human is watching."""
+    if not sys.stdout.isatty():
+        return text
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith(("+++", "---")):
+            out.append(typer.style(line, bold=True))
+        elif line.startswith("@@"):
+            out.append(typer.style(line, fg=typer.colors.CYAN))
+        elif line.startswith("+"):
+            out.append(typer.style(line, fg=typer.colors.GREEN))
+        elif line.startswith("-"):
+            out.append(typer.style(line, fg=typer.colors.RED))
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+@app.command(name="diff")
+def diff_cmd(
+    target: str = typer.Argument(
+        None,
+        help="Run ID, run directory, or task.yaml. Defaults to the newest run.",
+    ),
+    from_label: str = typer.Option(
+        None, "--from", help="Snapshot to diff from (default: baseline)"
+    ),
+    to_label: str = typer.Option(
+        None, "--to", help="Snapshot to diff to (default: last accepted iteration)"
+    ),
+    show_labels: bool = typer.Option(
+        False, "--list", help="List the run's snapshots and exit"
+    ),
+    out_dir: str = typer.Option("out", "--out-dir", help="Output root directory"),
+):
+    """Show the before/after source diff for a run.
+
+    Defaults to baseline vs. the last accepted iteration -- accepts only happen
+    on an improvement, so that is the winning code. Use --from/--to to step
+    through individual accepted iterations instead (see --list).
+
+    This is the untruncated version of the dashboard's "What changed" section,
+    which caps each edit at 500 characters.
+    """
+    from perflab.memory.run_diff import diff_snapshots, list_labels, resolve_labels
+
+    run_dir = _resolve_run_dir_or_id(target, out_dir)
+    labels = list_labels(run_dir)
+
+    if show_labels:
+        if not labels:
+            typer.echo(f"No snapshots in {run_dir / 'snapshots'}")
+            raise typer.Exit(code=1)
+        typer.echo(f"Snapshots in {run_dir.name}:")
+        for label in labels:
+            typer.echo(f"  {label}")
+        return
+
+    try:
+        resolved_from, resolved_to = resolve_labels(run_dir, from_label, to_label)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if resolved_to is None:
+        # A run that accepted nothing snapshots only the baseline. That is a
+        # legitimate result -- no candidate beat the incumbent -- not a failure.
+        typer.echo(
+            f"{run_dir.name} has only a {resolved_from!r} snapshot: "
+            "no iteration was accepted, so the code is unchanged."
+        )
+        return
+
+    result = diff_snapshots(run_dir, resolved_from, resolved_to)
+    typer.echo(f"{run_dir.name}: {resolved_from} -> {resolved_to}\n")
+    if not result.files_changed:
+        typer.echo("No source differences between these snapshots.")
+        return
+
+    typer.echo(_colorize_diff(result.text), nl=False)
+    typer.echo(
+        f"\n{result.files_changed} file(s) changed, "
+        f"{result.insertions} insertion(s), {result.deletions} deletion(s)"
+    )
+
+
 @app.command(name="list-runs")
 def list_runs_cmd(
     task: str = typer.Option(None, "--task", help="Filter by task name"),
@@ -663,9 +1051,21 @@ def compare(
     run_a: str = typer.Argument(..., help="First run ID"),
     run_b: str = typer.Argument(..., help="Second run ID"),
     out_dir: str = typer.Option("out", "--out-dir", help="Output root directory"),
+    force: bool = typer.Option(
+        False, "--force",
+        help=(
+            "Show an incomparable (different-hardware) comparison anyway, as "
+            "exploratory. Changes what is displayed, never the recorded verdict."
+        ),
+    ),
 ):
     """Compare two optimization runs side by side."""
     from perflab.memory.run_store import RunStore
+    from perflab.tools.env_fingerprint import (
+        FingerprintComparison,
+        blocking_differences,
+        format_comparison,
+    )
 
     store = RunStore(Path(out_dir))
     try:
@@ -673,6 +1073,41 @@ def compare(
     except FileNotFoundError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
+
+    env_cmp = FingerprintComparison.from_dict(result.get("environment") or {})
+
+    if env_cmp.verdict == "incomparable":
+        blocking = blocking_differences(env_cmp.differing)
+        if not force:
+            typer.echo("Environment mismatch:")
+            for f, a, b in blocking:
+                typer.echo(f"  {f}: {a} != {b}")
+            typer.echo(
+                f"Refusing to compare: {len(blocking)} hardware field(s) differ. "
+                f"Re-run with --force for an exploratory comparison."
+            )
+            raise typer.Exit(code=1)
+        typer.echo("EXPLORATORY COMPARISON — NOT VALID")
+        typer.echo("Environment mismatch:")
+        for f, a, b in blocking:
+            typer.echo(f"  {f}: {a} != {b}")
+        typer.echo("")
+    elif env_cmp.verdict == "advisory":
+        typer.echo("WARNING: environment differs (same hardware, different toolchain):")
+        for line in format_comparison(env_cmp):
+            typer.echo(f"  {line}")
+        typer.echo("")
+    elif env_cmp.verdict == "unverified":
+        missing = [
+            label for label, rid in (("run A", run_a), ("run B", run_b))
+            if not (store.runs_root / rid / "system_info.json").exists()
+        ]
+        which = " and ".join(missing) if missing else "one or both runs"
+        typer.echo(
+            f"NOTE: environment could not be verified for {which} "
+            f"— this comparison is not known to be valid."
+        )
+        typer.echo("")
 
     # Header: task and metric context
     if result.get("task_name"):
@@ -998,6 +1433,11 @@ def show_task_schema():
             ("anti_gaming.gaming_speedup_threshold", "float", "Warn if one iteration's speedup exceeds this (default: 10.0)"),
             ("anti_gaming.thread_count_check", "bool", "Check bench.json thread_delta field (default: false)"),
             ("anti_gaming.max_thread_delta", "int", "Allowed new threads during kernel execution (default: 0)"),
+            ("anti_gaming.forbidden_constructs", "list[str]",
+             "Constructs a candidate may not introduce; patches using them are rejected "
+             f"before benchmarking. One or more of: {', '.join(sorted(FORBIDDEN_CONSTRUCTS))}"),
+            ("anti_gaming.forbidden_patterns", "list[str]",
+             "Custom regexes treated the same way as forbidden_constructs"),
         ]),
         ("ROOFLINE", [
             ("roofline.peak_tflops", "float", "Hardware peak TFLOPS (e.g., 989.0 for H100 TF32)"),

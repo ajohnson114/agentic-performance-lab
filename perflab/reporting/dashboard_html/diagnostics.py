@@ -2,7 +2,23 @@
 from __future__ import annotations
 
 from .data import GlanceData
-from .widgets import _render_bar_chart
+from .widgets import _render_bar_chart, _render_markdown
+
+
+def _format_evidence_metrics(metrics: dict) -> str:
+    """Render an evidence ``metrics`` dict as ``key=value`` facts for the Measured column.
+
+    ``threshold`` (when present) is rendered as a trailing "(threshold N)" note
+    rather than another bare key=value pair.
+    """
+    if not metrics:
+        return ""
+    threshold = metrics.get("threshold")
+    rendered = ", ".join(f"{k}={v:g}" for k, v in metrics.items() if k != "threshold")
+    if threshold is not None:
+        suffix = f"(threshold {threshold:g})"
+        rendered = f"{rendered} {suffix}" if rendered else suffix
+    return rendered
 
 
 def _render_user_actions(parts: list[str], esc, user_actions: list[dict]) -> None:
@@ -56,18 +72,32 @@ def _render_diagnostics(
     # (a) Bottleneck diagnosis
     if bottleneck_diagnoses:
         parts.append('<details><summary>Bottleneck diagnosis</summary>')
+        parts.append(
+            '<p style="color:#999;font-size:0.85em;">Measured is a fact read from the '
+            'profiler. Root Cause is a heuristic inference and may be wrong even when the '
+            'measurement is correct &mdash; diagnoses badged '
+            '<span class="badge no">inferred</span> are a guess at the assessment level too.</p>'
+        )
         parts.append('<table class="iter-table">')
-        parts.append('<tr><th>Rank</th><th>Bottleneck</th><th>Root Cause</th>'
+        parts.append('<tr><th>Rank</th><th>Measured</th><th>Bottleneck</th><th>Root Cause</th>'
                      '<th>Confidence</th><th>Suggested Actions</th></tr>')
         for d in bottleneck_diagnoses:
             conf = d.get("confidence", "")
             badge_cls = conf if conf in ("high", "medium", "low") else ""
             actions = d.get("suggested_actions", [])
             actions_str = "; ".join(actions) if isinstance(actions, list) else str(actions)
+            # Defensive: older report JSON has no "evidence" key at all.
+            evidence = d.get("evidence") or {}
+            level = evidence.get("level", "derived")
+            rule_id = evidence.get("rule_id", "")
+            measured = _format_evidence_metrics(evidence.get("metrics") or {})
+            ev_badge_cls = "no" if level == "inferred" else ""
+            ev_badge = f'<span class="badge {ev_badge_cls}">{esc(level)}</span>' if rule_id else ""
             parts.append(
                 f'<tr>'
                 f'<td>{esc(str(d.get("rank", "")))}</td>'
-                f'<td>{esc(str(d.get("bottleneck", "")))}</td>'
+                f'<td><code>{esc(measured)}</code></td>'
+                f'<td>{esc(str(d.get("bottleneck", "")))} {ev_badge}</td>'
                 f'<td>{esc(str(d.get("root_cause", "")))}</td>'
                 f'<td><span class="badge {badge_cls}">{esc(conf)}</span></td>'
                 f'<td>{esc(actions_str)}</td>'
@@ -507,7 +537,7 @@ def _render_outcome_analysis(
     # --- LLM-generated explanation ---
     if optimization_summary:
         parts.append('<details open><summary style="font-weight:700">Why it worked</summary>')
-        parts.append(f'<p class="explanation">{esc(optimization_summary)}</p>')
+        _render_markdown(parts, optimization_summary, esc)
         parts.append('</details>')
 
     parts.append('</div>')

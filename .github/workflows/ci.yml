@@ -101,13 +101,13 @@ jobs:
           pip install -e ".[tasks-python]"
 
       - name: Save baseline (correctness + benchmark + contract)
-        run: perflab ci-check tasks/matmul/python/task.yaml --save-baseline
+        run: perflab ci-check perflab/demo_tasks/matmul/python/task.yaml --save-baseline
 
       # --tolerance 0.5: this job exercises the pipeline end-to-end; it is not
       # a perf gate. Pure-Python timing on shared runners can drift well past
       # the task's locally-tuned 2% tolerance between back-to-back runs.
       - name: Regression check against fresh baseline
-        run: perflab ci-check tasks/matmul/python/task.yaml --tolerance 0.5
+        run: perflab ci-check perflab/demo_tasks/matmul/python/task.yaml --tolerance 0.5
 
   # Confirms the wheel actually ships the bundled demo tasks as package data
   # and that `perflab tasks` works against a real install with no repo

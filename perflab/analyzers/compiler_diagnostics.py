@@ -112,7 +112,12 @@ def get_diagnostic_build_flags(program_type: str, compiler: str = "gcc") -> list
     if program_type == "cpp":
         if compiler in ("clang", "clang++"):
             return ["-Rpass=.*", "-Rpass-missed=.*", "-Rpass-analysis=.*", "-gline-tables-only"]
-        return ["-fopt-info-all-optall", "-gline-tables-only"]  # GCC default
+        # -gline-tables-only is Clang-only; GCC errors out with "unrecognized
+        # debug output level" and fails the build. -g1 is GCC's equivalent
+        # (line tables, no full debug info). This only surfaced on real GCC --
+        # on macOS `g++` is Apple Clang, which detect_compiler resolves to
+        # "clang" via --version, so the Clang branch was masking it.
+        return ["-fopt-info-all-optall", "-g1"]  # GCC default
     if program_type == "cuda":
         return ["--ptxas-options=-v", "--generate-line-info"]
     return []
@@ -133,7 +138,8 @@ def get_diagnostic_env_vars(program_type: str, compiler: str = "gcc") -> dict[st
     if program_type == "cpp":
         if compiler in ("clang", "clang++"):
             return {"PERFLAB_CXXFLAGS": "-Rpass=.* -Rpass-missed=.* -Rpass-analysis=.* -gline-tables-only"}
-        return {"PERFLAB_CXXFLAGS": "-fopt-info-all-optall -gline-tables-only"}
+        # -g1, not -gline-tables-only: see get_diagnostic_build_flags.
+        return {"PERFLAB_CXXFLAGS": "-fopt-info-all-optall -g1"}
     if program_type == "cuda":
         return {"PERFLAB_NVCCFLAGS": "--ptxas-options=-v"}
     return {}

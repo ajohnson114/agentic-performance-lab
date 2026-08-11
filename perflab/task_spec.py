@@ -167,6 +167,18 @@ class AntiGamingSpec:
     # Thread monitoring (via bench.json protocol)
     thread_count_check: bool = False        # Check bench.json thread_delta field (opt-in)
     max_thread_delta: int = 0               # Allowed new threads during kernel execution
+    # Constructs a candidate may not INTRODUCE. Named presets come from
+    # perflab.optimizers.forbidden.FORBIDDEN_CONSTRUCTS (e.g. "openmp",
+    # "optimization_pragmas", "blas"); forbidden_patterns is a custom-regex
+    # escape hatch. Empty by default -- nothing is forbidden unless a task says so.
+    forbidden_constructs: list[str] = field(default_factory=list)
+    forbidden_patterns: list[str] = field(default_factory=list)
+
+    def validate(self) -> list[str]:
+        """Return config errors (empty = valid)."""
+        from perflab.optimizers.forbidden import validate_spec
+
+        return validate_spec(self.forbidden_constructs, self.forbidden_patterns)
 
 
 @dataclass
@@ -371,7 +383,19 @@ class TaskSpec:
             )),
             thread_count_check=bool(ag_data.get("thread_count_check", False)),
             max_thread_delta=int(ag_data.get("max_thread_delta", 0)),
+            forbidden_constructs=[
+                str(x) for x in (ag_data.get("forbidden_constructs") or [])
+            ],
+            forbidden_patterns=[
+                str(x) for x in (ag_data.get("forbidden_patterns") or [])
+            ],
         )
+        # Fail fast on a typo'd construct name or a bad regex: a silently
+        # dropped rule would look like the policy is enforced when it isn't.
+        if ag_errors := anti_gaming.validate():
+            raise ValueError(
+                f"Invalid anti_gaming in {path}: {'; '.join(ag_errors)}"
+            )
 
         agent_data = data.get("agent", {}) or {}
         agent = AgentSpec(

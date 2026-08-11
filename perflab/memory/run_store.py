@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from perflab.optimizers.patch import read_source_files
+from perflab.tools.env_fingerprint import compare_fingerprints, fingerprint_from_sysinfo
 
 if TYPE_CHECKING:
     from perflab.task_spec import TaskSpec
@@ -100,6 +101,25 @@ def load_profiler_summaries(artifacts_dir: Path) -> dict[str, dict]:
 
     _profiler_summary_cache[cache_key] = (current_mtimes, summaries)
     return summaries
+
+def _load_env_fingerprint(run_dir: Path) -> dict | None:
+    """Load system_info.json from a run dir and project it to an environment
+    fingerprint (see perflab.tools.env_fingerprint).
+
+    Best-effort like the rest of this module: a missing or corrupt file
+    yields no fingerprint, never an exception -- an old run, or one where
+    capture failed, just compares as unverified rather than blowing up.
+    """
+    path = run_dir / "system_info.json"
+    if not path.exists():
+        return None
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Failed to load system_info.json from %s", run_dir, exc_info=True)
+        return None
+    return fingerprint_from_sysinfo(info)
+
 
 class RunStore:
     def __init__(self, out_root: Path):
@@ -264,6 +284,14 @@ class RunStore:
         status_a = _field(run_a, "status")
         status_b = _field(run_b, "status")
 
+        # Environment compatibility: are these two runs even the same
+        # hardware? A missing/corrupt system_info.json on either side just
+        # yields no fingerprint -- compare_fingerprints reports that as
+        # "unverified" rather than assuming compatible.
+        fp_a = _load_env_fingerprint(Path(run_a["run_dir"]))
+        fp_b = _load_env_fingerprint(Path(run_b["run_dir"]))
+        env_cmp = compare_fingerprints(fp_a, fp_b)
+
         return {
             "run_a": run_id_a,
             "run_b": run_id_b,
@@ -278,6 +306,7 @@ class RunStore:
             "ratio": ratio,
             "resolved_bottlenecks": sorted(bn_a - bn_b),
             "new_bottlenecks": sorted(bn_b - bn_a),
+            "environment": env_cmp.to_dict(),
         }
 
     def update_meta(self, run_id: str, updates: dict) -> None:

@@ -16,6 +16,22 @@ def _cell(value: object) -> str:
     """
     return str(value).replace("|", "\\|").replace("\n", " ")
 
+
+def _format_diag_metrics(metrics: dict) -> str:
+    """Render an evidence ``metrics`` dict as ``key=value`` facts for the report table.
+
+    ``threshold`` (when present) is rendered as a trailing "(threshold N)" note
+    rather than another bare key=value pair.
+    """
+    if not metrics:
+        return ""
+    threshold = metrics.get("threshold")
+    rendered = ", ".join(f"{k}={v:g}" for k, v in metrics.items() if k != "threshold")
+    if threshold is not None:
+        suffix = f"(threshold {threshold:g})"
+        rendered = f"{rendered} {suffix}" if rendered else suffix
+    return rendered
+
 def _render(data: dict) -> str:
     lines = []
     lines.append(f"# PerfLab Report — {data.get('task_name','')}")
@@ -63,10 +79,23 @@ def _render(data: dict) -> str:
     if diags:
         lines.append("## Bottleneck diagnosis")
         lines.append("")
-        lines.append("| Rank | Bottleneck | Root cause | Confidence |")
-        lines.append("|---:|---|---|:---:|")
+        lines.append(
+            "Measured values are facts read from the profiler. Root cause is a heuristic "
+            "inference and may be wrong even when the measurement is correct; diagnoses "
+            "marked `[inferred: ...]` are a guess at the assessment level too."
+        )
+        lines.append("")
+        lines.append("| Rank | Measured | Bottleneck | Root cause | Confidence |")
+        lines.append("|---:|---|---|---|:---:|")
         for d in diags:
-            lines.append(f"| {d.get('rank', '?')} | {_cell(d.get('bottleneck', ''))} | {_cell(d.get('root_cause', ''))} | {_cell(d.get('confidence', ''))} |")
+            # Defensive: older report JSON has no "evidence" key at all.
+            evidence = d.get("evidence") or {}
+            level = evidence.get("level", "derived")
+            rule_id = evidence.get("rule_id", "")
+            measured = _format_diag_metrics(evidence.get("metrics") or {})
+            bottleneck_text = d.get("bottleneck", "")
+            assessment = f"{bottleneck_text} [{level}: {rule_id}]" if rule_id else bottleneck_text
+            lines.append(f"| {d.get('rank', '?')} | {_cell(measured)} | {_cell(assessment)} | {_cell(d.get('root_cause', ''))} | {_cell(d.get('confidence', ''))} |")
         lines.append("")
 
     # Iterations table with before/after columns

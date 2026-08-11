@@ -5,7 +5,15 @@ program_type: "cpp"
 target_hardware: null
 
 build:
-  cmd: "g++ -O2 -o matmul_bin matmul.cpp"
+  # -O3, not -O2. At -O2 the agent's only route to vectorization was to write
+  # `#pragma GCC optimize("O3","unroll-loops")` into matmul.cpp -- a legal edit
+  # to an allowed file that silently overrides this pinned build line. Measured:
+  # the algorithmic rewrite was worth 9.7x on its own, and the pragma added
+  # another 4.0x on top, so the headline speedup was mostly compiler-flag
+  # escalation. -O3 costs nothing in baseline inflation (the naive ijk kernel
+  # measures 0.00176 at -O2 vs 0.00178 at -O3 -- it is bound on the strided B
+  # access, which no flag fixes) and removes the incentive entirely.
+  cmd: "g++ -O3 -o matmul_bin matmul.cpp"
   expected_exit: 0
 
 correctness:
@@ -27,6 +35,19 @@ constraints:
   max_iters: 12
   regression_tolerance: 0.02
   rlimit_as_gb: 4
+
+anti_gaming:
+  # This is a single-threaded, from-scratch cache-blocking exercise. Each entry
+  # closes a route that would produce a large speedup without doing the work:
+  #   optimization_pragmas - overrides the pinned -O level in build.cmd above
+  #   openmp / threading   - the task measures single-core efficiency
+  #   blas                 - calling a tuned GEMM is not writing one
+  # SIMD intrinsics are deliberately ALLOWED: hand-vectorizing is real work.
+  forbidden_constructs:
+    - optimization_pragmas
+    - openmp
+    - threading
+    - blas
 
 analysis_thresholds:
   perf_ipc_low: 1.5              # tight matmul loop should have high IPC

@@ -43,11 +43,12 @@ def stream_triad(A: np.ndarray, B: np.ndarray, C: np.ndarray, scalar: float) -> 
             A[i, j] = B[i, j] + scalar * C[i, j]
 
 
-def run_stream():
-    """Run all stream operations and return total bytes processed."""
-    A = np.zeros((N, N), dtype=np.float64)
-    B = np.random.randn(N, N).astype(np.float64)
-    C = np.random.randn(N, N).astype(np.float64)
+def run_stream(A: np.ndarray, B: np.ndarray, C: np.ndarray) -> int:
+    """Run all stream operations on caller-provided buffers.
+
+    Buffers are allocated and reset by bench.py so allocation and RNG stay out
+    of the timed region -- see bench.py's module docstring for why.
+    """
     scalar = 3.0
 
     stream_copy(B, A)
@@ -57,11 +58,13 @@ def run_stream():
 
     # Total bytes: copy(2N^2) + scale(2N^2) + add(3N^2) + triad(3N^2) = 10*N^2 elements
     # Each element is 8 bytes (float64)
-    total_bytes = 10 * N * N * 8
-    return total_bytes, A
+    return 10 * N * N * 8
 
 
 if __name__ == "__main__":
-    total_bytes, result = run_stream()
+    A = np.zeros((N, N), dtype=np.float64)
+    B = np.random.randn(N, N).astype(np.float64)
+    C = np.random.randn(N, N).astype(np.float64)
+    total_bytes = run_stream(A, B, C)
     print(f"Processed {total_bytes / 1e9:.2f} GB")
-    print(f"Checksum: {result.sum():.6f}")
+    print(f"Checksum: {A.sum():.6f}")

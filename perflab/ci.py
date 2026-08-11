@@ -23,6 +23,12 @@ from perflab.runners.benchmark import (
 )
 from perflab.runners.correctness import run_correctness
 from perflab.task_spec import TaskSpec
+from perflab.tools.env_fingerprint import (
+    blocking_differences,
+    compare_fingerprints,
+    fingerprint_from_sysinfo,
+    format_comparison,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,16 @@ class CICheckResult:
     secondary: MetricCheckResult | None = None
     profiler_regressions: list[ProfilerRegression] = field(default_factory=list)
     bench_variance_warnings: list[str] = field(default_factory=list)
+    # Environment compatibility vs. the baseline (see perflab.tools.env_fingerprint).
+    # None when there is no baseline to compare against yet (first run / --save-baseline).
+    environment: dict | None = None
+    environment_warnings: list[str] = field(default_factory=list)
+    # Did the noise gate actually run? False means the comparison fell back to
+    # the bare ratio test -- an old baseline with no per-repeat samples, or a
+    # harness that reports only an aggregate -- so a "pass" here is not known to
+    # be distinguishable from run-to-run spread. None when no comparison
+    # happened at all (no baseline yet, or the environment gate blocked first).
+    verified: bool | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -89,6 +105,12 @@ class CICheckResult:
             ]
         if self.bench_variance_warnings:
             d["bench_variance_warnings"] = self.bench_variance_warnings
+        if self.environment is not None:
+            d["environment"] = self.environment
+        if self.environment_warnings:
+            d["environment_warnings"] = self.environment_warnings
+        if self.verified is not None:
+            d["verified"] = self.verified
         return d
 
 
@@ -307,6 +329,18 @@ def save_baseline(
     if variance_warnings:
         data["bench_variance_warnings"] = variance_warnings
 
+    # Environment fingerprint, so a later ci-check can catch a baseline
+    # recorded on different hardware. Best-effort, mirroring how `samples`
+    # was added above: a probe failure must not stop a baseline from being
+    # saved -- it just means a future comparison reports unverified instead
+    # of blocking, exactly like a baseline saved by a version that predates
+    # this field.
+    try:
+        from perflab.tools.sysinfo import collect_system_info
+        data["environment"] = fingerprint_from_sysinfo(collect_system_info())
+    except Exception:  # noqa: BLE001 -- best-effort hardware probe, must not abort baseline save
+        logger.warning("Failed to capture environment fingerprint for baseline", exc_info=True)
+
     bp.parent.mkdir(parents=True, exist_ok=True)
     bp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return bp
@@ -317,16 +351,19 @@ def run_ci_check(
     baseline_path: Path | None = None,
     ncu_summary: dict | None = None,
     tolerance: float | None = None,
+    force: bool = False,
 ) -> CICheckResult:
     """Run benchmark and compare against baseline for regression.
 
     Checks primary metric, secondary metric (if configured), bench.json
-    variance (anti-gaming), and NCU profiler regressions (when profiler
+    variance (anti-gaming), an environment fingerprint gate (is the baseline
+    even from this hardware?), and NCU profiler regressions (when profiler
     data is available in both baseline and current run).
 
-    The check fails if *either* metric regresses beyond the tolerance.
-    Profiler regressions and variance warnings are reported but do not
-    cause failure — they are advisory signals.
+    The check fails if *either* metric regresses beyond the tolerance, or if
+    the environment gate finds the baseline was recorded on different
+    hardware (see below). Profiler regressions and bench-variance warnings
+    are reported but do not cause failure — they are advisory signals.
 
     If ncu_summary is provided, it is compared against the baseline's
     NCU data. If not provided, attempts to find NCU data from the most
@@ -335,6 +372,16 @@ def run_ci_check(
     tolerance (a fraction, e.g. 0.15 = 15%) overrides the task's
     regression_tolerance — for noisy environments like shared CI runners
     where the task's locally-tuned tolerance would flake.
+
+    The environment gate compares the baseline's recorded fingerprint (see
+    perflab.tools.env_fingerprint) against this host's. A mismatch on a
+    BLOCKING_FIELDS entry (different GPU/CPU/OS) fails the check outright —
+    a regression number from different hardware is not a regression number,
+    it is noise dressed up as one. `force` downgrades that to an advisory
+    warning and runs the check anyway, matching `perflab compare --force`.
+    It has no effect on ADVISORY_FIELDS mismatches (already advisory) or on
+    an unverified baseline (already advisory, never blocking — a baseline
+    saved before this field existed must keep working).
     """
     bp = baseline_path or _default_baseline_path(task)
     tol = tolerance if tolerance is not None else task.constraints.regression_tolerance
@@ -362,6 +409,51 @@ def run_ci_check(
 
     baseline_data = json.loads(bp.read_text(encoding="utf-8"))
     baseline_value = baseline_data["value"]
+
+    # Environment gate: is this baseline even from comparable hardware?
+    # Best-effort like the capture side -- a probe failure here must not
+    # crash CI, it just degrades to "unverified" exactly like a baseline
+    # that predates environment capture (the module's existing precedent
+    # for "the check couldn't run": report it, never silently pass).
+    try:
+        from perflab.tools.sysinfo import collect_system_info
+        current_env = fingerprint_from_sysinfo(collect_system_info())
+    except Exception:  # noqa: BLE001 -- best-effort hardware probe, must not abort ci-check
+        logger.warning("Failed to capture environment fingerprint for ci-check", exc_info=True)
+        current_env = None
+    env_cmp = compare_fingerprints(baseline_data.get("environment"), current_env)
+
+    if env_cmp.verdict == "incomparable" and not force:
+        fields = ", ".join(f for f, _, _ in blocking_differences(env_cmp.differing))
+        return CICheckResult(
+            passed=False,
+            current_value=current_value,
+            baseline_value=baseline_value,
+            regression_pct=None,
+            tolerance_pct=tol * 100,
+            metric_name=metric_name,
+            metric_mode=metric_mode,
+            bench_variance_warnings=variance_warnings,
+            environment=env_cmp.to_dict(),
+            environment_warnings=[
+                f"environment mismatch: baseline recorded on different hardware "
+                f"({fields}); re-record with --save-baseline"
+            ],
+        )
+
+    environment_warnings: list[str] = []
+    if env_cmp.verdict == "advisory":
+        environment_warnings = format_comparison(env_cmp)
+    elif env_cmp.verdict == "unverified":
+        environment_warnings = [
+            "environment could not be verified against the baseline (it predates "
+            "environment capture, or the fingerprint probe failed on this host) "
+            "-- this result's hardware validity is not known"
+        ]
+    elif env_cmp.verdict == "incomparable":  # implies force, from the branch above
+        environment_warnings = [
+            "environment mismatch downgraded by --force: " + "; ".join(format_comparison(env_cmp))
+        ]
 
     rule = rule_for_constraints(task.constraints)
     regression_pct, primary_regressed, primary_verdict = _assess_regression(
@@ -415,4 +507,7 @@ def run_ci_check(
         secondary=secondary_result,
         profiler_regressions=profiler_regs,
         bench_variance_warnings=variance_warnings,
+        environment=env_cmp.to_dict(),
+        environment_warnings=environment_warnings,
+        verified=primary_verdict.verified if primary_verdict is not None else None,
     )

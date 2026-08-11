@@ -262,6 +262,7 @@ def generate_reports(p: ReportParams) -> dict:
                 "root_cause": d.root_cause,
                 "confidence": d.confidence,
                 "suggested_actions": d.suggested_actions,
+                "evidence": d.evidence.to_dict(),
             }
             for d in final_diags
         ],
@@ -562,6 +563,7 @@ def generate_reports(p: ReportParams) -> dict:
                     "root_cause": d.root_cause,
                     "confidence": d.confidence,
                     "suggested_actions": d.suggested_actions,
+                    "evidence": d.evidence.to_dict(),
                 }
                 for d in final_diags
             ] if final_diags else None,

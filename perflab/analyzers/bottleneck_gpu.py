@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis
+from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis, Evidence
 
 
 def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[BottleneckDiagnosis]:
@@ -31,6 +31,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                     "Consider using lower-precision datatypes (FP16, TF32, INT8)",
                     "Ensure coalesced memory access patterns",
                 ],
+                evidence=Evidence(level="derived", rule_id="ncu_kernel_memory_bound", metrics={"mem_throughput_pct": dk_mem, "compute_throughput_pct": dk_compute, "mem_threshold": thresholds.ncu_mem_throughput_high, "compute_threshold": thresholds.ncu_compute_low}),
             ))
         elif dk_compute > thresholds.ncu_compute_throughput_high and dk_mem < thresholds.ncu_mem_low:
             findings.append(BottleneckDiagnosis(
@@ -43,6 +44,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                     "Reduce unnecessary computation or use approximations",
                     "Increase occupancy to hide instruction latency",
                 ],
+                evidence=Evidence(level="derived", rule_id="ncu_kernel_compute_bound", metrics={"compute_throughput_pct": dk_compute, "mem_throughput_pct": dk_mem, "compute_threshold": thresholds.ncu_compute_throughput_high, "mem_threshold": thresholds.ncu_mem_low}),
             ))
 
     if sm_util is not None and sm_util < thresholds.ncu_sm_util_low:
@@ -58,6 +60,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Fuse small kernels to reduce launch overhead",
                 "Check for serializing dependencies between kernel launches",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_sm_util_low", metrics={"sm_util_pct": sm_util, "threshold": thresholds.ncu_sm_util_low, "critical_threshold": thresholds.ncu_sm_util_critical}),
         ))
 
     if mem_throughput is not None and mem_throughput > thresholds.ncu_mem_bound_high:
@@ -73,6 +76,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Consider using lower-precision datatypes (FP16, TF32, INT8)",
                 "Ensure coalesced memory access patterns",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_mem_bound_high", metrics={"memory_throughput_pct": mem_throughput, "threshold": thresholds.ncu_mem_bound_high, "critical_threshold": thresholds.ncu_mem_bound_critical}),
         ))
 
     if occupancy is not None and occupancy < thresholds.ncu_occupancy_low:
@@ -89,6 +93,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Tune block dimensions to improve occupancy",
                 "Use __launch_bounds__ to hint register usage to compiler",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_occupancy_low", metrics={"occupancy_pct": occupancy, "threshold": thresholds.ncu_occupancy_low}),
         ))
 
     # High register pressure on dominant kernel
@@ -104,6 +109,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Reduce local variables and simplify expressions",
                 "Consider using shared memory instead of registers for some data",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_regs_per_thread_high", metrics={"registers_per_thread": dk_regs, "threshold": thresholds.ncu_regs_per_thread_high}),
         ))
 
     # Low branch efficiency — control divergence
@@ -123,6 +129,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Sort or partition input data so adjacent threads follow the same branch",
                 "Replace divergent branches with arithmetic masks (e.g., multiply by condition)",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_branch_efficiency_low", metrics={"branch_efficiency_pct": branch_eff, "threshold": thresholds.ncu_branch_efficiency_low}),
         ))
 
     # Low warp execution efficiency
@@ -142,6 +149,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Restructure computation to minimize predicated-off threads",
                 "Ensure grid dimensions evenly divide the problem size",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_warp_exec_efficiency_low", metrics={"warp_execution_efficiency_pct": warp_exec_eff, "threshold": thresholds.ncu_warp_exec_efficiency_low}),
         ))
 
     # Low Tensor Core utilization on capable GPUs
@@ -165,6 +173,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Use cuBLAS or CUTLASS for drop-in Tensor Core GEMM",
                 "Ensure shared memory tiles match WMMA fragment layout (16x16x16 for FP16)",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_tc_util_low", metrics={"tensor_core_utilization_pct": tc_val, "threshold": thresholds.ncu_tc_util_low}),
         ))
 
     # Tensor Core capable but no TC metrics detected (using CUDA cores entirely)
@@ -183,6 +192,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Replace scalar FMA loops with cooperative matrix operations (wmma::mma_sync)",
                 "Consider cuBLAS or CUTLASS for automatic Tensor Core dispatch",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_tc_not_engaged", metrics={"compute_throughput_pct": dk_compute, "threshold": thresholds.ncu_compute_throughput_high}),
         ))
 
     # Dominant warp stall reason diagnosis
@@ -278,6 +288,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
             root_cause=root,
             confidence=confidence,
             suggested_actions=actions,
+            evidence=Evidence(level="derived", rule_id="ncu_stall_pct_high", metrics={"stall_pct": stall_pct, "threshold": thresholds.ncu_stall_pct_high}),
         ))
 
     # Shared memory bank conflicts
@@ -300,6 +311,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Restructure access patterns so adjacent threads access different banks",
                 "Consider using warp-level primitives (__shfl) instead of shared memory for small data",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_bank_conflicts_high", metrics={"bank_conflicts": bc_val, "threshold": thresholds.ncu_bank_conflicts_high}),
         ))
 
     # Uncoalesced global memory access
@@ -322,6 +334,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Use Structure of Arrays (SoA) instead of Array of Structures (AoS)",
                 "Use vectorized loads (float4) to align transactions to 128-byte boundaries",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_sectors_per_request_high", metrics={"sectors_per_request": spr_val, "threshold": thresholds.ncu_sectors_per_request_high}),
         ))
 
     # Occupancy limiter diagnosis (actionable "why" for low occupancy)
@@ -369,6 +382,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 suggested_actions=_LIMITER_ACTIONS.get(limiter_name, [
                     "Profile with ncu occupancy section to identify the specific limiter",
                 ]),
+                evidence=Evidence(level="derived", rule_id="ncu_occupancy_limiter", metrics={"occupancy_pct": occupancy, "threshold": thresholds.ncu_occupancy_low, "limiter_pct": limiter_val or 0.0}),
             ))
 
     # FP64 on consumer GPU (1/64th throughput on most consumer GPUs)
@@ -389,6 +403,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Use FP32 accumulation with FP16/BF16 inputs for maximum throughput",
                 "On data-center GPUs (A100, H100), FP64 is viable but still slower than FP32/TF32",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_fp64_usage_high", metrics={"fp64_util_pct": fp64_util, "threshold": 10.0, "high_threshold": 30.0}),
         ))
 
     # Register spilling to local memory
@@ -411,6 +426,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                 "Reduce local variables — reuse registers, simplify expressions",
                 "Move frequently-accessed data to shared memory instead of local variables",
             ],
+            evidence=Evidence(level="derived", rule_id="ncu_register_spilling", metrics={"local_memory_bytes": lm_val, "high_threshold": 1024.0}),
         ))
 
     # GPU-side multi-cache-level diagnosis (L1 -> L2 -> DRAM)
@@ -437,6 +453,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                     "Use shared memory explicitly instead of relying on L1 cache — shared memory has guaranteed capacity",
                     "Ensure coalesced loads to maximize bytes per L1 cache line fill",
                 ],
+                evidence=Evidence(level="derived", rule_id="ncu_l1_cache_bottleneck", metrics={"l1_hit_rate_pct": dk_l1_hr, "l2_hit_rate_pct": dk_l2_hr, "threshold": 50.0}),
             ))
         # L2 < 50% with mem throughput > 40%: L2 misses are generating real DRAM traffic
         elif dk_l1_hr >= 50 and dk_l2_hr < 50 and dk_mem_tp > 40:
@@ -454,6 +471,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                     "Apply tile index swizzling to reduce L2 sector conflicts across CTAs",
                     "Consider reducing precision (FP32→FP16) to halve the working set size",
                 ],
+                evidence=Evidence(level="derived", rule_id="ncu_l2_cache_bottleneck", metrics={"l1_hit_rate_pct": dk_l1_hr, "l2_hit_rate_pct": dk_l2_hr, "memory_throughput_pct": dk_mem_tp, "l1_threshold": 50.0, "l2_threshold": 50.0, "mem_threshold": 40.0}),
             ))
         # mem throughput > 70% with good cache hits: DRAM bandwidth wall despite efficient caching
         elif dk_l1_hr >= 50 and dk_l2_hr >= 50 and dk_mem_tp > 70:
@@ -470,6 +488,7 @@ def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlene
                     "Increase compute-to-memory ratio — do more FLOPs per byte loaded (larger tiles, more reuse)",
                     "On Ampere+: use async copy (cp.async) to overlap data movement with compute",
                 ],
+                evidence=Evidence(level="derived", rule_id="ncu_dram_bandwidth_saturated", metrics={"l1_hit_rate_pct": dk_l1_hr, "l2_hit_rate_pct": dk_l2_hr, "memory_throughput_pct": dk_mem_tp, "l1_threshold": 50.0, "l2_threshold": 50.0, "mem_threshold": 70.0}),
             ))
 
     return findings
@@ -499,6 +518,7 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                     "Overlap CPU and GPU work with async operations",
                     "Increase batch size to amortize CPU overhead",
                 ],
+                evidence=Evidence(level="derived", rule_id="nsys_gpu_fraction_low", metrics={"gpu_fraction": gpu_fraction, "threshold": thresholds.nsys_gpu_fraction_low}),
             ))
 
     if api_overhead is not None and duration is not None and duration > 0:
@@ -514,6 +534,7 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                     "Batch small operations into larger kernels",
                     "Use CUDA graphs for repeated launch sequences",
                 ],
+                evidence=Evidence(level="derived", rule_id="nsys_api_overhead_high", metrics={"api_overhead_fraction": overhead_fraction, "threshold": thresholds.nsys_api_overhead_high}),
             ))
 
     # Single kernel dominating GPU time
@@ -530,6 +551,7 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                 "Profile this kernel with ncu for detailed metrics",
                 "Consider algorithmic improvements or kernel fusion",
             ],
+            evidence=Evidence(level="derived", rule_id="nsys_kernel_dominance_pct", metrics={"kernel_pct": k.get("pct", 0), "threshold": thresholds.nsys_kernel_dominance_pct}),
         ))
 
     # Kernel launch overhead from gap analysis
@@ -547,6 +569,7 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                 "Fuse small kernels to reduce launch count",
                 "Overlap CPU work with GPU execution using streams",
             ],
+            evidence=Evidence(level="derived", rule_id="nsys_kernel_gap_us", metrics={"avg_kernel_gap_us": avg_gap, "threshold": thresholds.nsys_kernel_gap_us}),
         ))
 
     # Data transfer bottleneck
@@ -566,6 +589,7 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                     "Reduce transfer volume by keeping data on GPU longer",
                     "Use unified memory or zero-copy memory where appropriate",
                 ],
+                evidence=Evidence(level="derived", rule_id="nsys_transfer_ratio", metrics={"htod_ms": htod_ms, "kernel_time_ms": kernel_time, "threshold_ratio": thresholds.nsys_transfer_ratio}),
             ))
 
     # Hot-path cudaMalloc/cudaFree detection
@@ -588,6 +612,7 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
                     "Use a memory pool allocator (e.g., RAPIDS RMM, PyTorch caching allocator)",
                     "Move allocations outside the hot loop — allocate once, reuse many times",
                 ],
+                evidence=Evidence(level="derived", rule_id="nsys_malloc_hot_path", metrics={"api_pct": api_pct, "threshold": 5.0, "high_threshold": 15.0}),
             ))
             break  # One finding is enough
 
@@ -625,6 +650,7 @@ def _analyze_gpu_attribution(
                     root_cause="Kernel launch overhead is significant relative to execution time",
                     confidence="high",
                     suggested_actions=suggestions or ["Use CUDA graphs to batch launches", "Profile with ncu for kernel-level optimization"],
+                    evidence=Evidence(level="inferred", rule_id="gpu_attrib_launch_overhead", metrics={"gpu_pct": entry.gpu_pct, "launch_overhead_us": entry.launch_overhead_us, "gpu_pct_threshold": 20.0, "launch_overhead_threshold": 50.0}),
                 ))
 
         elif entry.category == "pipeline-stall":
@@ -634,6 +660,7 @@ def _analyze_gpu_attribution(
                 root_cause="GPU stream is idle between kernel launches",
                 confidence="medium",
                 suggested_actions=entry.suggestions or ["Overlap computation across streams", "Use CUDA graphs"],
+                evidence=Evidence(level="inferred", rule_id="gpu_attrib_pipeline_stall", metrics={}),
             ))
 
     return findings
@@ -661,6 +688,7 @@ def _analyze_metal(summary: dict, thresholds: AnalysisThresholds) -> list[Bottle
                     "Use triple buffering to overlap CPU and GPU work",
                     "Increase batch size to amortize per-dispatch overhead",
                 ],
+                evidence=Evidence(level="derived", rule_id="metal_gpu_fraction_low", metrics={"gpu_fraction": gpu_fraction, "threshold": thresholds.metal_gpu_fraction_low}),
             ))
 
     # Blit (memory transfer) bottleneck
@@ -678,6 +706,7 @@ def _analyze_metal(summary: dict, thresholds: AnalysisThresholds) -> list[Bottle
                 "Use shared memory or managed buffers where possible",
                 "Batch transfers to reduce per-transfer overhead",
             ],
+            evidence=Evidence(level="derived", rule_id="metal_blit_ratio", metrics={"blit_ms": blit_ms, "gpu_time_ms": gpu_time, "threshold_ratio": thresholds.metal_blit_ratio}),
         ))
 
     # GPU idle time
@@ -694,6 +723,7 @@ def _analyze_metal(summary: dict, thresholds: AnalysisThresholds) -> list[Bottle
                 "Use triple buffering to overlap CPU and GPU work",
                 "Reduce command buffer submission overhead",
             ],
+            evidence=Evidence(level="derived", rule_id="metal_gpu_idle_pct_high", metrics={"gpu_idle_pct": gpu_idle_pct, "threshold": thresholds.metal_gpu_idle_pct_high}),
         ))
 
     # Dominant submission
@@ -712,6 +742,7 @@ def _analyze_metal(summary: dict, thresholds: AnalysisThresholds) -> list[Bottle
                     f"Focus optimization on submission '{label}'",
                     "Profile the associated shader for ALU and memory bottlenecks",
                 ],
+                evidence=Evidence(level="derived", rule_id="metal_submission_dominance", metrics={"submission_gpu_time_ms": top_ms, "gpu_time_ms": gpu_time, "threshold_ratio": thresholds.metal_submission_dominance}),
             ))
 
     # GPU counter-based analysis
@@ -729,6 +760,7 @@ def _analyze_metal(summary: dict, thresholds: AnalysisThresholds) -> list[Bottle
                 "Reduce memory access latency via threadgroup memory",
                 "Use SIMD group functions for data sharing",
             ],
+            evidence=Evidence(level="derived", rule_id="metal_alu_util_low", metrics={"alu_utilization_pct": alu_util, "threshold": thresholds.metal_alu_util_low}),
         ))
 
     return findings
@@ -763,6 +795,7 @@ def _analyze_host_device(
                     "Use CUDA graphs for repeated launch patterns",
                     "Use async memory operations (cudaMemcpyAsync) to avoid implicit syncs",
                 ],
+                evidence=Evidence(level="derived", rule_id="host_device_sync_ratio", metrics={"sync_ratio": sync_ratio, "threshold": thresholds.host_device_sync_ratio}),
             ))
 
     # Rule 2: Many small kernels
@@ -782,6 +815,7 @@ def _analyze_host_device(
                     "Use CUDA graphs to batch repeated launch sequences",
                     "Increase per-kernel work (larger grid, more elements per thread)",
                 ],
+                evidence=Evidence(level="derived", rule_id="host_device_many_small_kernels", metrics={"avg_kernel_us": avg_overall, "kernel_count": total_count, "dur_threshold_us": thresholds.host_device_kernel_dur_low_us, "count_threshold": thresholds.host_device_kernel_count_high}),
             ))
 
     # Rule 3: Data transfer bottleneck (enhanced)
@@ -801,6 +835,7 @@ def _analyze_host_device(
                     "Keep data on device across iterations to eliminate redundant transfers",
                     "Batch small transfers into fewer large transfers",
                 ],
+                evidence=Evidence(level="derived", rule_id="host_device_transfer_ratio", metrics={"transfer_ratio": transfer_ratio, "threshold": thresholds.host_device_transfer_ratio}),
             ))
 
     # Rule 4: Low GPU utilization with CPU hotspot
@@ -822,6 +857,7 @@ def _analyze_host_device(
                     "Use async CUDA APIs to avoid blocking the CPU",
                     "Pipeline host preprocessing with device execution",
                 ],
+                evidence=Evidence(level="inferred", rule_id="host_device_gpu_active_low", metrics={"gpu_active_pct": gpu_active, "hotspot_pct": top_hs.get("pct", 0), "gpu_active_threshold": thresholds.host_device_gpu_active_low, "hotspot_threshold": 30.0}),
             ))
 
     return findings
@@ -871,6 +907,7 @@ def _analyze_cross_profiler_cpu_gpu(
                 "Reduce Python-level overhead in the training loop",
                 "Increase batch size to amortize per-step CPU overhead",
             ],
+            evidence=Evidence(level="inferred", rule_id="cross_gpu_cpu_ratio_low", metrics={"gpu_cpu_ratio": ratio, "threshold": thresholds.cross_gpu_cpu_ratio_low}),
         ))
 
     if gpu_util < thresholds.cross_gpu_util_low:
@@ -885,6 +922,7 @@ def _analyze_cross_profiler_cpu_gpu(
                 "Reduce CPU-GPU synchronization points",
                 "Batch more work per command buffer",
             ],
+            evidence=Evidence(level="inferred", rule_id="cross_gpu_util_low", metrics={"gpu_util": gpu_util, "threshold": thresholds.cross_gpu_util_low}),
         ))
 
     return findings

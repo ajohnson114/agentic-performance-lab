@@ -27,6 +27,7 @@ from perflab.analyzers.decision import (
 )
 from perflab.analyzers.metrics_rollup import improvement_factor
 from perflab.memory.run_store import snapshot_workspace
+from perflab.optimizers.forbidden import compile_rules
 from perflab.optimizers.history import make_history_entry
 from perflab.optimizers.patch import (
     SearchReplaceBlock,
@@ -127,7 +128,11 @@ def evaluate_single_candidate(
     # Validate
     patch_notices: list[str] = []
     validation_errors = validate_patch(
-        blocks, task.edit_policy.allowed_paths, ws, notices=patch_notices
+        blocks, task.edit_policy.allowed_paths, ws, notices=patch_notices,
+        forbidden_rules=compile_rules(
+            task.anti_gaming.forbidden_constructs,
+            task.anti_gaming.forbidden_patterns,
+        ),
     )
     event_log.candidate_validation(it, ci, not validation_errors, validation_errors)
     if patch_notices:

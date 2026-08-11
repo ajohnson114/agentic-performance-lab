@@ -7,7 +7,7 @@ Every built-in task starts from a deliberately naive baseline. The only way to i
 ```bash
 pip install -e .
 perflab init                                    # configure your LLM provider
-perflab agent tasks/matmul/cuda/task.yaml       # LLM-driven optimization
+perflab agent perflab/demo_tasks/matmul/cuda/task.yaml       # LLM-driven optimization
 perflab replay out/runs/<run_id>/               # review what the agent did
 ```
 
@@ -49,8 +49,8 @@ pip install -e ".[openai]"                          # or .[anthropic], .[all]
 pip install -e ".[tasks-all]"                       # task dependencies (optional)
 perflab doctor                                       # check environment
 perflab init                                         # configure LLM provider
-perflab profile tasks/matmul/python/task.yaml        # one-shot profiling
-perflab agent   tasks/matmul/python/task.yaml        # LLM-driven optimization
+perflab profile perflab/demo_tasks/matmul/python/task.yaml        # one-shot profiling
+perflab agent   perflab/demo_tasks/matmul/python/task.yaml        # LLM-driven optimization
 ```
 
 **One-shot setup for rented instances:** `./setup-h100.sh` (NVIDIA GPU) or `./setup-tpu-v5e.sh` (TPU VM).
@@ -81,14 +81,13 @@ perflab agent matmul/python/task.yaml                # LLM-driven optimization
 
 Each task is a self-contained directory with a naive implementation, a benchmark harness (`bench.py`), a correctness test (`tests.py`), and a config (`task.yaml`). The agent must discover and apply all optimizations through code edits.
 
-`tasks/` at the repo root is a **mirror** of `perflab/demo_tasks/`, which is the packaged source of truth (wheel package data has to live inside the package). Either path works for *running* a task. If you *edit* a bundled task, edit it under `perflab/demo_tasks/` and then run:
+The bundled demo tasks live in `perflab/demo_tasks/` and ship inside the wheel as package data, so the same paths work whether you cloned the repo or just `pip install`ed it. They are read-only reference material — to change one, take an editable copy first:
 
 ```bash
-python scripts/sync_demo_tasks.py          # update the mirror
-python scripts/sync_demo_tasks.py --check  # what CI runs; exit 1 on drift
+perflab tasks list                          # what's bundled
+perflab tasks copy matmul/cpp ./my-matmul   # editable copy
+perflab agent ./my-matmul/task.yaml
 ```
-
-A test fails if the two trees diverge, so drift is caught before it ships.
 
 ### Featured tasks
 
@@ -96,11 +95,11 @@ These are good starting points for seeing what the agent can do:
 
 | Task | Command | Optimization space |
 |------|---------|--------------------|
-| CUDA matmul | `perflab agent tasks/matmul/cuda/task.yaml` | Tiling, coalescing, shared memory |
-| CUDA Tensor Core | `perflab agent tasks/matmul/cuda_tensorcore/task.yaml` | Double buffering, warp pipelining |
-| PyTorch transformer | `perflab agent tasks/transformer_train/pytorch/task.yaml` | AMP, SDPA, `torch.compile` |
-| C++ matmul | `perflab agent tasks/matmul/cpp/task.yaml` | Loop reordering, tiling, SIMD |
-| Triton matmul | `perflab agent tasks/matmul/triton/task.yaml` | Block tiling with `tl.dot` |
+| CUDA matmul | `perflab agent perflab/demo_tasks/matmul/cuda/task.yaml` | Tiling, coalescing, shared memory |
+| CUDA Tensor Core | `perflab agent perflab/demo_tasks/matmul/cuda_tensorcore/task.yaml` | Double buffering, warp pipelining |
+| PyTorch transformer | `perflab agent perflab/demo_tasks/transformer_train/pytorch/task.yaml` | AMP, SDPA, `torch.compile` |
+| C++ matmul | `perflab agent perflab/demo_tasks/matmul/cpp/task.yaml` | Loop reordering, tiling, SIMD |
+| Triton matmul | `perflab agent perflab/demo_tasks/matmul/triton/task.yaml` | Block tiling with `tl.dot` |
 
 ### All tasks
 
@@ -226,7 +225,7 @@ Checks applied to what a candidate produces, independent of edit policy or runti
 
 `paired_difference` re-measures the candidate *against* the incumbent by alternating spawns in ABBA order (6 pairs by default) instead of comparing measurements taken minutes apart, so thermal and clock drift cancels between the arms instead of being attributed to the patch. It costs roughly 2.6x the authoritative benchmark's wall clock for a task with enough repeats to spread across the blocks, and up to ~10x for a task configured with very few repeats — so it is opt-in. It earns that on drift-prone hardware (datacenter GPUs, shared CI runners, cloud VMs) and not on a quiet laptop. Where an interleaved run cannot happen — `perflab ci-check`, `perflab optimize`, or a measurement that failed part-way — the rule falls back to the default `non_overlapping_ci` gate and reports the result as unverified; it never falls back to accepting.
 
-Why it exists and what it does and does not buy: [Why block-interleaved (paired) A/B measurement, and why is it opt-in?](ENGINEERING_RATIONALE.md#why-block-interleaved-paired-ab-measurement-and-why-is-it-opt-in)
+Why it exists and what it does and does not buy: see the module docstring in [`perflab/runners/paired.py`](perflab/runners/paired.py).
 
 PerfLab also includes `perflab.harness`, a library of anti-gaming utilities for `bench.py` and `tests.py`:
 
@@ -246,7 +245,16 @@ PerfLab also includes `perflab.harness`, a library of anti-gaming utilities for 
 
 ## Creating a Custom Task
 
-Copy `tasks/_sample/` and customize (or `perflab tasks copy _sample my_task` if you installed via pip without cloning). A task needs: `task.yaml`, `bench.py`, `tests.py`, and source files.
+Scaffold one anywhere on disk from the bundled template:
+
+```bash
+perflab tasks init ~/my_kernel        # writes task.yaml, bench.py, tests.py, sample.py, tuning.yaml
+perflab profile ~/my_kernel/task.yaml
+```
+
+A task's workspace is just its `task.yaml`'s parent directory, so the task lives wherever you put it — nothing needs to sit inside the PerfLab checkout or the installed package. The generated `task.yaml` is the `_sample` template with `name` and `workspace` filled in and all ~100 lines of option documentation preserved.
+
+The tasks bundled with PerfLab (`perflab tasks list`) are read-only demo material shipped as package data; `perflab tasks copy <name> <dest>` takes an editable copy of one. Edit those copies, not the originals.
 
 ```yaml
 # task.yaml — minimal example
@@ -264,6 +272,50 @@ edit_policy:
 ```
 
 Run `perflab show-task task.yaml` to see effective config with defaults.
+
+### What `bench.py` must emit
+
+`metric.name` is a **dotted path into the JSON your harness writes**, so the structure has to line up. Four requirements, three of which are easy to miss:
+
+```python
+out = {
+    "throughput": {
+        "median": med,          # <- metric.name = "throughput.median"
+        "raw_values": per_run,  # per-repeat values, in measurement order
+    },
+    "meta": {
+        "M": 512, "N": 512,     # every contract.fixed_params key
+        "warmup": warmup,       # what you actually ran
+        "repeats": repeats,
+    },
+    "ok": True,
+}
+```
+
+1. Accept `--json <path>` and write the file there.
+2. Honor `PERFLAB_BENCH_WARMUP` / `PERFLAB_BENCH_REPEATS` — the agent sets these to 0/2 to screen candidates cheaply, and to your task's full values for the decision that actually accepts or rejects.
+3. Emit **`raw_values`** (per-repeat, in measurement order). The accept gate computes confidence intervals from it; without it, a candidate can only be compared on a point estimate and small real wins become indistinguishable from noise.
+4. Echo every `contract.fixed_params` key into `meta`. This is what stops the agent from "optimizing" by shrinking the problem, and it's checked on every benchmark.
+
+`bench.py`, `tests.py`, and `task.yaml` are protected: the agent cannot edit them, and they're hash-verified after every iteration. Put anything the agent *should* be allowed to change in `edit_policy.allowed_paths`.
+
+### Running the agent on your task
+
+```bash
+perflab doctor --all                      # confirm profilers + LLM provider are wired up
+perflab profile ~/my_kernel/task.yaml     # baseline + profiles, no LLM, no edits
+perflab agent   ~/my_kernel/task.yaml     # the optimization loop
+```
+
+Start with `profile` — it validates the task end to end (build, correctness, benchmark, contract) without spending tokens. Once that's clean, `agent` runs the loop and writes everything to `out/runs/<run_id>/`:
+
+```bash
+perflab view      # dashboard for the newest run
+perflab diff      # baseline vs. the winning code
+perflab list-runs # history
+```
+
+Useful flags while iterating on a new task: `--iters 3` to keep runs short and `--max-cost 2.00` to cap spend (see [Agent flags](#agent-flags) for the rest).
 
 ### MCP task authoring
 
@@ -284,8 +336,8 @@ sweep:
 ```
 
 ```bash
-perflab optimize tasks/matmul/cuda/task.yaml
-perflab optimize tasks/matmul/triton/task.yaml --max-trials 15
+perflab optimize perflab/demo_tasks/matmul/cuda/task.yaml
+perflab optimize perflab/demo_tasks/matmul/triton/task.yaml --max-trials 15
 ```
 
 In agent mode, parameter sweeps happen automatically after each accepted code edit.
@@ -295,8 +347,8 @@ In agent mode, parameter sweeps happen automatically after each accepted code ed
 ## CI Integration
 
 ```bash
-perflab ci-check tasks/matmul/cpp/task.yaml --save-baseline   # save baseline (once)
-perflab ci-check tasks/matmul/cpp/task.yaml                    # check in CI (exit 1 on regression)
+perflab ci-check perflab/demo_tasks/matmul/cpp/task.yaml --save-baseline   # save baseline (once)
+perflab ci-check perflab/demo_tasks/matmul/cpp/task.yaml                    # check in CI (exit 1 on regression)
 ```
 
 Compares against the stored baseline using `regression_tolerance` from `task.yaml` (default 2%).
@@ -373,6 +425,18 @@ perflab show-config   # see the final resolved values and which files were loade
 
 ---
 
+## Documentation
+
+| Document | What's in it |
+|----------|--------------|
+| [Architecture](docs/ARCHITECTURE.md) | Project layout, data flow, and a walkthrough of every subsystem — start here to work on PerfLab itself |
+| [Features](docs/FEATURES.md) | Reference for each analysis capability: profilers, roofline, attribution, TMA, TPU support |
+| [Design decisions](docs/DESIGN.md) | Short-form "why" behind the choices that aren't obvious from the code |
+| [Safety checks](docs/SAFETY_CHECKS.md) | All 31 numbered checks, from patch validation and sandboxing to reward-hack mitigation and measurement stability |
+| [GPT-4o field notes](docs/GPT4O_FIELD_NOTES.md) | Measured failure modes from real runs, and what changed because of them |
+
+---
+
 ## Prerequisites
 
 - Python 3.10+
@@ -391,7 +455,7 @@ PerfLab gracefully skips profilers that aren't installed. Install the ones relev
 
 Compilers: `g++` for C++ tasks, `nvcc` for CUDA. Runtimes: `torch`, `jax`, `triton` as needed (`pip install -e ".[tasks-pytorch]"`).
 
-**A note on hardware coverage:** PerfLab's CI has no GPU or TPU runner, so the NVIDIA (`nsys`/`ncu`) and TPU analysis paths are tested against recorded-format fixtures rather than real devices. The CPU paths and the Linux isolation layer are exercised on real hardware. See [Validation Coverage: What Runs on Real Hardware](ENGINEERING_RATIONALE.md#validation-coverage-what-runs-on-real-hardware) for exactly what that does and does not guarantee.
+**A note on hardware coverage:** PerfLab's CI has no GPU or TPU runner, so the NVIDIA (`nsys`/`ncu`) and TPU analysis paths are tested against recorded-format fixtures rather than real devices. The CPU paths and the Linux isolation layer are exercised on real hardware, including the bubblewrap and seccomp acceptance tests, which CI fails if they silently skip.
 
 ---
 

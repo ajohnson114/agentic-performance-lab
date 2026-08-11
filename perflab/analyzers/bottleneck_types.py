@@ -110,6 +110,42 @@ class AnalysisThresholds:
     tpu_infeed_stall_pct_high: float = 10.0       # flag if infeed stall > 10% of step time
 
 
+@dataclass(frozen=True)
+class Evidence:
+    """Provenance for a :class:`BottleneckDiagnosis`'s ``bottleneck`` claim.
+
+    Note: frozen=True auto-generates ``__hash__``, but ``metrics`` is a plain
+    dict, which is unhashable -- hashing an ``Evidence`` (or a diagnosis that
+    holds one) raises ``TypeError`` at call time. Equality still works fine.
+    Never put one in a ``set`` or use it as a dict key.
+    """
+
+    level: str = "derived"
+    """Strongest evidence level supporting the claim.
+
+    - ``observed``  — restates a directly measured value with no threshold judgment
+    - ``derived``   — deterministic computation or threshold comparison over observed
+                      metrics (the common case for these rules)
+    - ``inferred``  — heuristic pattern match, source-text hints, or cross-profiler
+                      correlation that may be wrong even when the inputs are correct
+
+    ``root_cause`` and ``suggested_actions`` on the owning diagnosis are ALWAYS
+    inferred regardless of this field's value, and must be rendered as such.
+    """
+
+    rule_id: str = ""
+    """Identifier of the rule that fired, e.g. ``ncu_sm_util_low``. Prefer the
+    ``AnalysisThresholds`` attribute name when the rule is threshold-driven."""
+
+    metrics: dict[str, float] = field(default_factory=dict)
+    """The observed values this diagnosis was computed from, e.g.
+    ``{"sm_util_pct": 23.0, "threshold": 50.0}``. These are facts; the surrounding
+    prose is not."""
+
+    def to_dict(self) -> dict:
+        return {"level": self.level, "rule_id": self.rule_id, "metrics": self.metrics}
+
+
 @dataclass
 class BottleneckDiagnosis:
     rank: int
@@ -117,3 +153,6 @@ class BottleneckDiagnosis:
     root_cause: str           # e.g. "Insufficient parallelism or small kernel launches"
     confidence: str           # "high" | "medium" | "low"
     suggested_actions: list[str] = field(default_factory=list)
+
+    # --- provenance (added) ---
+    evidence: Evidence = field(default_factory=Evidence)

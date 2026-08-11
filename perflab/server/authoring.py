@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
+from perflab.optimizers.forbidden import FORBIDDEN_CONSTRUCTS
 from perflab.server.core import _PROGRAM_TYPES, _guard_output_size, mcp
 
 # ===========================================================================
@@ -128,6 +129,16 @@ def show_task_schema() -> dict:
                 {"name": "contract.fixed_params", "type": "dict", "desc": "Values enforced in bench.json meta (e.g., {M: 4096})"},
                 {"name": "contract.min_repeats", "type": "int", "desc": "Minimum benchmark repeats (default: 1)"},
                 {"name": "contract.required_bench_fields", "type": "list[str]", "desc": "Fields that must exist in bench.json"},
+            ]},
+            {"section": "ANTI_GAMING", "fields": [
+                {"name": "anti_gaming.forbidden_constructs", "type": "list[str]",
+                 "desc": "Constructs a candidate may not introduce; such patches are "
+                         "rejected before benchmarking. One or more of: "
+                         + ", ".join(sorted(FORBIDDEN_CONSTRUCTS))},
+                {"name": "anti_gaming.forbidden_patterns", "type": "list[str]",
+                 "desc": "Custom regexes treated the same way as forbidden_constructs"},
+                {"name": "anti_gaming.gaming_speedup_threshold", "type": "float",
+                 "desc": "Warn if one iteration's speedup exceeds this (default: 10.0)"},
             ]},
             {"section": "ROOFLINE", "fields": [
                 {"name": "roofline.peak_tflops", "type": "float", "desc": "Hardware peak TFLOPS"},

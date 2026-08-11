@@ -32,6 +32,8 @@ class TestTopLevelHelp:
             "peaks",
             "ci-check",
             "replay",
+            "export",
+            "diff",
             "list-runs",
             "compare",
             "thresholds",

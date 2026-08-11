@@ -362,7 +362,10 @@ class TestGetBottlenecks:
         result = get_bottlenecks(rid, out_dir=str(tmp_path))
         assert len(result) >= 1
         for diag in result:
-            assert set(diag) == {"rank", "bottleneck", "root_cause", "confidence", "suggested_actions"}
+            assert set(diag) == {
+                "rank", "bottleneck", "root_cause", "confidence", "suggested_actions",
+                "evidence",
+            }
         assert result[0]["rank"] == 1
 
 
