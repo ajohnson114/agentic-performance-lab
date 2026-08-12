@@ -26,6 +26,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+import perflab
 from perflab.config import (
     DEFAULT_CONFIG_TEMPLATE,
     PerfLabConfig,
@@ -280,7 +281,7 @@ class TestWrapCommandFallbacks:
         an unbound path -- e.g. the repo's `tasks -> perflab/demo_tasks`
         symlink. Every task's relative command ("python bench.py --json
         out/bench.json") then fails with "can't open file '//bench.py'".
-        Reproduced on Linux via `cd tasks/matmul/python && perflab agent
+        Reproduced on Linux via `cd perflab/demo_tasks/matmul/python && perflab agent
         task.yaml`; a silent cwd change is exactly the kind of failure that
         looks like a broken candidate rather than a broken sandbox.
         """
@@ -747,7 +748,12 @@ class TestBwrapAcceptance:
         from perflab.runners.benchmark import run_benchmark
         from perflab.runners.correctness import run_correctness
 
-        src = Path(__file__).resolve().parents[1] / "tasks" / "matmul" / "cpp"
+        # Resolved from the installed package, not a repo-relative path: the
+        # demo tasks live inside perflab/ so the wheel can ship them, and the
+        # old top-level tasks/ mirror that this used to point at is gone.
+        src = Path(perflab.__file__).resolve().parent / "demo_tasks" / "matmul" / "cpp"
+        if not src.is_dir():
+            pytest.skip(f"bundled matmul/cpp task not found at {src}")
         ws = tmp_path / "matmul_cpp"
         shutil.copytree(src, ws)
 
