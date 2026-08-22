@@ -66,13 +66,15 @@ def make_task(
     correctness_expected_exit: int = 0,
     build_yaml: str = "null",
     fixed_params_yaml: str = "{}",
+    program_type: str = "python",
+    rlimit_as_gb_yaml: str = "0",
 ) -> TaskSpec:
     """Write a minimal python task workspace and load its TaskSpec."""
     ws = tmp_path / "workspace"
     ws.mkdir(exist_ok=True)
     (ws / "task.yaml").write_text(textwrap.dedent(f"""\
         name: pipeline-test
-        program_type: python
+        program_type: {program_type}
         build: {build_yaml}
         correctness:
           cmd: "python tests.py"
@@ -90,7 +92,7 @@ def make_task(
         constraints:
           max_iters: 3
           regression_tolerance: 0.02
-          rlimit_as_gb: 0
+          rlimit_as_gb: {rlimit_as_gb_yaml}
         contract:
           fixed_params: {fixed_params_yaml}
           min_repeats: 1
@@ -175,6 +177,42 @@ class TestPipelineSuccess:
         assert (ws / "built.txt").exists()
         assert result.bench["ok"] is True
         assert (run_dir / "logs" / "build.stdout.txt").exists()
+
+    def test_build_step_uses_gpu_rlimit_for_gpu_program_types(
+        self, tmp_path: Path, run_dirs: tuple[Path, Path], monkeypatch,
+    ) -> None:
+        # Confirmed on real H100 hardware: nvcc -arch=native (unlike a
+        # hardcoded -arch=sm_90) queries the GPU driver at compile time to
+        # auto-detect compute capability, creating a CUDA context that
+        # exceeds the 4GB CPU-default RLIMIT_AS -- an opaque build failure
+        # with no useful stderr. The build step must resolve the same
+        # GPU-aware limit run_benchmark/run_correctness already do.
+        from perflab.runners import pipeline as pipeline_module
+        from perflab.tools.shell import DEFAULT_GPU_RLIMIT_AS_BYTES, CmdResult
+
+        build_yaml = '{cmd: "python build.py", expected_exit: 0}'
+        task = make_task(
+            tmp_path, build_yaml=build_yaml,
+            program_type="cuda", rlimit_as_gb_yaml="null",
+        )
+        (task.workspace / "build.py").write_text(
+            "open('built.txt', 'w').write('yes')\n", encoding="utf-8"
+        )
+        run_dir, artifacts_dir = run_dirs
+
+        captured_rlimits = []
+        real_run_cmd = pipeline_module.run_cmd
+
+        def _spy_run_cmd(argv, **kwargs):
+            if argv and Path(argv[0]).name == "python" and "build.py" in argv:
+                captured_rlimits.append(kwargs.get("rlimit_as_bytes"))
+                return CmdResult(cmd=argv, returncode=0, stdout="", stderr="", duration_s=0.0)
+            return real_run_cmd(argv, **kwargs)
+
+        monkeypatch.setattr(pipeline_module, "run_cmd", _spy_run_cmd)
+        run_pipeline(task, run_dir, artifacts_dir)
+
+        assert captured_rlimits == [DEFAULT_GPU_RLIMIT_AS_BYTES]
 
 
 class TestPipelineFailures:

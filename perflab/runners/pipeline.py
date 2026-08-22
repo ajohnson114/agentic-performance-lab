@@ -23,7 +23,7 @@ from perflab.analyzers.compiler_diagnostics import (
     get_diagnostic_env_vars,
     parse_compiler_output,
 )
-from perflab.runners.benchmark import run_benchmark, validate_contract
+from perflab.runners.benchmark import _resolve_rlimit, run_benchmark, validate_contract
 from perflab.runners.correctness import run_correctness
 from perflab.task_spec import TaskSpec
 from perflab.tools.isolation import IsolationPolicy
@@ -121,7 +121,18 @@ def run_pipeline(
                     get_diagnostic_build_flags(task.program_type, compiler=detected_compiler)
                 )
 
-        bres = run_cmd(build_cmd_parts, cwd=ws)
+        # GPU-aware limit, matching run_benchmark/run_correctness: a build
+        # command that needs nvcc to touch the GPU driver (e.g. -arch=native,
+        # which queries the device to auto-detect compute capability, unlike
+        # a hardcoded -arch=sm_90) creates a CUDA context at compile time and
+        # can exceed the 4GB CPU default -- confirmed on real H100 hardware,
+        # where this was the difference between a task compiling fine
+        # (explicit -arch) and failing with an opaque exit 1 and no matching
+        # stderr (implicit -arch=native).
+        bres = run_cmd(
+            build_cmd_parts, cwd=ws,
+            rlimit_as_bytes=_resolve_rlimit(task.program_type, task.constraints.rlimit_as_gb),
+        )
         build_stderr = bres.stderr
         if save_logs:
             logs_dir = run_dir / "logs"

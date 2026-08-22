@@ -25,6 +25,28 @@ def _resolve_roofline_peaks(task: TaskSpec) -> dict | None:
     return resolve_roofline(task)
 
 
+def _resolve_device_for_summary(bench_meta_device: object, sysinfo: dict) -> str:
+    """Best-effort device string for generate_optimization_summary's hardware
+    context, when the task's own bench.json doesn't report one.
+
+    Framework-based tasks (pytorch/jax) self-report a device in bench.json's
+    meta section, but hand-written raw-binary tasks (cuda, triton) generally
+    don't -- their bench.py only knows problem-size parameters (M/N/K/...),
+    not a device string. Falling back straight to "unknown" there made every
+    raw CUDA task's LLM-written explanation hedge about hardware it didn't
+    need to guess at: capture_system_info() already detected the real GPU
+    via nvidia-smi and stored it in ctx.sysinfo, confirmed on real H100
+    hardware -- the resulting summary said "device is unconfirmed" for a
+    task whose own system_info.json had "NVIDIA H100 80GB HBM3" the whole
+    time.
+    """
+    if isinstance(bench_meta_device, str) and bench_meta_device:
+        return bench_meta_device
+    if sysinfo.get("nvidia_gpus"):
+        return "cuda"
+    return "unknown"
+
+
 def _regenerate_roofline_with_history(ctx: AgentContext) -> None:
     """Regenerate roofline.png with the full optimization trail from ctx.history.
 
@@ -193,7 +215,9 @@ def run(ctx: AgentContext, status: str = "completed") -> None:
         try:
             optimization_summary_text, summary_usage, summary_latency = generate_optimization_summary(
                 ctx,
-                device=bench_data_final.get("meta", {}).get("device", "unknown"),
+                device=_resolve_device_for_summary(
+                    bench_data_final.get("meta", {}).get("device"), ctx.sysinfo,
+                ),
                 profiler_summaries=profiler_summaries_final,
             )
             ctx.total_llm_calls += 1
