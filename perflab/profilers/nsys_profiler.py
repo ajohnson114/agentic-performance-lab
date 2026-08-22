@@ -4,6 +4,7 @@ import logging
 import re
 import shutil
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -151,6 +152,35 @@ def _parse_nsys_sqlite(sqlite_path: Path) -> dict:
     return result
 
 
+def _resolve_kernel_names(conn: sqlite3.Connection) -> Callable[[object], str]:
+    """Return a function resolving a CUPTI_ACTIVITY_KIND_KERNEL name column value to a string.
+
+    Confirmed on real hardware (Nsight Systems 2025.1.1.0): demangledName /
+    shortName / mangledName are declared INTEGER -- StringId references into
+    StringIds.id, not the string itself (PRAGMA table_info shows this
+    directly; querying demangledName raw returns e.g. 413, not a kernel
+    name). Every kernel-name query in this module used to read the column
+    raw, which silently produced integers wherever a missing/unrelated
+    string method didn't already crash it (get_kernel_dossier, top_kernels,
+    the CPU->GPU call graph, ...). Some older nsys/CUPTI export versions are
+    believed to have stored the string directly, so this checks the column's
+    declared type at runtime rather than assuming either schema.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(CUPTI_ACTIVITY_KIND_KERNEL)").fetchall()
+    except sqlite3.OperationalError:
+        return lambda v: str(v) if v is not None else "(unknown)"
+    demangled_type = next((c["type"] for c in cols if c["name"] == "demangledName"), None)
+    if demangled_type != "INTEGER":
+        return lambda v: str(v) if v else "(unknown)"
+
+    try:
+        id_to_name = {r["id"]: r["value"] for r in conn.execute("SELECT id, value FROM StringIds")}
+    except sqlite3.OperationalError:
+        return lambda v: "(unknown)"
+    return lambda v: id_to_name.get(v, "(unknown)")
+
+
 def _extract_top_kernels(conn: sqlite3.Connection, result: dict) -> None:
     """Top-10 GPU kernels by total time."""
     cur = conn.execute("""
@@ -167,6 +197,7 @@ def _extract_top_kernels(conn: sqlite3.Connection, result: dict) -> None:
     if not rows:
         return
 
+    resolve_name = _resolve_kernel_names(conn)
     total_kernel_ns = sum(r["total_ns"] for r in rows)
     # Get the true total across *all* kernels, not just top-10
     all_total = conn.execute(
@@ -178,7 +209,7 @@ def _extract_top_kernels(conn: sqlite3.Connection, result: dict) -> None:
     for r in rows:
         pct = (r["total_ns"] / total_all_ns * 100.0) if total_all_ns > 0 else 0.0
         kernels.append({
-            "name": r["demangledName"] or "(unknown)",
+            "name": resolve_name(r["demangledName"]),
             "count": r["count"],
             "total_ms": r["total_ns"] / 1e6,
             "avg_us": r["avg_ns"] / 1e3,
@@ -217,6 +248,7 @@ def _extract_top_kernels_by_device(conn: sqlite3.Connection, result: dict) -> No
     if len(device_ids) <= 1:
         return
 
+    resolve_name = _resolve_kernel_names(conn)
     device_totals: dict[int, int] = {}
     for r in rows:
         device_totals[r["deviceId"]] = device_totals.get(r["deviceId"], 0) + (r["total_ns"] or 0)
@@ -230,7 +262,7 @@ def _extract_top_kernels_by_device(conn: sqlite3.Connection, result: dict) -> No
         total = device_totals.get(dev, 0)
         pct = (r["total_ns"] / total * 100.0) if total > 0 else 0.0
         bucket.append({
-            "name": r["demangledName"] or "(unknown)",
+            "name": resolve_name(r["demangledName"]),
             "count": r["count"],
             "total_ms": r["total_ns"] / 1e6,
             "avg_us": r["avg_ns"] / 1e3,
@@ -262,6 +294,7 @@ def _extract_nccl_time(conn: sqlite3.Connection, result: dict) -> None:
     if not rows:
         return
 
+    resolve_name = _resolve_kernel_names(conn)
     total_ns = 0
     nccl_ns = 0
     device_total: dict[int, int] = {}
@@ -271,7 +304,7 @@ def _extract_nccl_time(conn: sqlite3.Connection, result: dict) -> None:
         dev = r["deviceId"]
         total_ns += dur
         device_total[dev] = device_total.get(dev, 0) + dur
-        if "nccl" in (r["demangledName"] or "").lower():
+        if "nccl" in resolve_name(r["demangledName"]).lower():
             nccl_ns += dur
             device_nccl[dev] = device_nccl.get(dev, 0) + dur
 
@@ -507,10 +540,12 @@ def _extract_kernel_launch_dims(conn: sqlite3.Connection, result: dict) -> None:
     if not rows:
         return
 
-    # Aggregate per-kernel
+    # Aggregate per-kernel. Keyed by the same resolved name top_kernels uses
+    # below, so the entry["name"] lookup actually matches.
+    resolve_name = _resolve_kernel_names(conn)
     kernel_dims: dict[str, dict] = {}
     for r in rows:
-        name = r["demangledName"] or "(unknown)"
+        name = resolve_name(r["demangledName"])
         if name not in kernel_dims:
             kernel_dims[name] = {"grid_sizes": [], "block_sizes": [], "threads": []}
         grid_size = (r["gridX"] or 1) * (r["gridY"] or 1) * (r["gridZ"] or 1)
@@ -655,6 +690,7 @@ def _extract_cpu_gpu_correlation(conn: sqlite3.Connection, result: dict) -> None
     if not rows:
         return
 
+    resolve_name = _resolve_kernel_names(conn)
     correlations = []
     for r in rows:
         gpu_start = r["gpu_start"]
@@ -667,7 +703,7 @@ def _extract_cpu_gpu_correlation(conn: sqlite3.Connection, result: dict) -> None
         correlations.append({
             "correlation_id": r["correlationId"],
             "api_name": r["api_name"],
-            "kernel_name": r["kernel_name"] or "(unknown)",
+            "kernel_name": resolve_name(r["kernel_name"]),
             "cpu_start_ns": cpu_start,
             "cpu_end_ns": cpu_end,
             "gpu_start_ns": gpu_start,

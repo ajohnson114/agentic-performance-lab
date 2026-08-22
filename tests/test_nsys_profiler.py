@@ -15,6 +15,7 @@ from perflab.profilers.nsys_profiler import (
     _extract_gpu_utilization,
     _extract_nccl_time,
     _extract_per_stream_gaps,
+    _extract_top_kernels,
     _extract_top_kernels_by_device,
 )
 
@@ -264,3 +265,63 @@ class TestNcclTimeMultiGpu:
         _extract_nccl_time(conn, result)
         assert result["nccl_pct"] == 10.0
         assert "nccl_pct_by_device" not in result
+
+
+class TestKernelNameStringIdSchema:
+    """Regression coverage for the real schema found on Nsight Systems 2025.1.1.0.
+
+    Every other fixture in this file (and the ones inherited before it) declares
+    demangledName TEXT, modeling an older nsys export. Real hardware testing on
+    an actual 2x-GPU RunPod box found that current nsys instead declares
+    demangledName INTEGER -- a StringId reference into StringIds.id -- so
+    reading it raw silently produced integers as "kernel names" (or crashed
+    _extract_nccl_time's .lower() call outright). These fixtures model that
+    schema so it can't regress silently again.
+    """
+
+    def _make_stringid_db(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
+            "(correlationId INTEGER, demangledName INTEGER, start INTEGER, end INTEGER, "
+            " streamId INTEGER, deviceId INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME "
+            "(correlationId INTEGER, nameId INTEGER, start INTEGER, end INTEGER)"
+        )
+        conn.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        conn.execute("INSERT INTO StringIds VALUES (1, 'cudaLaunchKernel')")
+        conn.execute("INSERT INTO StringIds VALUES (413, 'sgemm_kernel(int, int, int)')")
+        conn.execute("INSERT INTO StringIds VALUES (414, 'ncclKernel_AllReduce')")
+        conn.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (100, 413, 0, 1000, 1, 0)"
+        )
+        conn.execute("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (100, 1, 0, 5)")
+        conn.execute(
+            "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (200, 414, 1000, 1100, 1, 0)"
+        )
+        conn.execute("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (200, 1, 1000, 1005)")
+        return conn
+
+    def test_top_kernels_resolves_real_name_not_raw_id(self):
+        conn = self._make_stringid_db()
+        result: dict = {}
+        _extract_top_kernels(conn, result)
+        names = {k["name"] for k in result["top_kernels"]}
+        assert names == {"sgemm_kernel(int, int, int)", "ncclKernel_AllReduce"}
+
+    def test_cpu_gpu_correlation_resolves_real_name_not_raw_id(self):
+        conn = self._make_stringid_db()
+        result: dict = {}
+        _extract_cpu_gpu_correlation(conn, result)
+        names = {c["kernel_name"] for c in result["cpu_gpu_correlations"]}
+        assert names == {"sgemm_kernel(int, int, int)", "ncclKernel_AllReduce"}
+
+    def test_nccl_time_matches_by_resolved_name_not_raw_id(self):
+        conn = self._make_stringid_db()
+        result: dict = {}
+        _extract_nccl_time(conn, result)
+        # sgemm_kernel: 1000ns, ncclKernel_AllReduce: 100ns -> 100/1100
+        assert result["nccl_pct"] == round(100 / 1100 * 100.0, 1)
