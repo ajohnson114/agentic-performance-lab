@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from perflab.runners.benchmark import _resolve_rlimit
 from perflab.runners.correctness import _passthrough_env
-from perflab.tools.shell import DEFAULT_TIMEOUT_S, CmdResult, run_cmd
+from perflab.tools.shell import DEFAULT_RLIMIT_AS_BYTES, DEFAULT_TIMEOUT_S, CmdResult, run_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,16 @@ logger = logging.getLogger(__name__)
 # passthrough here covers every current and future profiler.
 _BENCH_ENV_PASSTHROUGH: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "perflab_bench_env_passthrough", default=(),
+)
+
+# Same funnel problem as _BENCH_ENV_PASSTHROUGH above, for the benchmark's
+# memory limit: Profiler.run()'s signature carries no task context, so
+# run_bench_under has no way to know a profiled command is a GPU task unless
+# the profiler loop tells it via this contextvar first. Defaults to the CPU
+# limit so any caller that never enters bench_rlimit() (test doubles, direct
+# calls) keeps run_cmd's own long-standing default unchanged.
+_BENCH_RLIMIT_AS_BYTES: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "perflab_bench_rlimit_as_bytes", default=DEFAULT_RLIMIT_AS_BYTES,
 )
 
 
@@ -41,6 +52,27 @@ def bench_env_passthrough(names: Sequence[str] | None) -> Iterator[None]:
         yield
     finally:
         _BENCH_ENV_PASSTHROUGH.reset(token)
+
+
+@contextmanager
+def bench_rlimit(program_type: str | None, rlimit_as_gb: float | None) -> Iterator[None]:
+    """Apply the task's memory limit (_resolve_rlimit) to profiled runs in this block.
+
+    Without this, every profiler funnels through run_bench_under's 4GB CPU
+    default even for GPU tasks -- CUDA context creation (especially under
+    nsys/CUPTI/ncu instrumentation, which reserves substantial extra virtual
+    address space beyond what the workload itself needs) reliably exceeds
+    that ceiling and fails with a false "out of memory" while actual GPU
+    memory sits idle. Confirmed on real 2x-GPU hardware: nsys/ncu against a
+    CUDA task produced zero CUPTI activity data under the 4GB default, and
+    succeeded once the GPU-appropriate 32GB limit (DEFAULT_GPU_RLIMIT_AS_BYTES
+    via _resolve_rlimit) was applied to the identical command.
+    """
+    token = _BENCH_RLIMIT_AS_BYTES.set(_resolve_rlimit(program_type, rlimit_as_gb))
+    try:
+        yield
+    finally:
+        _BENCH_RLIMIT_AS_BYTES.reset(token)
 
 
 @dataclass
@@ -85,12 +117,16 @@ def run_bench_under(
     os.environ and overlaid next, so profiled runs see the same extra vars the
     non-profiled benchmark/correctness runners forward. Explicit `env` entries
     are overlaid last and win over both the locale and the passthrough vars.
+
+    The memory limit passed to run_cmd comes from bench_rlimit() (task-aware:
+    32GB for GPU program types, matching run_benchmark/run_correctness) if a
+    caller entered that context first, else run_cmd's own 4GB CPU default.
     """
     passthrough_env = _passthrough_env(list(_BENCH_ENV_PASSTHROUGH.get()))
     return run_cmd(
         [*wrapper, *bench_argv(bench_cmd)], cwd=cwd,
         env={"LC_ALL": "C", **passthrough_env, **(env or {})}, timeout_s=timeout_s,
-        env_mode="allowlist",
+        env_mode="allowlist", rlimit_as_bytes=_BENCH_RLIMIT_AS_BYTES.get(),
     )
 
 

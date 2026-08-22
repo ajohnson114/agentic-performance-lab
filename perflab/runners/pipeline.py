@@ -253,13 +253,17 @@ def run_pipeline(
     if do_profiles:
         tp0 = time.perf_counter()
         from perflab.profilers import select_profilers
-        from perflab.profilers.base import bench_env_passthrough
+        from perflab.profilers.base import bench_env_passthrough, bench_rlimit
 
-        # Forward task.yaml env_passthrough vars (DATA_ROOT/HF_HOME, ...) to the
-        # profiled benchmark runs, matching the non-profiled benchmark/
-        # correctness runs above -- every profiler funnels through
-        # run_bench_under, which reads this context.
-        with bench_env_passthrough(task.constraints.env_passthrough):
+        # Forward task.yaml env_passthrough vars (DATA_ROOT/HF_HOME, ...) and
+        # the task-appropriate memory limit (32GB for GPU program types, see
+        # bench_rlimit) to the profiled benchmark runs, matching the
+        # non-profiled benchmark/correctness runs above -- every profiler
+        # funnels through run_bench_under, which reads both contexts.
+        with (
+            bench_env_passthrough(task.constraints.env_passthrough),
+            bench_rlimit(task.program_type, task.constraints.rlimit_as_gb),
+        ):
             for profiler in select_profilers(task):
                 if not profiler.is_available():
                     artifacts[profiler.name] = "(not available)"

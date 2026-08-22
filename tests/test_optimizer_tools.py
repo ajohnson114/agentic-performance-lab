@@ -34,7 +34,7 @@ def _make_task(tmp_path: Path, *, program_type: str = "cuda", build_cmd: str | N
             cmd="python bench.py",
             metric=SimpleNamespace(mode="maximize"),
         ),
-        constraints=SimpleNamespace(top_n=3, env_passthrough=[]),
+        constraints=SimpleNamespace(top_n=3, env_passthrough=[], rlimit_as_gb=None),
         analysis_thresholds=AnalysisThresholds(),
     )
 

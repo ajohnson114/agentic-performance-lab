@@ -412,7 +412,7 @@ def _tool_run_profiler(ctx: AgentContext, args: dict[str, Any]) -> dict:
     get_bottlenecks / get_kernel_dossier call in the same tool loop sees it.
     """
     from perflab.profilers import select_profilers
-    from perflab.profilers.base import bench_env_passthrough
+    from perflab.profilers.base import bench_env_passthrough, bench_rlimit
 
     profiler_name = args.get("profiler_name")
     if not profiler_name or not isinstance(profiler_name, str):
@@ -445,7 +445,10 @@ def _tool_run_profiler(ctx: AgentContext, args: dict[str, Any]) -> dict:
     scoped_dir = ctx.rp.artifacts_dir / "tool_calls" / f"{profiler_name}_{uuid.uuid4().hex[:8]}"
     scoped_dir.mkdir(parents=True, exist_ok=True)
 
-    with bench_env_passthrough(ctx.task.constraints.env_passthrough):
+    with (
+        bench_env_passthrough(ctx.task.constraints.env_passthrough),
+        bench_rlimit(ctx.task.program_type, ctx.task.constraints.rlimit_as_gb),
+    ):
         result = profiler.run(ctx.task.benchmark.cmd, cwd=ctx.ws, artifacts_dir=scoped_dir)
 
     try:
