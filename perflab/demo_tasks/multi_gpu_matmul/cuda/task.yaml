@@ -32,6 +32,12 @@ profile_plan:
 constraints:
   max_iters: 8
   regression_tolerance: 0.02
+  # NCCL communicator init across 2+ devices reserves far more virtual
+  # address space than any bounded RLIMIT_AS can accommodate -- confirmed
+  # on real 2x-GPU hardware that even 64GB (2x the single-GPU default)
+  # fails with a false CUDA "out of memory" during ncclCommInitAll while
+  # actual GPU memory sits idle. 0 disables the limit for this task only.
+  rlimit_as_gb: 0
 
 analysis_thresholds:
   gpu_cpu_ratio_low: 0.8         # NCCL sync adds some host-visible overhead vs a pure single-GPU matmul

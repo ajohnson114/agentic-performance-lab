@@ -184,6 +184,12 @@ static void multi_gpu_sgemm(int M, int N, int K, int numDevices,
     int count = M * N;
     CHECK_NCCL(ncclGroupStart());
     for (int i = 0; i < numDevices; ++i) {
+        // The allocation/kernel-launch loop above leaves the CUDA context on
+        // numDevices-1 -- ncclAllReduce validates d_C[i] against whichever
+        // device is CURRENTLY active, not the device the pointer was
+        // allocated on, so every i other than the last one fails with
+        // "Cuda failure 1 'invalid argument'" without this.
+        CHECK_CUDA(cudaSetDevice(i));
         CHECK_NCCL(ncclAllReduce(d_C[i], d_C[i], count, ncclFloat, ncclSum, comms[i], streams[i]));
     }
     CHECK_NCCL(ncclGroupEnd());
