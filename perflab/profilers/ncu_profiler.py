@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult, run_bench_under
+from perflab.profilers.base import ProfileResult, current_bench_rlimit, run_bench_under
 from perflab.tools.shell import run_cmd
 from perflab.tools.symbols import demangle
 
@@ -45,7 +45,7 @@ class NcuProfiler:
         if report_path.exists():
             export_res = run_cmd(
                 ["ncu", "--import", str(report_path), "--csv", "--log-file", str(csv_path)],
-                cwd=cwd,
+                cwd=cwd, rlimit_as_bytes=current_bench_rlimit(),
             )
             csv_returncode = export_res.returncode
             exported = True

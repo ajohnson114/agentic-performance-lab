@@ -4,7 +4,6 @@ import contextlib
 import json
 import logging
 import math
-import shlex
 import shutil
 import tempfile
 import zipfile
@@ -38,15 +37,14 @@ from perflab.optimizers.patch import (
 from perflab.runners.benchmark import (
     metric_value,
     run_benchmark,
+    run_build_cmd,
     validate_bench_variance,
     validate_contract,
 )
 from perflab.runners.correctness import run_correctness, run_correctness_twice
 from perflab.runners.paired import PairedRun, run_paired_benchmark
 from perflab.runners.pipeline import run_pipeline_for_ctx
-from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
 from perflab.tools import compute_sanitizer
-from perflab.tools.shell import run_cmd
 
 if TYPE_CHECKING:
     from perflab.optimizers.agent import AgentContext
@@ -169,10 +167,7 @@ def evaluate_single_candidate(
         # Build the patched copy so compiled tasks benchmark the patched
         # binary (prescreen built only its own, already-discarded copy).
         if task.build is not None:
-            build_res = run_cmd(
-                shlex.split(task.build.cmd), cwd=temp_ws,
-                timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
-            )
+            build_res = run_build_cmd(task, temp_ws)
             if build_res.returncode != task.build.expected_exit:
                 progress.on_message(f"[agent]   Build FAILED (rc={build_res.returncode})")
                 return _reject("build failed", {
@@ -371,10 +366,7 @@ def _build_arm(ctx: AgentContext, cwd: Path) -> str:
     build = ctx.task.build
     if build is None:
         return ""
-    res = run_cmd(
-        shlex.split(build.cmd), cwd=cwd,
-        timeout_s=build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
-    )
+    res = run_build_cmd(ctx.task, cwd)
     if res.returncode != build.expected_exit:
         return f"build failed (rc={res.returncode})"
     return ""
@@ -1075,10 +1067,7 @@ def remeasure_baseline(ctx: AgentContext, current_value: float | None = None) ->
         with zipfile.ZipFile(baseline_zip) as zf:
             zf.extractall(temp_ws)
         if task.build is not None:
-            build_res = run_cmd(
-                shlex.split(task.build.cmd), cwd=temp_ws,
-                timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
-            )
+            build_res = run_build_cmd(task, temp_ws)
             if build_res.returncode != task.build.expected_exit:
                 progress.on_message(
                     f"[agent]   Baseline re-measure build failed (rc={build_res.returncode}); keeping original baseline"

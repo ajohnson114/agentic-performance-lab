@@ -8,9 +8,14 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
 from perflab.tools.isolation import IsolationPolicy, wrap_command
 from perflab.tools.shell import CmdResult, resolve_cpu_plan, run_cmd
+
+if TYPE_CHECKING:
+    from perflab.task_spec import TaskSpec
 
 _GPU_PROGRAM_TYPES = {"cuda", "pytorch", "jax", "triton"}
 
@@ -77,6 +82,35 @@ def _resolve_rlimit(program_type: str | None, rlimit_as_gb: float | None) -> int
     if program_type in _GPU_PROGRAM_TYPES:
         return DEFAULT_GPU_RLIMIT_AS_BYTES
     return DEFAULT_RLIMIT_AS_BYTES
+
+
+def run_build_cmd(task: TaskSpec, cwd: Path) -> CmdResult:
+    """Run task.build.cmd with the same GPU-aware memory limit every build
+    call site needs. Caller must check task.build is not None first (every
+    current caller already branches on that before reaching here).
+
+    Every one of the half-dozen places in this codebase that invoke a task's
+    build step used to call run_cmd directly and never resolved a rlimit at
+    all -- silently falling back to run_cmd's bare 4GB CPU default regardless
+    of program_type. Confirmed on real H100 hardware: nvcc -arch=native
+    (unlike a hardcoded -arch=sm_90) queries the GPU driver at compile time
+    to auto-detect compute capability, creating a CUDA context that exceeds
+    4GB -- an opaque build failure (exit 1, no useful stderr) that hit
+    perflab/runners/pipeline.py's baseline build, perflab/ci.py's
+    ci-check build, optimizers/phases/autotune.py's per-combination
+    rebuild, and two separate build call sites in
+    optimizers/phases/evaluate.py (per-candidate build, and the
+    drift-detection baseline re-measure build) -- five bugs from one
+    missing line, found one exhausting real-API-cost run at a time. This is
+    the single funnel now; a future build call site that goes through this
+    function inherits the fix automatically instead of needing to remember it.
+    """
+    assert task.build is not None, "run_build_cmd called with no build step configured"
+    return run_cmd(
+        shlex.split(task.build.cmd), cwd=cwd,
+        timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
+        rlimit_as_bytes=_resolve_rlimit(task.program_type, task.constraints.rlimit_as_gb),
+    )
 
 
 def run_benchmark(

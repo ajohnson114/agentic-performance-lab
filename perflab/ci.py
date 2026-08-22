@@ -18,6 +18,7 @@ from perflab.analyzers.decision import (
 from perflab.runners.benchmark import (
     metric_value,
     run_benchmark,
+    run_build_cmd,
     validate_bench_variance,
     validate_contract,
 )
@@ -125,10 +126,7 @@ def _run_bench_full(task: TaskSpec) -> dict:
 
     # Build
     if task.build is not None:
-        import shlex
-
-        from perflab.tools.shell import run_cmd
-        bres = run_cmd(shlex.split(task.build.cmd), cwd=ws)
+        bres = run_build_cmd(task, ws)
         if bres.returncode != task.build.expected_exit:
             raise RuntimeError(f"Build failed with code {bres.returncode}")
 

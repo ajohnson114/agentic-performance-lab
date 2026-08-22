@@ -297,3 +297,67 @@ class TestOutDirNotCopied:
         ws.mkdir()
         ignore = workspace_copy_ignore(ws, ws)
         assert ignore(str(ws), ["algo.py"]) == set()
+
+
+class TestBuildArmUsesGpuRlimit:
+    def test_build_arm_uses_gpu_rlimit_for_gpu_program_types(self, tmp_path, monkeypatch):
+        # Confirmed on real H100 hardware: candidates that had just passed
+        # prescreen's own build (which disables rlimit entirely, via
+        # skip_preexec=True -- required for its ThreadPoolExecutor context)
+        # then failed here with an opaque exit 1 when the build needed to
+        # touch the GPU driver (nvcc -arch=native auto-detecting compute
+        # capability, unlike a hardcoded -arch=sm_90) under the unadorned
+        # 4GB CPU-default RLIMIT_AS this call used to fall back to.
+        # _build_arm now delegates to runners.benchmark.run_build_cmd (the
+        # shared funnel every build call site in the codebase goes through),
+        # so the spy patches run_cmd where that helper actually calls it.
+        import textwrap
+
+        import perflab.runners.benchmark as benchmark_mod
+        from perflab.task_spec import TaskSpec
+        from perflab.tools.shell import DEFAULT_GPU_RLIMIT_AS_BYTES
+
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        (ws / "out").mkdir()
+        task_file = ws / "task.yaml"
+        task_file.write_text(textwrap.dedent("""\
+            name: test-cuda-task
+            program_type: cuda
+            build: {cmd: "python build.py", expected_exit: 0}
+            correctness:
+              cmd: "python tests.py"
+              expected_exit: 0
+            benchmark:
+              cmd: "python bench.py --json out/bench.json"
+              metric:
+                name: tflops.median
+                mode: maximize
+              warmup: 1
+              repeats: 5
+            edit_policy:
+              allowed_paths:
+                - "*.cu"
+            constraints:
+              max_iters: 5
+              regression_tolerance: 0.02
+            contract:
+              fixed_params: {}
+              min_repeats: 1
+              required_bench_fields:
+                - ok
+        """), encoding="utf-8")
+        task = TaskSpec.load(task_file)
+        ctx = _make_ctx(task, tmp_path)
+
+        captured: dict = {}
+
+        def fake_run_cmd(argv, **kwargs):
+            captured["rlimit_as_bytes"] = kwargs.get("rlimit_as_bytes")
+            return _ok()
+
+        monkeypatch.setattr(benchmark_mod, "run_cmd", fake_run_cmd)
+        err = evaluate_mod._build_arm(ctx, ws)
+
+        assert err == ""
+        assert captured["rlimit_as_bytes"] == DEFAULT_GPU_RLIMIT_AS_BYTES

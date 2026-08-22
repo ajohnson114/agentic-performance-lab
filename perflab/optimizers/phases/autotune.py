@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from perflab.optimizers.history import make_history_entry
-from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
+from perflab.runners.benchmark import run_build_cmd
 
 if TYPE_CHECKING:
     from perflab.optimizers.agent import AgentContext
@@ -66,13 +66,7 @@ def _auto_tune_sweep(
 
             # Build if needed
             if task.build:
-                import shlex
-
-                from perflab.tools.shell import run_cmd
-                build_res = run_cmd(
-                    shlex.split(task.build.cmd), cwd=task.workspace,
-                    timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
-                )
+                build_res = run_build_cmd(task, task.workspace)
                 if build_res.returncode != 0:
                     continue
 

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from perflab.profilers.base import ProfileResult, run_bench_under
+from perflab.profilers.base import ProfileResult, current_bench_rlimit, run_bench_under
 from perflab.profilers.interval_union import union_duration
 from perflab.tools.shell import run_cmd
 
@@ -44,7 +44,7 @@ class NsysProfiler:
                 f"--output={sqlite_path}",
                 str(nsys_rep),
             ]
-            run_cmd(export_cmd, cwd=cwd)
+            run_cmd(export_cmd, cwd=cwd, rlimit_as_bytes=current_bench_rlimit())
 
         # Prefer SQLite parsing; fall back to regex-based stdout parsing
         if sqlite_path.exists():

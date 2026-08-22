@@ -75,6 +75,16 @@ def bench_rlimit(program_type: str | None, rlimit_as_gb: float | None) -> Iterat
         _BENCH_RLIMIT_AS_BYTES.reset(token)
 
 
+def current_bench_rlimit() -> int | None:
+    """The rlimit bench_rlimit() set for this block, for profiler code that
+    needs to call run_cmd directly instead of through run_bench_under (e.g.
+    ncu's --import/export step, nsys's sqlite export step: both are GPU
+    tooling that can need the same GPU-aware limit as the live profiled run,
+    but operate on an already-captured file rather than wrapping bench_cmd,
+    so they don't go through run_bench_under itself)."""
+    return _BENCH_RLIMIT_AS_BYTES.get()
+
+
 @dataclass
 class ProfileResult:
     name: str
