@@ -44,16 +44,20 @@ has no GPU) that has no CUDA toolkit installed. See
 ``optimizers.phases.evaluate._cuda_sanitizer_gate`` for that half; this
 module only answers "is compute-sanitizer available and what did it find."
 
-Parsing: compute-sanitizer prints a stable, tool-agnostic
-``ERROR SUMMARY: N error(s)`` line after the target process exits,
-regardless of the target's own exit code -- so a correctness assertion that
-fails for an unrelated reason does not masquerade as a sanitizer finding,
-and a sanitizer-flagged error is not masked by the target happening to exit
-0. When that line is *absent* (a crash before it could print, a timeout, an
-unexpected output format), the result is treated as unverified and NOT
-clean -- fail closed on ambiguity, the same stance every statistical gate in
-this codebase takes (see ``analyzers.decision``): a missing signal is never
-silently treated as a passing one.
+Parsing: compute-sanitizer prints a stable summary line after the target
+process exits, regardless of the target's own exit code -- so a
+correctness assertion that fails for an unrelated reason does not
+masquerade as a sanitizer finding, and a sanitizer-flagged error is not
+masked by the target happening to exit 0. The summary line's exact text is
+NOT tool-agnostic, though: memcheck prints ``ERROR SUMMARY: N error(s)``,
+but racecheck prints its own ``RACECHECK SUMMARY: N hazards displayed (X
+errors, Y warnings)`` instead (confirmed on real hardware) -- see
+``_SUMMARY_PATTERNS``, tried in order. When no pattern matches (a crash
+before either tool could print, a timeout, an unexpected output format),
+the result is treated as unverified and NOT clean -- fail closed on
+ambiguity, the same stance every statistical gate in this codebase takes
+(see ``analyzers.decision``): a missing signal is never silently treated as
+a passing one.
 """
 from __future__ import annotations
 
@@ -73,10 +77,20 @@ from perflab.tools.shell import run_cmd
 #: nvcc -- independent of program_type (see module docstring).
 _NVCC_RE = re.compile(r"(?:^|[\s/])nvcc(?:\.exe)?\b")
 
-#: compute-sanitizer's stable summary line, present for every tool
-#: (memcheck, racecheck, initcheck, synccheck) once the target process exits
-#: and the tool has finished reporting.
-_ERROR_SUMMARY_RE = re.compile(r"ERROR SUMMARY:\s*(\d+)\s*error", re.IGNORECASE)
+#: compute-sanitizer's summary line format differs by tool. memcheck (and,
+#: per NVIDIA's docs, initcheck/synccheck) print "ERROR SUMMARY: N error(s)".
+#: racecheck does NOT -- confirmed on real hardware (Nsight Compute / CUDA
+#: 12.8, H100): it prints its own "RACECHECK SUMMARY: N hazards displayed
+#: (X errors, Y warnings)" instead. A single ERROR-SUMMARY-only regex made
+#: every racecheck run "inconclusive" regardless of whether it was actually
+#: clean -- rejecting every real candidate on real hardware, silently,
+#: because every unit test fixture for racecheck used the wrong (copied
+#: from memcheck) summary format and never caught it. Patterns are tried in
+#: order; the first one that matches the combined output wins.
+_SUMMARY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"ERROR SUMMARY:\s*(\d+)\s*error", re.IGNORECASE),
+    re.compile(r"RACECHECK SUMMARY:.*?\(\s*(\d+)\s*errors?", re.IGNORECASE),
+)
 
 #: memcheck catches out-of-bounds/misaligned/illegal-address accesses;
 #: racecheck catches shared-memory hazards (the bug class a missing or
@@ -215,7 +229,11 @@ def _run_one_tool(
         env_mode="allowlist", pass_fds=spawn_fds,
     )
     combined = f"{res.stdout}\n{res.stderr}"
-    match = _ERROR_SUMMARY_RE.search(combined)
+    match = None
+    for pattern in _SUMMARY_PATTERNS:
+        match = pattern.search(combined)
+        if match:
+            break
     ran = match is not None
     errors = int(match.group(1)) if match else -1
     return SanitizerToolResult(

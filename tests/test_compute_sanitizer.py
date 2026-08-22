@@ -142,6 +142,11 @@ class TestRunComputeSanitizer:
 
         def _fake_run_cmd(argv, **kwargs):
             calls.append(argv)
+            # Real per-tool summary formats (see _SUMMARY_PATTERNS) -- using
+            # the same (memcheck-shaped) fixture for both tools is exactly
+            # what let the racecheck-format bug through undetected before.
+            if "racecheck" in argv:
+                return _cmd_result("========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n")
             return _cmd_result("========= ERROR SUMMARY: 0 errors\n")
 
         monkeypatch.setattr(cs, "run_cmd", _fake_run_cmd)
@@ -149,6 +154,8 @@ class TestRunComputeSanitizer:
             "python tests.py", tmp_path, tools=["memcheck", "racecheck"],
         )
         assert [r.tool for r in report.results] == ["memcheck", "racecheck"]
+        assert report.clean is True
+        assert all(r.ran for r in report.results)
         assert len(calls) == 2
         for argv, tool in zip(calls, ["memcheck", "racecheck"], strict=True):
             assert argv[0] == "compute-sanitizer"
@@ -156,6 +163,36 @@ class TestRunComputeSanitizer:
             assert "--target-processes" in argv and "all" in argv
             # The wrapped correctness command itself must still be present.
             assert argv[-2:] == ["python", "tests.py"]
+
+    def test_racecheck_clean_summary_format_parses_as_clean(self, tmp_path, monkeypatch):
+        # Real compute-sanitizer output captured on 2x-H100 hardware (CUDA
+        # 12.8). Before the fix, this was unconditionally treated as
+        # inconclusive/not-clean because it doesn't contain "ERROR SUMMARY:".
+        monkeypatch.setattr(
+            cs, "run_cmd",
+            lambda *a, **k: _cmd_result(
+                "========= COMPUTE-SANITIZER\n"
+                "ok {'M': 64, 'N': 64, 'K': 64}\n"
+                "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n"
+            ),
+        )
+        report = cs.run_compute_sanitizer("python tests.py", tmp_path, tools=["racecheck"])
+        assert report.results[0].ran is True
+        assert report.results[0].errors == 0
+        assert report.clean is True
+
+    def test_racecheck_dirty_summary_format_parses_error_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            cs, "run_cmd",
+            lambda *a, **k: _cmd_result(
+                "========= Race reported between Write access...\n"
+                "========= RACECHECK SUMMARY: 2 hazards displayed (2 errors, 0 warnings)\n"
+            ),
+        )
+        report = cs.run_compute_sanitizer("python tests.py", tmp_path, tools=["racecheck"])
+        assert report.results[0].ran is True
+        assert report.results[0].errors == 2
+        assert report.clean is False
 
     def test_wraps_target_processes_all_so_child_processes_are_covered(self, tmp_path, monkeypatch):
         # tests.py subprocess.run()s the compiled binary rather than exec-ing
