@@ -6,7 +6,7 @@ import logging
 import os
 import platform
 import subprocess
-import warnings
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -126,28 +126,47 @@ def collect_system_info() -> dict[str, Any]:
     except ImportError:
         pass
 
-    # JAX version and TPU detection
+    # JAX version and TPU detection -- run in a throwaway subprocess, never
+    # in-process. jax.devices() initializes JAX's runtime (background
+    # threads, heavier still with a CUDA/TPU backend actually present),
+    # which would leave THIS process multithreaded for the rest of its
+    # life. Every build/correctness/benchmark subprocess perflab spawns
+    # afterward goes through run_cmd's preexec_fn (rlimit/cpu pinning),
+    # which forces classic fork()+exec() instead of posix_spawn -- and
+    # fork() in a multithreaded process only carries over the calling
+    # thread, so a lock held by any other thread at fork time stays locked
+    # forever in the child. Confirmed on real GPU hardware: importing jax
+    # in-process here reliably broke the very next nvcc build in the same
+    # run with an opaque "Build failed with code 1", no matching stderr.
     try:
-        # Suppress JAX fork() warning — JAX is multithreaded and internally uses subprocess
-        # which calls os.fork(), triggering a harmless but noisy warning
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*os.fork.*multithreaded.*")
-            import jax
-            info["jax_version"] = jax.__version__
-            devices = jax.devices()
-        tpu_devices = [d for d in devices if d.platform == "tpu"]
-        if tpu_devices:
-            d0 = tpu_devices[0]
-            info["tpu_devices"] = [{
-                "name": str(d.device_kind),
-                "id": d.id,
-                "platform": d.platform,
-            } for d in tpu_devices]
-            info["tpu_chip"] = str(d0.device_kind)
-            info["tpu_count"] = len(tpu_devices)
-    except ImportError:
-        pass
-    except Exception:  # noqa: BLE001 -- best-effort hardware probe, must not abort sysinfo collection
+        probe = (
+            "import json, warnings\n"
+            "with warnings.catch_warnings():\n"
+            "    warnings.filterwarnings('ignore')\n"
+            "    import jax\n"
+            "    devices = jax.devices()\n"
+            "tpu = [d for d in devices if d.platform == 'tpu']\n"
+            "print(json.dumps({\n"
+            "    'jax_version': jax.__version__,\n"
+            "    'tpu_devices': [\n"
+            "        {'name': str(d.device_kind), 'id': d.id, 'platform': d.platform}\n"
+            "        for d in tpu\n"
+            "    ],\n"
+            "}))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            jax_info = json.loads(result.stdout.strip())
+            info["jax_version"] = jax_info["jax_version"]
+            tpu_devices = jax_info.get("tpu_devices") or []
+            if tpu_devices:
+                info["tpu_devices"] = tpu_devices
+                info["tpu_chip"] = tpu_devices[0]["name"]
+                info["tpu_count"] = len(tpu_devices)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError):
         logger.warning("JAX device detection failed", exc_info=True)
 
     # Triton version
