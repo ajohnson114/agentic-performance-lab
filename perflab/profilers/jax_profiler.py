@@ -199,11 +199,30 @@ def _collect_jax_trace_metrics(trace_dir: Path) -> dict:
     if not trace_dir.exists():
         return result
 
+    # KNOWN GAP, needs real GPU/TPU hardware to resolve (see
+    # validate-gpu-hardware.sh): a real trace captured on this machine's JAX
+    # CPU backend (jax 0.11.1) has every event's "cat" field as an empty
+    # string -- so the host/device/mxu_utilization categorization below
+    # never matches anything and this function silently returns {} even
+    # once files are found and parsed correctly. Unconfirmed whether this is
+    # CPU-backend-specific (plausible -- CPU has no real host/device split)
+    # or a broader trace-schema drift that also affects GPU/TPU. Until
+    # checked against a real accelerator trace, treat empty results from
+    # this function as inconclusive, not "no MXU activity."
+    #
+    # rglob, not glob: jax.profiler.trace()'s actual output layout is
+    # <trace_dir>/plugins/profile/<timestamp>/<hostname>.trace.json.gz (the
+    # standard TensorBoard-profiler-plugin directory convention) -- nothing
+    # is ever written directly under trace_dir itself. A non-recursive glob
+    # here found zero files against every real trace this was ever run
+    # against; verified empirically (jax.profiler.trace() on this machine
+    # writes exactly that nested+gzipped layout).
     trace_files = (
-        list(trace_dir.glob("*.trace.json"))
-        + list(trace_dir.glob("*.json"))
-        + list(trace_dir.glob("*.pb"))
-        + list(trace_dir.glob("*.xplane.pb"))
+        list(trace_dir.rglob("*.trace.json"))
+        + list(trace_dir.rglob("*.trace.json.gz"))
+        + list(trace_dir.rglob("*.json"))
+        + list(trace_dir.rglob("*.pb"))
+        + list(trace_dir.rglob("*.xplane.pb"))
     )
     if not trace_files:
         return result
@@ -212,16 +231,45 @@ def _collect_jax_trace_metrics(trace_dir: Path) -> dict:
     host_time_us: float = 0.0
     device_time_us: float = 0.0
     mxu_events: list[float] = []
+    # Same MXU samples, split by TPU chip index -- for multi-chip programs
+    # (SPMD across a pod slice) this reveals a straggler/idle chip that the
+    # blended mxu_utilization_pct average would hide. Resolved from pid via
+    # process_name metadata events below; chips that can't be resolved that
+    # way still count toward the aggregate mxu_events, just not this split.
+    mxu_events_by_device: dict[int, list[float]] = {}
     infeed_time_us: float = 0.0
     total_step_time_us: float = 0.0
 
     for tf in trace_files[:5]:  # Cap to avoid processing huge trace dirs
-        if not tf.suffix == ".json":
+        is_gz = tf.name.endswith(".json.gz")
+        if not (tf.suffix == ".json" or is_gz):
             continue
         try:
+            import gzip
             import json
-            data = json.loads(tf.read_text(encoding="utf-8", errors="replace"))
+            if is_gz:
+                with gzip.open(tf, "rt", encoding="utf-8", errors="replace") as f:
+                    raw_text = f.read()
+            else:
+                raw_text = tf.read_text(encoding="utf-8", errors="replace")
+            data = json.loads(raw_text)
             events = data if isinstance(data, list) else data.get("traceEvents", [])
+
+            # Resolve pid -> TPU chip index from process_name metadata events,
+            # e.g. {"ph": "M", "name": "process_name", "pid": 3,
+            #       "args": {"name": "/device:TPU:0"}}.
+            chip_by_pid: dict[object, int] = {}
+            for ev in events:
+                if not isinstance(ev, dict) or ev.get("ph") != "M":
+                    continue
+                if ev.get("name") != "process_name":
+                    continue
+                ev_args = ev.get("args", {})
+                label = ev_args.get("name", "") if isinstance(ev_args, dict) else ""
+                m = re.search(r"tpu[:_](\d+)", str(label), re.IGNORECASE)
+                if m and "pid" in ev:
+                    chip_by_pid[ev["pid"]] = int(m.group(1))
+
             # Per-file busy intervals: events overlap within a trace
             # (concurrent device streams, nested host spans), so wall-clock
             # time is the union of intervals, not the sum of durations.
@@ -257,7 +305,11 @@ def _collect_jax_trace_metrics(trace_dir: Path) -> dict:
                 args = ev.get("args", {})
                 if "mxu_utilization" in args:
                     try:
-                        mxu_events.append(float(args["mxu_utilization"]))
+                        val = float(args["mxu_utilization"])
+                        mxu_events.append(val)
+                        chip = chip_by_pid.get(ev.get("pid"))
+                        if chip is not None:
+                            mxu_events_by_device.setdefault(chip, []).append(val)
                     except (ValueError, TypeError):
                         pass
 
@@ -290,6 +342,12 @@ def _collect_jax_trace_metrics(trace_dir: Path) -> dict:
     if mxu_events:
         avg_mxu = sum(mxu_events) / len(mxu_events)
         result["mxu_utilization_pct"] = round(avg_mxu, 1)
+
+    if len(mxu_events_by_device) > 1:
+        result["mxu_utilization_pct_by_device"] = {
+            chip: round(sum(vals) / len(vals), 1)
+            for chip, vals in mxu_events_by_device.items()
+        }
 
     if infeed_time_us > 0 and total_step_time_us > 0:
         result["infeed_stall_pct"] = round(

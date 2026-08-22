@@ -37,10 +37,10 @@ class TestDemoTasksRootResolution:
         # Sorted, and every entry actually has a task.yaml on disk.
         assert names == sorted(names)
 
-    def test_iter_bundled_tasks_finds_all_eighteen(self) -> None:
-        # 17 real demo tasks + the _sample template.
+    def test_iter_bundled_tasks_finds_all_twenty_one(self) -> None:
+        # 20 real demo tasks + the _sample template.
         names = [name for name, _ in _iter_bundled_tasks()]
-        assert len(names) == 18
+        assert len(names) == 21
 
 
 class TestTasksList:

@@ -161,6 +161,9 @@ class LinuxPerfProfiler:
             hotspots = _parse_perf_script(script_path)
             if hotspots:
                 summary["hotspots"] = hotspots
+            cpu_pct_by_pid = _parse_perf_script_pid_shares(script_path)
+            if cpu_pct_by_pid:
+                summary["cpu_pct_by_pid"] = cpu_pct_by_pid
 
         # Parse annotated hotspots from perf annotate output
         if annotate_path.exists():
@@ -350,6 +353,63 @@ def _parse_perf_script(script_path: Path, top_n: int = 10) -> list[dict]:
         })
 
     return hotspots
+
+
+# perf script's default header line starts "<comm> <pid>[/<tid>] ...", e.g.
+# "python 12345/12345 4324.343434: 700000 cycles:" or "sched-messaging 1414
+# K 28690.636582: 4590 cycles". PID is always the first run of digits after
+# comm, optionally followed by "/<tid>". comm names containing internal
+# spaces (rare) won't match -- those samples simply aren't attributed to a
+# pid rather than being misparsed.
+_HEADER_PID_RE = re.compile(r"^\S+\s+(\d+)(?:/\d+)?\s")
+
+
+def _parse_perf_script_pid_shares(script_path: Path) -> dict[int, float]:
+    """Per-process share of total samples, gated to multi-process traces only.
+
+    perf inherits into every forked/exec'd child of the traced command by
+    default (perflab launches it directly, not via --pid attach), so a
+    multiprocessing.Pool / ProcessPoolExecutor benchmark's samples already
+    span every worker's pid. _parse_perf_script's hotspot list intentionally
+    stays a single cross-process ranking -- the right question for "which
+    function should I optimize" when workers run identical code. This
+    answers a different question: is the work itself evenly spread across
+    workers, or is one straggling or hogging the CPU?
+    """
+    if not script_path.exists():
+        return {}
+
+    text = script_path.read_text(encoding="utf-8", errors="replace")
+    if not text.strip():
+        return {}
+
+    pid_counts: dict[int, int] = {}
+    total = 0
+    expect_self = False
+    current_pid: int | None = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            expect_self = False
+            continue
+
+        if not line[0].isspace():
+            expect_self = True
+            m = _HEADER_PID_RE.match(line)
+            current_pid = int(m.group(1)) if m else None
+            continue
+
+        if expect_self:
+            expect_self = False
+            total += 1
+            if current_pid is not None:
+                pid_counts[current_pid] = pid_counts.get(current_pid, 0) + 1
+
+    if len(pid_counts) <= 1 or total == 0:
+        return {}
+
+    return {pid: round(count / total * 100.0, 1) for pid, count in pid_counts.items()}
 
 
 def _parse_perf_annotate(annotate_path: Path, min_pct: float = 1.0) -> list[dict]:

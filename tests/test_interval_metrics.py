@@ -57,16 +57,20 @@ class TestUnionDuration:
 # ---------------------------------------------------------------------------
 
 def _make_kernel_db(rows):
-    """In-memory nsys-like SQLite DB with CUPTI kernel rows (start, end, streamId)."""
+    """In-memory nsys-like SQLite DB with CUPTI kernel rows (start, end, streamId).
+
+    All rows land on deviceId 0 -- these tests are about interval-union math
+    within a single device, not multi-GPU disambiguation (see test_nsys_profiler.py).
+    """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
-        "(start INTEGER, end INTEGER, streamId INTEGER, "
+        "(start INTEGER, end INTEGER, streamId INTEGER, deviceId INTEGER, "
         " demangledName TEXT, correlationId INTEGER)"
     )
     conn.executemany(
-        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL (start, end, streamId) VALUES (?, ?, ?)",
+        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL (start, end, streamId, deviceId) VALUES (?, ?, ?, 0)",
         rows,
     )
     return conn
@@ -168,11 +172,136 @@ class TestTorchTraceCpuVsGpu:
         assert cg["total_cpu_op_us"] == pytest.approx(600.0)
 
 
+class TestTorchTraceMultiGpu:
+    """Kineto stamps args["device"] on every GPU kernel/memcpy event -- these
+    lock in that _parse_torch_trace actually uses it to build a per-device
+    breakdown, the same way nsys_profiler.py's deviceId column does."""
+
+    def test_idle_device_visible_in_breakdown(self, tmp_path):
+        """GPU 0 covers the whole span; GPU 1 is only busy for its first 10%.
+        The aggregate cpu_vs_gpu union alone would mask GPU 1 being mostly idle."""
+        events = [
+            {"ph": "X", "name": "kern_a", "cat": "kernel", "ts": 0, "dur": 1000,
+             "args": {"device": 0}},
+            {"ph": "X", "name": "kern_b", "cat": "kernel", "ts": 0, "dur": 100,
+             "args": {"device": 1}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        assert result["cpu_vs_gpu"]["total_gpu_kernel_us"] == pytest.approx(1000.0)
+        by_device = result["gpu_active_pct_by_device"]
+        assert by_device[0] == pytest.approx(100.0)
+        assert by_device[1] == pytest.approx(10.0)
+
+    def test_single_device_no_breakdown(self, tmp_path):
+        """Single-GPU traces get no gpu_active_pct_by_device key at all --
+        output stays identical to before this feature existed."""
+        events = [
+            {"ph": "X", "name": "kern_a", "cat": "kernel", "ts": 0, "dur": 100,
+             "args": {"device": 0}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        assert "gpu_active_pct_by_device" not in result
+
+    def test_events_without_device_arg_excluded_from_breakdown(self, tmp_path):
+        """A GPU event with no resolvable device still counts in the
+        aggregate union, but can't participate in the per-device split."""
+        events = [
+            {"ph": "X", "name": "kern_a", "cat": "kernel", "ts": 0, "dur": 100,
+             "args": {"device": 0}},
+            {"ph": "X", "name": "kern_b", "cat": "kernel", "ts": 0, "dur": 100},
+            {"ph": "X", "name": "kern_c", "cat": "kernel", "ts": 0, "dur": 100,
+             "args": {"device": 1}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        assert result["cpu_vs_gpu"]["total_gpu_kernel_us"] == pytest.approx(100.0)
+        assert set(result["gpu_active_pct_by_device"].keys()) == {0, 1}
+
+    def test_per_device_dominant_kernel_breakdown(self, tmp_path):
+        """GPU 0 dominated by sgemm, GPU 1 by conv2d -- the device-blind
+        top_gpu_kernels ranking sums both into one list and can't show this."""
+        events = [
+            {"ph": "X", "name": "sgemm", "cat": "kernel", "ts": 0, "dur": 900,
+             "args": {"device": 0}},
+            {"ph": "X", "name": "relu", "cat": "kernel", "ts": 900, "dur": 100,
+             "args": {"device": 0}},
+            {"ph": "X", "name": "conv2d", "cat": "kernel", "ts": 0, "dur": 950,
+             "args": {"device": 1}},
+            {"ph": "X", "name": "relu", "cat": "kernel", "ts": 950, "dur": 50,
+             "args": {"device": 1}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        by_device = result["top_gpu_kernels_by_device"]
+        assert by_device[0][0]["name"] == "sgemm"
+        assert by_device[1][0]["name"] == "conv2d"
+
+    def test_single_device_no_kernel_breakdown(self, tmp_path):
+        events = [
+            {"ph": "X", "name": "sgemm", "cat": "kernel", "ts": 0, "dur": 100,
+             "args": {"device": 0}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        assert "top_gpu_kernels_by_device" not in result
+
+    def test_nccl_pct_and_per_device_breakdown(self, tmp_path):
+        events = [
+            # GPU 0: 90% compute, 10% NCCL
+            {"ph": "X", "name": "sgemm", "cat": "kernel", "ts": 0, "dur": 900,
+             "args": {"device": 0}},
+            {"ph": "X", "name": "ncclKernel_AllReduce_RING", "cat": "kernel", "ts": 900, "dur": 100,
+             "args": {"device": 0}},
+            # GPU 1: 50% compute, 50% NCCL -- lagging on the collective
+            {"ph": "X", "name": "sgemm", "cat": "kernel", "ts": 0, "dur": 500,
+             "args": {"device": 1}},
+            {"ph": "X", "name": "ncclKernel_AllReduce_RING", "cat": "kernel", "ts": 500, "dur": 500,
+             "args": {"device": 1}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        assert result["nccl_pct"] == pytest.approx(30.0)  # (100 + 500) / 2000
+        by_device = result["nccl_pct_by_device"]
+        assert by_device[0] == pytest.approx(10.0)
+        assert by_device[1] == pytest.approx(50.0)
+
+    def test_no_nccl_kernels_no_keys(self, tmp_path):
+        events = [
+            {"ph": "X", "name": "sgemm", "cat": "kernel", "ts": 0, "dur": 100,
+             "args": {"device": 0}},
+        ]
+        result = _parse_torch_trace(_write_trace(tmp_path, events))
+        assert "nccl_pct" not in result
+        assert "nccl_pct_by_device" not in result
+
+
 # ---------------------------------------------------------------------------
 # jax trace host/device split and infeed stall
 # ---------------------------------------------------------------------------
 
 class TestJaxTraceMetrics:
+    def test_finds_real_nested_gzipped_trace_layout(self, tmp_path):
+        """jax.profiler.trace(log_dir) actually writes
+        <log_dir>/plugins/profile/<timestamp>/<hostname>.trace.json.gz --
+        verified empirically against a real trace, not assumed. Nothing is
+        ever written directly under log_dir itself, and the file is
+        gzip-compressed. A non-recursive, non-gzip-aware glob (the
+        pre-existing code) finds zero files against every real trace ever
+        produced -- this must not regress back to that."""
+        import gzip
+
+        nested = tmp_path / "plugins" / "profile" / "2026_08_20_12_00_00"
+        nested.mkdir(parents=True)
+        trace = {
+            "traceEvents": [
+                {"cat": "device", "name": "matmul", "ts": 0, "dur": 100},
+                {"cat": "host", "name": "prep", "ts": 200, "dur": 50},
+            ]
+        }
+        gz_path = nested / "somehost.trace.json.gz"
+        with gzip.open(gz_path, "wt", encoding="utf-8") as f:
+            f.write(json.dumps(trace))
+
+        result = _collect_jax_trace_metrics(tmp_path)
+        assert result["device_time_us"] == pytest.approx(100.0)
+        assert result["host_time_us"] == pytest.approx(50.0)
+
     def test_concurrent_device_events_use_union(self, tmp_path):
         trace = {
             "traceEvents": [
@@ -219,3 +348,39 @@ class TestJaxTraceMetrics:
         result = _collect_jax_trace_metrics(tmp_path)
         assert result["host_time_us"] == 8000.0
         assert result["device_time_us"] == 15000.0
+
+    def test_per_chip_mxu_breakdown_reveals_idle_chip(self, tmp_path):
+        """A blended mxu_utilization_pct average can look healthy even when
+        one chip in a multi-chip SPMD program is mostly idle; the per-chip
+        breakdown (resolved from pid via process_name metadata) must not."""
+        trace = {
+            "traceEvents": [
+                {"ph": "M", "name": "process_name", "pid": 1,
+                 "args": {"name": "/device:TPU:0"}},
+                {"ph": "M", "name": "process_name", "pid": 2,
+                 "args": {"name": "/device:TPU:1"}},
+                {"cat": "device", "name": "step", "pid": 1, "ts": 0, "dur": 100,
+                 "args": {"mxu_utilization": 95.0}},
+                {"cat": "device", "name": "step", "pid": 2, "ts": 0, "dur": 100,
+                 "args": {"mxu_utilization": 10.0}},
+            ]
+        }
+        (tmp_path / "trace.json").write_text(json.dumps(trace))
+        result = _collect_jax_trace_metrics(tmp_path)
+        assert result["mxu_utilization_pct"] == pytest.approx(52.5)
+        by_chip = result["mxu_utilization_pct_by_device"]
+        assert by_chip[0] == pytest.approx(95.0)
+        assert by_chip[1] == pytest.approx(10.0)
+
+    def test_single_chip_no_mxu_breakdown(self, tmp_path):
+        trace = {
+            "traceEvents": [
+                {"ph": "M", "name": "process_name", "pid": 1,
+                 "args": {"name": "/device:TPU:0"}},
+                {"cat": "device", "name": "step", "pid": 1, "ts": 0, "dur": 100,
+                 "args": {"mxu_utilization": 95.0}},
+            ]
+        }
+        (tmp_path / "trace.json").write_text(json.dumps(trace))
+        result = _collect_jax_trace_metrics(tmp_path)
+        assert "mxu_utilization_pct_by_device" not in result

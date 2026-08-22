@@ -37,6 +37,12 @@ class AnalysisThresholds:
     nsys_kernel_dominance_pct: float = 80.0
     nsys_kernel_gap_us: float = 50.0
     nsys_transfer_ratio: float = 0.2
+    nsys_gpu_imbalance_pct: float = 30.0  # flag if busiest/idlest GPU active_pct spread > 30pp
+
+    # -- Communication (NCCL) -- shared across nsys and torch-profiler, both
+    # of which detect NCCL kernels by name pattern rather than a profiler-
+    # specific mechanism, so one threshold covers both sources.
+    nccl_time_pct_high: float = 20.0  # flag if NCCL collectives take > 20% of GPU time
 
     # -- Linux perf --
     perf_ipc_low: float = 1.0

@@ -574,6 +574,7 @@ def generate_reports(p: ReportParams) -> dict:
                     "category": a.category,
                     "gpu_pct": a.gpu_pct,
                     "gpu_time_ms": a.gpu_time_ms,
+                    "device_id": a.device_id,
                     "diagnosis": a.diagnosis,
                     "suggestions": a.suggestions,
                 }

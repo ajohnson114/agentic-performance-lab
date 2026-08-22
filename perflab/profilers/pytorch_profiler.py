@@ -45,12 +45,20 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
     # Categorize events
     op_stats: dict[str, dict] = {}       # all ph=X events by name
     gpu_kernel_stats: dict[str, dict] = {}  # cat=kernel events
+    # Same, split by device -- see gpu_kernel_intervals_by_device below for
+    # why (and why top_gpu_kernels itself stays a single cross-device ranking).
+    gpu_kernel_stats_by_device: dict[int, dict[str, dict]] = {}
     cpu_op_stats: dict[str, dict] = {}      # cat=cpu_op/operator events
     raw_cpu_ops: list[dict] = []             # timestamped CPU ops for temporal cross-ref
     # Busy intervals for wall-clock metrics: GPU kernels can run concurrently
     # on multiple streams and CPU op spans nest, so summing durations
     # double-counts. Events without a timestamp fall back to plain sums.
     gpu_kernel_intervals: list[tuple[float, float]] = []
+    # Same intervals, split by CUDA device index (args["device"], which
+    # Kineto stamps on every GPU kernel/memcpy event) for multi-GPU imbalance
+    # detection. Events without a resolvable device are excluded here but
+    # still counted in the aggregate gpu_kernel_intervals above.
+    gpu_kernel_intervals_by_device: dict[int, list[tuple[float, float]]] = {}
     gpu_kernel_no_ts_us = 0.0
     cpu_op_intervals: list[tuple[float, float]] = []
     cpu_op_no_ts_us = 0.0
@@ -96,9 +104,21 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
                 gpu_kernel_stats[name] = {"total_us": 0.0, "count": 0}
             gpu_kernel_stats[name]["total_us"] += float(dur)
             gpu_kernel_stats[name]["count"] += 1
+
+            device_id = args.get("device") if isinstance(args, dict) else None
+            if isinstance(device_id, int):
+                dev_stats = gpu_kernel_stats_by_device.setdefault(device_id, {})
+                if name not in dev_stats:
+                    dev_stats[name] = {"total_us": 0.0, "count": 0}
+                dev_stats[name]["total_us"] += float(dur)
+                dev_stats[name]["count"] += 1
+
             gpu_ts = ev.get("ts")
             if isinstance(gpu_ts, (int, float)):
-                gpu_kernel_intervals.append((float(gpu_ts), float(gpu_ts) + float(dur)))
+                interval = (float(gpu_ts), float(gpu_ts) + float(dur))
+                gpu_kernel_intervals.append(interval)
+                if isinstance(device_id, int):
+                    gpu_kernel_intervals_by_device.setdefault(device_id, []).append(interval)
             else:
                 gpu_kernel_no_ts_us += float(dur)
 
@@ -223,6 +243,55 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
         except (KeyError, TypeError, ZeroDivisionError):
             logger.warning("Failed to compute top GPU kernels", exc_info=True)
 
+    # Per-device top-kernel breakdown, gated to multi-GPU traces only.
+    # top_gpu_kernels above intentionally stays a single cross-device ranking
+    # (see nsys_profiler._extract_top_kernels_by_device for the reasoning).
+    if len(gpu_kernel_stats_by_device) > 1:
+        try:
+            top_gpu_by_device: dict[int, list[dict]] = {}
+            for dev, stats_by_name in gpu_kernel_stats_by_device.items():
+                dev_total_us = sum(s["total_us"] for s in stats_by_name.values())
+                sorted_dev = sorted(stats_by_name.items(), key=lambda x: x[1]["total_us"], reverse=True)
+                entries = []
+                for kname, stats in sorted_dev[:top_n]:
+                    pct = (stats["total_us"] / dev_total_us * 100.0) if dev_total_us > 0 else 0.0
+                    entries.append({
+                        "name": kname,
+                        "total_us": round(stats["total_us"], 1),
+                        "count": stats["count"],
+                        "pct": round(pct, 1),
+                    })
+                top_gpu_by_device[dev] = entries
+            if top_gpu_by_device:
+                result["top_gpu_kernels_by_device"] = top_gpu_by_device
+        except (KeyError, TypeError, ZeroDivisionError):
+            logger.warning("Failed to compute per-device top GPU kernels", exc_info=True)
+
+    # NCCL (collective communication) time as a fraction of GPU time.
+    # Name-pattern match only (see nsys_profiler._extract_nccl_time for the
+    # same reasoning) -- reuses gpu_kernel_stats/_by_device already built above.
+    if gpu_kernel_stats:
+        try:
+            total_gpu_us = sum(s["total_us"] for s in gpu_kernel_stats.values())
+            nccl_us = sum(s["total_us"] for name, s in gpu_kernel_stats.items() if "nccl" in name.lower())
+            if nccl_us > 0 and total_gpu_us > 0:
+                result["nccl_time_us"] = round(nccl_us, 1)
+                result["nccl_pct"] = round(nccl_us / total_gpu_us * 100.0, 1)
+
+                if len(gpu_kernel_stats_by_device) > 1:
+                    nccl_by_device: dict[int, float] = {}
+                    for dev, stats_by_name in gpu_kernel_stats_by_device.items():
+                        dev_total_us = sum(s["total_us"] for s in stats_by_name.values())
+                        dev_nccl_us = sum(
+                            s["total_us"] for name, s in stats_by_name.items() if "nccl" in name.lower()
+                        )
+                        if dev_total_us > 0:
+                            nccl_by_device[dev] = round(dev_nccl_us / dev_total_us * 100.0, 1)
+                    if nccl_by_device:
+                        result["nccl_pct_by_device"] = nccl_by_device
+        except (KeyError, TypeError, ZeroDivisionError):
+            logger.warning("Failed to compute NCCL time fraction", exc_info=True)
+
     # CPU vs GPU breakdown.
     # Interval-union rather than summed durations: concurrent GPU kernels
     # (multiple streams) and nested CPU op spans would otherwise double-count
@@ -239,6 +308,24 @@ def _parse_torch_trace(trace_path: Path, top_n: int = 10) -> dict:
             }
     except (KeyError, TypeError, ZeroDivisionError):
         pass
+
+    # Per-device GPU utilization breakdown: same union-of-busy-intervals math
+    # as cpu_vs_gpu.total_gpu_kernel_us above, but split per CUDA device and
+    # normalized against the *same* shared span so devices are directly
+    # comparable. The aggregate union can look fully busy even when one GPU
+    # is idle while another covers the whole window -- this is what catches
+    # that (mirrors nsys_profiler.py's gpu_active_pct_by_device).
+    if len(gpu_kernel_intervals_by_device) > 1 and gpu_kernel_intervals:
+        try:
+            span_us = max(e for _, e in gpu_kernel_intervals) - min(s for s, _ in gpu_kernel_intervals)
+            if span_us > 0:
+                by_device: dict[int, float] = {}
+                for dev, intervals in gpu_kernel_intervals_by_device.items():
+                    busy_us = union_duration(intervals)
+                    by_device[dev] = round(busy_us / span_us * 100.0, 1)
+                result["gpu_active_pct_by_device"] = by_device
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass
 
     # Memory summary
     try:

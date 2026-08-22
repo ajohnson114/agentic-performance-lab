@@ -22,6 +22,7 @@ from perflab.optimizers.progress import (
     usage_output_tokens,
 )
 from perflab.optimizers.prompt import PromptContext, build_prompt, parse_candidates
+from perflab.optimizers.tool_loop import run_tool_loop
 from perflab.task_spec import TaskSpec
 
 if TYPE_CHECKING:
@@ -260,6 +261,7 @@ def _build_gpu_context(
                         "gpu_time_ms": e.gpu_time_ms,
                         "gpu_pct": e.gpu_pct,
                         "launch_overhead_us": e.launch_overhead_us,
+                        "device_id": e.device_id,
                         "caller_function": e.caller_function,
                         "framework_op": e.framework_op,
                         "diagnosis": e.diagnosis,
@@ -599,6 +601,10 @@ def build_iteration_prompt(ctx: AgentContext) -> tuple[list, list[dict] | None]:
     )
     messages = build_prompt(prompt_ctx)
     ctx.prev_summaries = profiler_summaries
+    # Also on ctx (not just the local var above) so the generate-phase tool
+    # loop's diagnostic tools (get_bottlenecks, get_kernel_dossier, ...) see
+    # the same data this prompt was built from.
+    ctx.profiler_summaries = profiler_summaries
     return messages, build_flag_dicts
 
 
@@ -632,8 +638,8 @@ def run(ctx: AgentContext) -> GenerateResult:
 
     llm_t0 = time.monotonic()
     try:
-        result = provider.complete(
-            messages,
+        result = run_tool_loop(
+            provider, messages, ctx,
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
         )
@@ -647,8 +653,8 @@ def run(ctx: AgentContext) -> GenerateResult:
             emergency_budget = current_tokens // 2  # halve the prompt
             messages = _trim_to_budget(messages, emergency_budget)
             try:
-                result = provider.complete(
-                    messages,
+                result = run_tool_loop(
+                    provider, messages, ctx,
                     temperature=llm_config.temperature,
                     max_tokens=llm_config.max_tokens,
                 )

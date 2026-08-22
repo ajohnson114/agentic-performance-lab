@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from perflab.analyzers.bottleneck_gpu import detect_gpu_imbalance
 from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis, Evidence
 
 
@@ -85,6 +86,19 @@ def _analyze_perf(
             ],
             evidence=Evidence(level="derived", rule_id="perf_hotspot_dominance_pct", metrics={"hotspot_pct": hs.get("pct", 0), "threshold": thresholds.perf_hotspot_dominance_pct}),
         ))
+
+    # Multi-process CPU imbalance: perf inherits into every forked/exec'd
+    # child of the traced command by default, so a multiprocessing.Pool /
+    # ProcessPoolExecutor benchmark's samples already span every worker's
+    # pid (see _parse_perf_script_pid_shares in linux_perf.py). Reuses
+    # detect_gpu_imbalance -- a per-process "% of total samples" share is
+    # the same 0-100-per-entity utilization shape as per-device active_pct.
+    proc_imbalance = detect_gpu_imbalance(
+        summary.get("cpu_pct_by_pid"), thresholds, rule_id="perf_cpu_imbalance_pct",
+        device_label="Worker", metric_label="CPU share",
+    )
+    if proc_imbalance is not None:
+        findings.append(proc_imbalance)
 
     # Rule A — Single-threaded execution
     cpus_utilized = summary.get("cpus_utilized")

@@ -9,7 +9,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from perflab.llm.base import CompletionResult, Message
+from perflab.llm.base import CompletionResult, Message, ToolSpec
 from perflab.llm.config import PROVIDER_DEFAULT_MODELS
 
 # Allowed hosts for Ollama API to prevent SSRF.
@@ -108,6 +108,12 @@ class OllamaProvider:
         except Exception:  # noqa: BLE001 -- best-effort availability probe, any failure means unavailable
             return False
 
+    def supports_tools(self) -> bool:
+        # Tool-calling support varies wildly by locally-installed model; a
+        # tool loop must fall back to single-shot for this provider rather
+        # than assume it works.
+        return False
+
     def complete(
         self,
         messages: Sequence[Message],
@@ -116,7 +122,10 @@ class OllamaProvider:
         max_tokens: int = 4096,
         json_mode: bool = False,
         stop: Sequence[str] | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> CompletionResult:
+        if tools:
+            raise NotImplementedError("OllamaProvider does not support tool calling yet (supports_tools() is False)")
         url = f"{self.api_base.rstrip('/')}/api/chat"
         payload: dict = {
             "model": self.model,

@@ -40,6 +40,24 @@ class TestBuildCpuGpuCallGraph:
     def test_empty_correlations(self):
         assert build_cpu_gpu_call_graph([]) == []
 
+    def test_device_id_disambiguates_same_stream_id(self):
+        """Same kernel/stream_id on two different GPUs must stay separate edges.
+
+        CUDA assigns stream IDs per-device, so on a multi-GPU trace the same
+        stream_id is reused across devices; grouping on stream_id alone would
+        wrongly merge kernels launched on different GPUs into one edge.
+        """
+        correlations = [
+            {"api_name": "cudaLaunchKernel", "kernel_name": "sgemm", "stream_id": 7,
+             "device_id": 0, "gpu_duration_ns": 5_000_000, "launch_overhead_ns": 10_000},
+            {"api_name": "cudaLaunchKernel", "kernel_name": "sgemm", "stream_id": 7,
+             "device_id": 1, "gpu_duration_ns": 5_000_000, "launch_overhead_ns": 10_000},
+        ]
+        edges = build_cpu_gpu_call_graph(correlations)
+        assert len(edges) == 2
+        assert {e.device_id for e in edges} == {0, 1}
+        assert all(e.count == 1 for e in edges)
+
 
 class TestAttributionRanking:
     def test_top_kernel_gets_rank_1(self):
@@ -80,8 +98,8 @@ class TestAttributionRanking:
 
 class TestPipelineStalls:
     def test_idle_stream_detected(self):
-        per_stream_gaps = {1: {"avg_gap_us": 200, "max_gap_us": 500, "num_gaps": 10}}
-        stream_util = {1: {"active_pct": 30, "kernel_count": 20, "total_kernel_ms": 5}}
+        per_stream_gaps = {"0:1": {"device_id": 0, "stream_id": 1, "avg_gap_us": 200, "max_gap_us": 500, "num_gaps": 10}}
+        stream_util = {"0:1": {"device_id": 0, "stream_id": 1, "active_pct": 30, "kernel_count": 20, "total_kernel_ms": 5}}
         entries = detect_pipeline_stalls(per_stream_gaps, stream_util)
         assert len(entries) >= 1
         assert entries[0].category == "pipeline-stall"
@@ -90,14 +108,28 @@ class TestPipelineStalls:
     def test_multi_stream_serialization(self):
         per_stream_gaps = {}
         stream_util = {
-            1: {"active_pct": 90, "kernel_count": 100, "total_kernel_ms": 50},
-            2: {"active_pct": 10, "kernel_count": 5, "total_kernel_ms": 2},
+            "0:1": {"device_id": 0, "stream_id": 1, "active_pct": 90, "kernel_count": 100, "total_kernel_ms": 50},
+            "0:2": {"device_id": 0, "stream_id": 2, "active_pct": 10, "kernel_count": 5, "total_kernel_ms": 2},
         }
         entries = detect_pipeline_stalls(per_stream_gaps, stream_util)
         assert any("imbalance" in e.diagnosis.lower() for e in entries)
 
     def test_empty_data(self):
         assert detect_pipeline_stalls({}, {}) == []
+
+    def test_multi_gpu_keys_do_not_collide(self):
+        """Stream 1 idle on GPU 0 but busy on GPU 1 must report exactly one stall,
+        naming the GPU it occurred on -- a stream_id-only key would either merge
+        the two entries or (depending on dict ordering) mask the real stall."""
+        per_stream_gaps = {"0:1": {"max_gap_us": 500}, "1:1": {"max_gap_us": 20}}
+        stream_util = {
+            "0:1": {"device_id": 0, "stream_id": 1, "active_pct": 20, "kernel_count": 10},
+            "1:1": {"device_id": 1, "stream_id": 1, "active_pct": 95, "kernel_count": 200},
+        }
+        entries = detect_pipeline_stalls(per_stream_gaps, stream_util)
+        assert len(entries) == 1
+        assert entries[0].device_id == 0
+        assert "GPU 0" in entries[0].diagnosis
 
 
 class TestCorrelationExtraction:

@@ -1,0 +1,61 @@
+name: "multi_gpu_matmul_cuda"
+workspace: "tasks/multi_gpu_matmul/cuda"
+program_type: "cuda"
+# Requires >=2 visible CUDA devices (the binary itself raises a clear error
+# otherwise, via cudaGetDeviceCount()). Not tied to a specific GPU model --
+# runs on any 2x+ GPU box, e.g. a multi-GPU RunPod instance. Needs the NCCL
+# development package installed (libnccl-dev on Debian/Ubuntu -- already
+# part of setup-h100.sh's target environment).
+target_hardware: null
+
+build:
+  # -lnccl requires libnccl-dev (or equivalent) to be installed; NCCL ships
+  # as part of the standard CUDA-toolkit-adjacent stack on multi-GPU boxes.
+  cmd: "nvcc -O2 -arch=native -o sgemm_multi_gpu_bin sgemm_multi_gpu.cu -lnccl"
+  expected_exit: 0
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 8
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.8         # NCCL sync adds some host-visible overhead vs a pure single-GPU matmul
+  ncu_sm_util_low: 60.0          # lower than matmul/cuda's 70 -- multi-GPU sync overhead eats into per-kernel SM occupancy
+  sync_count_warn: 4             # per-device stream syncs are expected here
+  nsys_gpu_imbalance_pct: 15.0   # tighter than the 30pp default -- imbalance is the whole point of this task
+  nccl_time_pct_high: 5.0        # lower than the 20% default -- surface any NCCL share, not just a dominant one
+
+contract:
+  # Pinned so a candidate can't "optimize" by shrinking the problem, and so
+  # num_gpus in bench.json reflects real hardware rather than the agent
+  # quietly making the task single-GPU to dodge the imbalance/NCCL findings.
+  fixed_params: { M: 4096, N: 4096, K: 4096 }
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops", "num_gpus"]
+
+data_hints:
+  sparsity: 0.0
+  dtype_safety: "fp32_safe"
+  access_pattern: "naive"        # naive per-thread kernel, not yet optimized
+  value_range: [-0.5, 0.5]
+
+edit_policy:
+  allowed_paths:
+    - "sgemm_multi_gpu.cu"
+
+out_dir: "../../out"

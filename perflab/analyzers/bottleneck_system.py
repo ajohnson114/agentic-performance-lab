@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import re
 
+from perflab.analyzers.bottleneck_gpu import (
+    detect_communication_bound,
+    detect_gpu_imbalance,
+    detect_per_device_kernel_divergence,
+)
 from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis, Evidence
 
 
@@ -32,6 +37,20 @@ def _analyze_tpu(
             ],
             evidence=Evidence(level="derived", rule_id="tpu_mxu_util_low", metrics={"mxu_utilization_pct": mxu_util, "threshold": thresholds.tpu_mxu_util_low}),
         ))
+
+    # Rule 1b: Multi-chip MXU imbalance -- reuses detect_gpu_imbalance from
+    # bottleneck_gpu.py. Its (busiest vs idlest, 0-100 utilization-per-device)
+    # heuristic is generic; per-chip MXU% fits the same shape as per-device
+    # GPU active_pct, so no TPU-specific detector was needed. JAX's SPMD model
+    # means every chip normally runs the *same* program, so an MXU spread
+    # here usually means uneven sharding, a straggler chip, or a collective
+    # (all-reduce/all-gather) stalling the faster chips.
+    mxu_imbalance = detect_gpu_imbalance(
+        jax_summary.get("mxu_utilization_pct_by_device"), thresholds, rule_id="tpu_mxu_imbalance_pct",
+        device_label="TPU chip", metric_label="MXU utilization",
+    )
+    if mxu_imbalance is not None:
+        findings.append(mxu_imbalance)
 
     # Rule 2: Padding waste from HLO analysis
     hlo_ops = jax_summary.get("hlo_ops", [])
@@ -239,6 +258,15 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
                 evidence=Evidence(level="derived", rule_id="gpu_cpu_ratio_low", metrics={"gpu_cpu_ratio": ratio, "threshold": thresholds.gpu_cpu_ratio_low}),
             ))
 
+    # Multi-GPU load imbalance (see bottleneck_gpu.detect_gpu_imbalance;
+    # same heuristic nsys uses, computed here from the torch-trace pid/device
+    # breakdown instead of nsys's CUPTI_ACTIVITY_KIND_KERNEL.deviceId).
+    imbalance = detect_gpu_imbalance(
+        summary.get("gpu_active_pct_by_device"), thresholds, rule_id="torch_gpu_imbalance_pct"
+    )
+    if imbalance is not None:
+        findings.append(imbalance)
+
     # Excessive synchronization
     sync_count = summary.get("sync_count", 0)
     total_sync_us = summary.get("total_sync_time_us", 0)
@@ -294,6 +322,22 @@ def _analyze_torch_trace(summary: dict, *, device: str | None = None, thresholds
             ],
             evidence=Evidence(level="derived", rule_id="gpu_kernel_dominance_pct", metrics={"kernel_pct": k.get("pct", 0), "threshold": thresholds.gpu_kernel_dominance_pct}),
         ))
+
+    # Per-device kernel divergence (see bottleneck_gpu.detect_per_device_kernel_divergence)
+    divergence = detect_per_device_kernel_divergence(
+        summary.get("top_gpu_kernels_by_device"),
+        top_gpu[0]["name"] if top_gpu else None,
+        thresholds, rule_id="torch_kernel_divergence_pct",
+    )
+    if divergence is not None:
+        findings.append(divergence)
+
+    # NCCL communication time (see bottleneck_gpu.detect_communication_bound)
+    comm_bound = detect_communication_bound(
+        summary.get("nccl_pct"), thresholds, rule_id="torch_nccl_time_pct_high"
+    )
+    if comm_bound is not None:
+        findings.append(comm_bound)
 
     # -- Per-phase training breakdown analysis --
     phases = summary.get("phases", [])

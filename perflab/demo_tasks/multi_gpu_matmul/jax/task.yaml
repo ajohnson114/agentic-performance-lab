@@ -1,0 +1,49 @@
+name: "multi_gpu_matmul_jax"
+workspace: "tasks/multi_gpu_matmul/jax"
+program_type: "jax"
+# Requires >=2 visible JAX devices (bench.py/tests.py raise a clear error
+# otherwise). Not tied to a specific GPU model -- runs on any 2x+ GPU box,
+# e.g. a multi-GPU RunPod instance.
+target_hardware: null
+
+build: null
+
+correctness:
+  cmd: "python tests.py"
+  expected_exit: 0
+
+benchmark:
+  cmd: "python bench.py --json out/bench.json"
+  metric:
+    name: "tflops.median"
+    mode: "maximize"
+  warmup: 3
+  repeats: 10
+
+profile_plan:
+  always: ["cpu_flame"]
+
+constraints:
+  max_iters: 8
+  regression_tolerance: 0.02
+
+analysis_thresholds:
+  gpu_cpu_ratio_low: 0.6         # cross-device collective adds host-visible overhead vs a pure single-GPU matmul
+  sync_count_warn: 6             # per-device dispatch + block_until_ready calls are expected here
+  nsys_gpu_imbalance_pct: 15.0   # tighter than the 30pp default -- imbalance is the whole point of this task
+  nccl_time_pct_high: 5.0        # lower than the 20% default -- surface any NCCL share, not just a dominant one
+  jax_recompilation_warn: 1
+
+contract:
+  # Pinned so a candidate can't "optimize" by shrinking the problem, and so
+  # num_gpus in bench.json reflects real hardware rather than the agent
+  # quietly making the task single-device to dodge the imbalance/NCCL findings.
+  fixed_params: { M: 4096, N: 4096, K: 4096 }
+  min_repeats: 3
+  required_bench_fields: ["ok", "tflops", "num_gpus"]
+
+edit_policy:
+  allowed_paths:
+    - "matmul_op.py"
+
+out_dir: "../../out"

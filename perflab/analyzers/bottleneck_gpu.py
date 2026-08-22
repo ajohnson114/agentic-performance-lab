@@ -3,6 +3,149 @@ from __future__ import annotations
 from perflab.analyzers.bottleneck_types import AnalysisThresholds, BottleneckDiagnosis, Evidence
 
 
+def detect_gpu_imbalance(
+    active_pct_by_device: dict[int, float] | None,
+    thresholds: AnalysisThresholds,
+    rule_id: str,
+    device_label: str = "GPU",
+    metric_label: str = "active",
+) -> BottleneckDiagnosis | None:
+    """Flag a busiest-vs-idlest per-device utilization spread beyond nsys_gpu_imbalance_pct.
+
+    Shared by nsys, torch-profiler, and TPU analysis: all three compute a
+    per-device 0-100 utilization percentage (GPU union-of-busy-intervals for
+    nsys/torch, per-chip MXU% for TPU), so the imbalance heuristic and
+    threshold are identical either way -- only rule_id and the two labels
+    (for accurate wording -- "GPU ... active" vs "TPU chip ... MXU
+    utilization") differ per source.
+    """
+    if not active_pct_by_device or len(active_pct_by_device) <= 1:
+        return None
+    busiest = max(active_pct_by_device, key=lambda d: active_pct_by_device[d])
+    idlest = min(active_pct_by_device, key=lambda d: active_pct_by_device[d])
+    spread = active_pct_by_device[busiest] - active_pct_by_device[idlest]
+    if spread <= thresholds.nsys_gpu_imbalance_pct:
+        return None
+    # 50pp: at this spread one device is doing roughly double (or more) the
+    # work of another -- unambiguously an imbalance, not noise.
+    confidence = "high" if spread > 50 else "medium"
+    return BottleneckDiagnosis(
+        rank=0,
+        bottleneck=(
+            f"{device_label} load imbalance ({device_label} {busiest} {metric_label} "
+            f"{active_pct_by_device[busiest]:.0f}% vs {device_label} {idlest} {metric_label} "
+            f"{active_pct_by_device[idlest]:.0f}%)"
+        ),
+        root_cause=f"One or more {device_label}s sit idle relative to others in this trace -- "
+                   "likely uneven work partitioning, a straggler rank, or a "
+                   "synchronization barrier stalling the faster devices",
+        confidence=confidence,
+        suggested_actions=[
+            "Check work partitioning across devices (data/model-parallel shard sizes)",
+            "Look for a straggler rank blocking an all-reduce or collective",
+            f"Profile the idle {device_label} individually to see what it's waiting on",
+        ],
+        evidence=Evidence(
+            level="derived", rule_id=rule_id,
+            metrics={
+                "pct_spread": spread,
+                "threshold": thresholds.nsys_gpu_imbalance_pct,
+                "busiest_device": busiest,
+                "idlest_device": idlest,
+            },
+        ),
+    )
+
+
+def detect_per_device_kernel_divergence(
+    top_kernels_by_device: dict[int, list[dict]] | None,
+    overall_top_kernel_name: str | None,
+    thresholds: AnalysisThresholds,
+    rule_id: str,
+) -> BottleneckDiagnosis | None:
+    """Flag a device whose own dominant kernel differs from the overall top kernel.
+
+    The device-blind top_kernels/top_gpu_kernels ranking sums each kernel's
+    time across all devices -- the right question for "which kernel should I
+    optimize" when devices replicate the same kernel, but it can't reveal
+    that one specific device's workload looks different (pipeline-parallel
+    stage heterogeneity, or a shape/dtype branch only some devices take).
+    This is that different question. Only fires for the first divergent
+    device found, to avoid flooding findings when many devices diverge the
+    same way; suppressed entirely when the device's top kernel matches the
+    overall #1, since that's the same story the existing dominance finding
+    already tells.
+    """
+    if not top_kernels_by_device or len(top_kernels_by_device) <= 1:
+        return None
+    for dev, kernels in top_kernels_by_device.items():
+        if not kernels:
+            continue
+        top = kernels[0]
+        if top.get("pct", 0) <= thresholds.nsys_kernel_dominance_pct:
+            continue
+        if overall_top_kernel_name and top.get("name") == overall_top_kernel_name:
+            continue
+        return BottleneckDiagnosis(
+            rank=0,
+            bottleneck=(
+                f"GPU {dev} dominated by a different kernel ('{top['name']}' at "
+                f"{top['pct']:.0f}% of that device's own time)"
+            ),
+            root_cause="This device's workload is dominated by a kernel that isn't the "
+                       "overall top kernel -- likely pipeline-parallel stage heterogeneity "
+                       "or a shape/dtype branch that only this device takes",
+            confidence="medium",
+            suggested_actions=[
+                f"Profile GPU {dev} individually (e.g. CUDA_VISIBLE_DEVICES={dev}) to isolate '{top['name']}'",
+                "Check for shape/dtype branches or pipeline-stage assignment that differs across devices",
+            ],
+            evidence=Evidence(
+                level="derived", rule_id=rule_id,
+                metrics={"device": dev, "kernel_pct": top.get("pct", 0), "threshold": thresholds.nsys_kernel_dominance_pct},
+            ),
+        )
+    return None
+
+
+def detect_communication_bound(
+    nccl_pct: float | None,
+    thresholds: AnalysisThresholds,
+    rule_id: str,
+) -> BottleneckDiagnosis | None:
+    """Flag GPU time meaningfully spent in NCCL collectives rather than compute.
+
+    Shared by nsys and torch-profiler analysis: both detect NCCL kernels the
+    same way (kernel name contains "nccl" -- see nsys_profiler._extract_nccl_time
+    / pytorch_profiler._parse_torch_trace), so the threshold is identical
+    either way. This is a name-pattern signal only -- it says how much GPU
+    time went to collectives, not whether that time overlaps compute or
+    serializes it (that needs interval-intersection analysis neither
+    profiler path computes), so confidence is capped at medium.
+    """
+    if nccl_pct is None or nccl_pct <= thresholds.nccl_time_pct_high:
+        return None
+    return BottleneckDiagnosis(
+        rank=0,
+        bottleneck=f"Significant NCCL communication time ({nccl_pct:.0f}% of GPU time)",
+        root_cause="A meaningful fraction of GPU time is spent in NCCL collective "
+                   "operations (all-reduce, all-gather, broadcast, etc.) rather than "
+                   "compute -- this can't tell whether that time overlaps compute or "
+                   "serializes it",
+        confidence="medium",
+        suggested_actions=[
+            "Check whether communication overlaps compute (DDP gradient bucketing, async collectives)",
+            "Increase per-GPU batch size to amortize fixed collective overhead",
+            "Check interconnect: NVLink/NVSwitch vs PCIe vs cross-node network can change this by 10x+",
+            "Profile with NCCL_DEBUG=INFO or nsys's NCCL plugin for algorithm/topology detail this tool doesn't extract",
+        ],
+        evidence=Evidence(
+            level="derived", rule_id=rule_id,
+            metrics={"nccl_pct": nccl_pct, "threshold": thresholds.nccl_time_pct_high},
+        ),
+    )
+
+
 def _analyze_ncu(summary: dict, thresholds: AnalysisThresholds) -> list[BottleneckDiagnosis]:
     """Analyze NVIDIA Nsight Compute (ncu) summary."""
     findings: list[BottleneckDiagnosis] = []
@@ -553,6 +696,34 @@ def _analyze_nsys(summary: dict, thresholds: AnalysisThresholds) -> list[Bottlen
             ],
             evidence=Evidence(level="derived", rule_id="nsys_kernel_dominance_pct", metrics={"kernel_pct": k.get("pct", 0), "threshold": thresholds.nsys_kernel_dominance_pct}),
         ))
+
+    # Per-device kernel divergence: does one GPU's own top kernel differ from
+    # the overall top kernel (pipeline-parallel heterogeneity, shape/dtype
+    # branch that only some devices take)?
+    divergence = detect_per_device_kernel_divergence(
+        summary.get("top_kernels_by_device"),
+        top_kernels[0]["name"] if top_kernels else None,
+        thresholds, rule_id="nsys_kernel_divergence_pct",
+    )
+    if divergence is not None:
+        findings.append(divergence)
+
+    # NCCL communication time (see detect_communication_bound docstring for
+    # what this can and can't tell you).
+    comm_bound = detect_communication_bound(
+        summary.get("nccl_pct"), thresholds, rule_id="nsys_nccl_time_pct_high"
+    )
+    if comm_bound is not None:
+        findings.append(comm_bound)
+
+    # Multi-GPU load imbalance: one device idle relative to another over the
+    # same trace window (straggler rank, uneven work partitioning, or a
+    # synchronization stall pinning one GPU while others race ahead).
+    imbalance = detect_gpu_imbalance(
+        summary.get("gpu_active_pct_by_device"), thresholds, rule_id="nsys_gpu_imbalance_pct"
+    )
+    if imbalance is not None:
+        findings.append(imbalance)
 
     # Kernel launch overhead from gap analysis
     avg_gap = summary.get("avg_kernel_gap_us")

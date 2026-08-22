@@ -255,6 +255,54 @@ def test_analyze_torch_trace_real_gpu_low_ratio_still_flagged():
     assert underutilized.confidence == "high"
 
 
+def test_analyze_torch_trace_gpu_imbalance_flagged():
+    summary = {"gpu_active_pct_by_device": {0: 95.0, 1: 15.0}}
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert any("imbalance" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_balanced_devices_no_imbalance_finding():
+    summary = {"gpu_active_pct_by_device": {0: 90.0, 1: 88.0}}
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert not any("imbalance" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_per_device_kernel_divergence():
+    summary = {
+        "top_gpu_kernels": [{"name": "sgemm", "pct": 60.0, "total_us": 100.0}],
+        "top_gpu_kernels_by_device": {
+            0: [{"name": "sgemm", "pct": 90.0, "total_us": 90.0}],
+            1: [{"name": "conv2d", "pct": 95.0, "total_us": 95.0}],
+        },
+    }
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert any("different kernel" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_no_divergence_when_same_kernel_dominates_every_device():
+    summary = {
+        "top_gpu_kernels": [{"name": "sgemm", "pct": 60.0, "total_us": 100.0}],
+        "top_gpu_kernels_by_device": {
+            0: [{"name": "sgemm", "pct": 90.0, "total_us": 90.0}],
+            1: [{"name": "sgemm", "pct": 92.0, "total_us": 92.0}],
+        },
+    }
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert not any("different kernel" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_high_nccl_time():
+    summary = {"nccl_pct": 35.0}
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert any("nccl" in f.bottleneck.lower() for f in findings)
+
+
+def test_analyze_torch_trace_low_nccl_time_no_finding():
+    summary = {"nccl_pct": 5.0}
+    findings = _analyze_torch_trace(summary, device="cuda", thresholds=_default_thresholds())
+    assert not any("nccl" in f.bottleneck.lower() for f in findings)
+
+
 # -- GPU attribution: findings must not be dropped when correlations missing -
 
 def test_analyze_gpu_attribution_without_correlations_still_yields_findings():
@@ -263,8 +311,8 @@ def test_analyze_gpu_attribution_without_correlations_still_yields_findings():
     those should still produce findings instead of being silently dropped."""
     nsys_summary = {
         "top_kernels": [{"name": "big_kernel", "pct": 30.0, "total_ms": 100.0}],
-        "stream_utilization": {"0": {"active_pct": 20.0, "kernel_count": 5}},
-        "per_stream_gaps": {"0": {"max_gap_us": 500.0}},
+        "stream_utilization": {"0:0": {"device_id": 0, "stream_id": 0, "active_pct": 20.0, "kernel_count": 5}},
+        "per_stream_gaps": {"0:0": {"max_gap_us": 500.0}},
     }
     findings = _analyze_gpu_attribution(nsys_summary, None, _default_thresholds())
     assert len(findings) >= 1

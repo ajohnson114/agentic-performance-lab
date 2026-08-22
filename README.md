@@ -36,7 +36,7 @@ perflab replay   out/runs/…  # human-readable timeline of what the agent did
 
 **Supported backends:** Python, C++, CUDA, PyTorch, JAX, Triton on NVIDIA GPUs, Google TPUs, Apple Silicon, or CPU-only.
 
-**Scope:** Single-device performance optimization. Does not handle multi-GPU, multi-node, or distributed training.
+**Scope:** Optimizes a single benchmarked process. Diagnostics are multi-GPU aware (per-device utilization, load imbalance, kernel divergence) when that process drives multiple devices directly, but PerfLab does not orchestrate multi-node or distributed (`torchrun`) training.
 
 ---
 
@@ -72,6 +72,7 @@ perflab agent matmul/python/task.yaml                # LLM-driven optimization
 | Platform | Recommended tasks |
 |----------|------------------|
 | **NVIDIA GPU** | `matmul/cuda`, `matmul/cuda_tensorcore`, `matmul/triton`, `transformer_train/pytorch` |
+| **NVIDIA multi-GPU (2+)** | `multi_gpu_matmul/pytorch`, `multi_gpu_matmul/jax`, `multi_gpu_matmul/cuda` |
 | **Apple Silicon** | `matmul/pytorch`, `matmul/jax`, `transformer_train/pytorch` |
 | **CPU only** | `matmul/python`, `matmul/cpp`, `matmul/cpp_parallel`, `stream/python` |
 
@@ -99,6 +100,9 @@ These are good starting points for seeing what the agent can do:
 | CUDA Tensor Core | `perflab agent perflab/demo_tasks/matmul/cuda_tensorcore/task.yaml` | Double buffering, warp pipelining |
 | PyTorch transformer | `perflab agent perflab/demo_tasks/transformer_train/pytorch/task.yaml` | AMP, SDPA, `torch.compile` |
 | C++ matmul | `perflab agent perflab/demo_tasks/matmul/cpp/task.yaml` | Loop reordering, tiling, SIMD |
+| Multi-GPU matmul (PyTorch) | `perflab agent perflab/demo_tasks/multi_gpu_matmul/pytorch/task.yaml` | Balancing a lopsided K-split across devices, NCCL all-reduce overhead |
+| Multi-GPU matmul (JAX) | `perflab agent perflab/demo_tasks/multi_gpu_matmul/jax/task.yaml` | Same, via `shard_map`/`psum` (XLA:GPU compiles this to NCCL) |
+| Multi-GPU matmul (raw CUDA) | `perflab agent perflab/demo_tasks/multi_gpu_matmul/cuda/task.yaml` | Same, via `ncclCommInitAll`/`ncclAllReduce` directly |
 | Triton matmul | `perflab agent perflab/demo_tasks/matmul/triton/task.yaml` | Block tiling with `tl.dot` |
 
 ### All tasks
@@ -122,6 +126,9 @@ These are good starting points for seeing what the agent can do:
 | PyTorch inference | `pytorch` | Per-image CPU preprocessing, batch_size=1, eager mode, fp32 | Batching, GPU preprocess, `torch.compile`, half precision |
 | STREAM (memory bandwidth) | `python` | Column-major traversal of row-major arrays, scalar loops (cache-unfriendly) | NumPy vectorization, row-major access order |
 | GPU inference demo (H100) | `pytorch` | fp32 eager, per-image CPU pre/postprocess, no AMP/compile (14 antipatterns) | AMP, `channels_last`, `torch.compile`, CUDA graphs, batched pre/postprocessing |
+| Multi-GPU matmul (PyTorch) | `pytorch` | K-split 90/10 across devices (tensor-parallel, `torch.cuda.nccl.all_reduce`) | Balance the split across GPUs; requires 2+ CUDA devices |
+| Multi-GPU matmul (JAX) | `jax` | K-split 90/10 across devices (tensor-parallel, `shard_map`+`psum`) | Balance the split across GPUs; requires 2+ JAX devices |
+| Multi-GPU matmul (raw CUDA) | `cuda` | K-split 90/10 across devices (tensor-parallel, raw NCCL C API) | Balance the split across GPUs; requires 2+ CUDA devices, `libnccl-dev` |
 
 ---
 
@@ -213,6 +220,7 @@ Checks applied to what a candidate produces, independent of edit policy or runti
 - **Contract validation** — benchmark output checked against `contract.fixed_params` (prevents shrinking the problem to "optimize") and `min_repeats`/`min_warmup` (prevents dialing down measurement counts)
 - **Regression check** — candidates must beat baseline by `regression_tolerance` (default 2%)
 - **Noise gate** — an improvement must also be distinguishable from measurement noise: by default, the candidate's 95% confidence interval must not overlap the incumbent's. Without it, a 2% acceptance threshold on a machine with 8% run-to-run spread accepts noise as a win, and beam search then chases it. When a task's benchmark reports only an aggregate (no per-repeat samples), the gate cannot run and the decision is logged as unverified rather than silently downgraded. Which test is applied is selectable — see **Decision rules** below
+- **compute-sanitizer gate (CUDA)** — for tasks whose build step invokes `nvcc`, the winning candidate is re-run under NVIDIA's `compute-sanitizer` (`memcheck` + `racecheck`) once, between the correctness pass and permanent acceptance. A numerically-correct kernel can still be undefined behavior — an out-of-bounds shared-memory access, or a race from a missing `__syncthreads()` — that happens to compute the right answer on today's driver/GPU/occupancy and corrupts it on the next. Applies regardless of `program_type` (a `cpp`-typed task with an `nvcc` build step, like the reduction demo, still gets checked). Degrades to "skipped, logged once" if `compute-sanitizer` isn't installed — the same stance every profiling tool here takes toward a missing binary — and never treats a missing/unparseable sanitizer report as a pass. Configurable via `constraints.compute_sanitizer` (default `true`), `compute_sanitizer_tools` (default `[memcheck, racecheck]`), `compute_sanitizer_timeout_s` (default `180`)
 - **Anti-gaming** — determinism re-runs with a varied seed (reject on divergence), zero-variance timing detection, mode-aware single-iteration speedup alerts, and optional thread-count enforcement — configured via `anti_gaming:` in task.yaml
 
 **Decision rules.** One module answers "is this candidate better?" for the agent, `perflab optimize`, and `perflab ci-check`. Pick the rule with `constraints.decision_rule` in `task.yaml`:
@@ -451,6 +459,7 @@ PerfLab gracefully skips profilers that aren't installed. Install the ones relev
 | perf | Hardware counters (Linux) | `sudo apt install linux-tools-common` |
 | nsys | NVIDIA GPU timeline | [Nsight Systems](https://developer.nvidia.com/nsight-systems) |
 | ncu | NVIDIA GPU kernel profiler | [Nsight Compute](https://developer.nvidia.com/nsight-compute) |
+| compute-sanitizer | CUDA memory/race-safety gate for `nvcc`-built tasks (see Safety) | Ships with the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) |
 | toplev | Intel TMA analysis | `pip install pmu-tools` |
 
 Compilers: `g++` for C++ tasks, `nvcc` for CUDA. Runtimes: `torch`, `jax`, `triton` as needed (`pip install -e ".[tasks-pytorch]"`).

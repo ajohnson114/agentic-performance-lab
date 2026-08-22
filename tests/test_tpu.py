@@ -48,6 +48,19 @@ class TestAnalyzeTPU:
         findings = _analyze_tpu(summary, _default_thresholds())
         assert not any("MXU" in f.bottleneck for f in findings)
 
+    def test_multi_chip_mxu_imbalance_flagged(self):
+        summary = {"mxu_utilization_pct_by_device": {0: 95.0, 1: 10.0}}
+        findings = _analyze_tpu(summary, _default_thresholds())
+        assert any("imbalance" in f.bottleneck.lower() for f in findings)
+        imbalance = next(f for f in findings if "imbalance" in f.bottleneck.lower())
+        assert "TPU chip" in imbalance.bottleneck
+        assert "MXU utilization" in imbalance.bottleneck
+
+    def test_multi_chip_balanced_no_imbalance_finding(self):
+        summary = {"mxu_utilization_pct_by_device": {0: 90.0, 1: 88.0}}
+        findings = _analyze_tpu(summary, _default_thresholds())
+        assert not any("imbalance" in f.bottleneck.lower() for f in findings)
+
     def test_padding_waste(self):
         summary = {
             "hlo_ops": [

@@ -1,14 +1,14 @@
 # Safety Checks
 
-PerfLab evaluates every LLM-generated candidate through **31 safety checks** before accepting it. These checks form a defense-in-depth chain spanning five categories:
+PerfLab evaluates every LLM-generated candidate through **32 safety checks** before accepting it. These checks form a defense-in-depth chain spanning five categories:
 
 | Category | Checks | Purpose |
 |----------|--------|---------|
 | **A. Patch Validation** | 1–7 | Can the edit be applied safely? |
 | **B. Execution Sandboxing** | 8–14 | Can the resulting code damage the system? |
-| **C. Result Integrity** | 15–22 | Are the benchmark numbers trustworthy? |
-| **D. Reward-Hack Mitigation** | 23–26 | Is the optimization genuine, or gaming the metric? |
-| **E. Hardware Stability** | 27–31 | Is the measurement environment reliable? |
+| **C. Result Integrity** | 15–23 | Are the benchmark numbers trustworthy, and is the winning candidate free of undefined behavior? |
+| **D. Reward-Hack Mitigation** | 24–27 | Is the optimization genuine, or gaming the metric? |
+| **E. Hardware Stability** | 28–32 | Is the measurement environment reliable? |
 
 A candidate must survive all applicable checks to be accepted. If any check rejects or flags the candidate, it is discarded and the workspace is restored to its previous state.
 
@@ -292,11 +292,31 @@ These checks verify that benchmark results are trustworthy — not faked, not st
 
 ---
 
+### 23. CUDA memory/race safety (compute-sanitizer)
+
+**What:** For tasks whose build step invokes `nvcc`, the candidate that just cleared the regression check is rebuilt in a fresh temp workspace and its correctness command is re-run once under NVIDIA's `compute-sanitizer` — `memcheck` (out-of-bounds/misaligned/illegal-address accesses) and `racecheck` (shared-memory hazards), sequentially. This runs *after* correctness has already passed and *before* the patch is applied to the real workspace — the last gate a candidate crosses.
+
+**Why:** The correctness test's numerical check only proves the answer was right on the one input it happened to run. It cannot prove the kernel that produced it is free of undefined behavior. An out-of-bounds shared-memory access, or a race from a missing (or misplaced) `__syncthreads()`, routinely computes the right answer on today's driver, GPU and occupancy while remaining UB that a different driver, a different launch configuration, or a different compiler flag can flip into silent corruption. Exactly the optimizations these CUDA tasks invite — shared-memory tiling, warp-level primitives, double buffering — are where this bug class lives, and it is invisible to a numeric-output check by construction.
+
+**What it catches:** Out-of-bounds and misaligned global/shared/local memory accesses, illegal address accesses, and shared-memory race conditions (`memcheck`/`racecheck`). Not gated on `program_type` — a `cpp`-typed task whose build step is `nvcc` (e.g. the reduction/cpp_cuda demo) is still checked, since the risk is "this task compiles a hand-written CUDA kernel," not the declared program type.
+
+**Not applicable to:** PyTorch/JAX/Triton tasks, whose GPU kernels come from vetted library or compiler-generated code (cuBLAS/cuDNN/Triton) rather than agent-hand-written CUDA — a different risk profile, and a much heavier sanitizer target (a full framework import), so they are out of scope for this check.
+
+**Fail-closed on ambiguity:** compute-sanitizer's `ERROR SUMMARY: N error(s)` line is the parse target, printed after the target process exits regardless of its own exit code. When that line is absent — a crash before it could print, a timeout, an unrecognized output format — the result is treated as **not clean**, never as a pass. A missing signal is never silently treated as a passing one.
+
+**Action on failure:** REJECT — candidate discarded, agent proceeds to the next-best candidate or iteration. If `compute-sanitizer` is not installed, the check is skipped (once per run, logged as an `anti_gaming_warning` event) rather than blocking every CUDA task on a host without the CUDA Toolkit — the same stance every other profiling tool in PerfLab takes toward a missing binary.
+
+**Configurable:** `constraints.compute_sanitizer` (default: `true`); `constraints.compute_sanitizer_tools` (default: `[memcheck, racecheck]`); `constraints.compute_sanitizer_timeout_s` (default: `180`).
+
+**Source:** `perflab/tools/compute_sanitizer.py` — `run_compute_sanitizer()`, `uses_cuda_build()`; `perflab/optimizers/phases/evaluate.py` — `_cuda_sanitizer_gate()`
+
+---
+
 ## Category D: Reward-Hack Mitigation
 
 These checks defend against LLM-generated code that games benchmarks rather than genuinely optimizing performance. They address specific attack patterns documented in the [Wafer.ai reward hacks field guide](https://www.wafer.ai/blog/reward-hacks-field-guide).
 
-### 23. Bench.json variance check
+### 24. Bench.json variance check
 
 **What:** After every benchmark, `validate_bench_variance()` walks the bench.json tree looking for numeric arrays (timing values, throughput measurements) with zero or near-zero coefficient of variation.
 
@@ -312,7 +332,7 @@ These checks defend against LLM-generated code that games benchmarks rather than
 
 ---
 
-### 24. Determinism re-run
+### 25. Determinism re-run
 
 **What:** When enabled, the correctness test runs twice for each candidate. The second run sets `PERFLAB_DETERMINISM_SEED=42` in the subprocess environment, signaling the test harness to use different random inputs if it supports the convention.
 
@@ -330,7 +350,7 @@ These checks defend against LLM-generated code that games benchmarks rather than
 
 ---
 
-### 25. Incremental gaming detector
+### 26. Incremental gaming detector
 
 **What:** After each accepted iteration, computes the speedup ratio of the new metric relative to the *previous best* (not the baseline). Logs a warning if this exceeds `anti_gaming.gaming_speedup_threshold` (default 100x).
 
@@ -346,7 +366,7 @@ These checks defend against LLM-generated code that games benchmarks rather than
 
 ---
 
-### 26. Thread injection check
+### 27. Thread injection check
 
 **What:** When enabled, the agent checks for a `thread_delta` field in `bench.json`'s `meta` section. If the benchmark harness reports that new threads were spawned during kernel execution beyond `max_thread_delta`, the candidate is rejected.
 
@@ -366,7 +386,7 @@ These checks defend against LLM-generated code that games benchmarks rather than
 
 These checks don't evaluate the patch itself — they ensure the measurement environment is stable enough to produce trustworthy results.
 
-### 27. GPU thermal gate
+### 28. GPU thermal gate
 
 **What:** Before each GPU benchmark, the runner checks GPU temperature. If above 80°C, it waits up to 120 seconds for cooldown to 75°C.
 
@@ -378,7 +398,7 @@ These checks don't evaluate the patch itself — they ensure the measurement env
 
 ---
 
-### 28. GPU clock locking
+### 29. GPU clock locking
 
 **What:** `setup-h100.sh` locks GPU SM clocks at max frequency via `nvidia-smi -lgc`.
 
@@ -390,7 +410,7 @@ These checks don't evaluate the patch itself — they ensure the measurement env
 
 ---
 
-### 29. GPU isolation
+### 30. GPU isolation
 
 **What:** On multi-GPU nodes, `setup-h100.sh` sets `CUDA_VISIBLE_DEVICES=0` to pin benchmarks to a single GPU.
 
@@ -402,7 +422,7 @@ These checks don't evaluate the patch itself — they ensure the measurement env
 
 ---
 
-### 30. Drift detection
+### 31. Drift detection
 
 **What:** Every 3 accepted patches, the agent re-runs the benchmark from the current workspace state and compares the result against the last accepted value. If drift exceeds 5%, a warning is logged.
 
@@ -414,7 +434,7 @@ These checks don't evaluate the patch itself — they ensure the measurement env
 
 ---
 
-### 31. Ollama SSRF prevention
+### 32. Ollama SSRF prevention
 
 **What:** The Ollama provider validates that `api_base` points to localhost (`localhost`, `127.0.0.1`, or `::1`) on port 11434 and uses `http` or `https` scheme.
 
@@ -446,29 +466,30 @@ LLM response
   ├─ apply_patch()                    → write edits to disk
   │
   ├─ run_correctness()                → correctness gate (15)
-  │   └─ determinism re-run           → second run with different seed (24)
+  │   └─ determinism re-run           → second run with different seed (25)
   │
   ├─ run_benchmark()                  → benchmark execution (16)
-  │   ├─ thermal gate                 → wait for GPU cooldown (27)
+  │   ├─ thermal gate                 → wait for GPU cooldown (28)
   │   ├─ bench.json anti-tampering    → hash + mtime check (17)
   │   └─ timeout enforcement          → 300s kill (9)
   │
   ├─ validate_contract()              → required fields (18) + fixed params (19)
-  ├─ validate_bench_variance()        → caching detection (23)
-  ├─ thread_delta check               → thread injection (26, if enabled)
+  ├─ validate_bench_variance()        → caching detection (24)
+  ├─ thread_delta check               → thread injection (27, if enabled)
   │
   ├─ is_improvement()                 → regression check, ≥2% (22)
   │   └─ confirmation re-benchmark    → full-fidelity re-run if fast-screened (21)
   │
-  ├─ gaming detector                  → incremental speedup check (25)
-  ├─ drift detection                  → every 3 accepts (30)
+  ├─ compute-sanitizer gate           → CUDA memory/race safety, nvcc builds only (23)
+  ├─ gaming detector                  → incremental speedup check (26)
+  ├─ drift detection                  → every 3 accepts (31)
   │
   └─ restore_files()                  → restore originals (8)
 ```
 
 ## Harness-level helpers (perflab.harness)
 
-In addition to the 31 framework checks above, PerfLab provides a library of in-process mitigations that task authors can import in their protected `bench.py` and `tests.py` files. Because these files are in the `PROTECTED_FILENAMES` blocklist, the LLM cannot remove the checks once a task author adds them.
+In addition to the 32 framework checks above, PerfLab provides a library of in-process mitigations that task authors can import in their protected `bench.py` and `tests.py` files. Because these files are in the `PROTECTED_FILENAMES` blocklist, the LLM cannot remove the checks once a task author adds them.
 
 | Helper | Module | Reward hack mitigated | Mechanism |
 |--------|--------|-----------------------|-----------|

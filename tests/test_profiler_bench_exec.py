@@ -284,9 +284,9 @@ class TestPySpyLadder:
         result = PySpyProfiler().run("python3 bench.py", tmp_path, artifacts_dir)
 
         out = str((artifacts_dir / "pyspy_speedscope.json").resolve())
-        native = ["py-spy", "record", "--native", "--format", "speedscope",
+        native = ["py-spy", "record", "--native", "--subprocesses", "--format", "speedscope",
                   "-o", out, "--", "python3", "bench.py"]
-        plain = ["py-spy", "record", "--format", "speedscope",
+        plain = ["py-spy", "record", "--subprocesses", "--format", "speedscope",
                  "-o", out, "--", "python3", "bench.py"]
         assert [c["cmd"] for c in rec.calls] == [
             native,
@@ -309,9 +309,9 @@ class TestPySpyLadder:
         PySpyProfiler().run("python3 bench.py", tmp_path, artifacts_dir)
 
         out = str((artifacts_dir / "pyspy_speedscope.json").resolve())
-        native = ["py-spy", "record", "--native", "--format", "speedscope",
+        native = ["py-spy", "record", "--native", "--subprocesses", "--format", "speedscope",
                   "-o", out, "--", "python3", "bench.py"]
-        plain = ["py-spy", "record", "--format", "speedscope",
+        plain = ["py-spy", "record", "--subprocesses", "--format", "speedscope",
                  "-o", out, "--", "python3", "bench.py"]
         assert [c["cmd"] for c in rec.calls] == [native, plain]
 

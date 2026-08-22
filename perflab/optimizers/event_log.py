@@ -72,6 +72,22 @@ class AgentEventLog:
             "raw_response_path": str(resp_path.relative_to(self.run_dir)),
         })
 
+    def tool_call(
+        self, iteration: int, turn: int, tool_name: str,
+        arguments: dict, result: str,
+    ) -> None:
+        """One tool invocation inside a generate-phase tool loop -- so
+        `perflab replay` can show exactly what the agent asked for and got,
+        the same reproducibility guarantee llm_request/llm_response give the
+        single-shot path."""
+        self._write("tool_call", iteration, {
+            "turn": turn,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "result_length_chars": len(result),
+            "result_preview": result[:500],
+        })
+
     def candidate_validation(
         self, iteration: int, candidate_index: int,
         valid: bool, errors: list[str],
@@ -191,6 +207,17 @@ class AgentEventLog:
         self._write("rlimit_warning", iteration, {
             "details": details,
             "candidate_index": candidate_index,
+        })
+
+    def compute_sanitizer_check(
+        self, iteration: int, candidate_index: int,
+        tools: list[str], clean: bool, details: str,
+    ) -> None:
+        self._write("compute_sanitizer_check", iteration, {
+            "candidate_index": candidate_index,
+            "tools": tools,
+            "clean": clean,
+            "details": details,
         })
 
     def early_stop(self, iteration: int, reason: str) -> None:

@@ -40,6 +40,48 @@ class TestDiagnoseBottlenecks:
         diags = diagnose_bottlenecks(summaries, "cuda")
         assert any("launch overhead" in d.bottleneck.lower() or "gap" in d.bottleneck.lower() for d in diags)
 
+    def test_nsys_gpu_load_imbalance(self):
+        summaries = {"nsys": {"gpu_active_pct_by_device": {0: 95.0, 1: 20.0}}}
+        diags = diagnose_bottlenecks(summaries, "cuda")
+        assert any("imbalance" in d.bottleneck.lower() for d in diags)
+
+    def test_nsys_gpu_balanced_devices_no_finding(self):
+        summaries = {"nsys": {"gpu_active_pct_by_device": {0: 90.0, 1: 85.0}}}
+        diags = diagnose_bottlenecks(summaries, "cuda")
+        assert not any("imbalance" in d.bottleneck.lower() for d in diags)
+
+    def test_nsys_per_device_kernel_divergence(self):
+        summaries = {"nsys": {
+            "top_kernels": [{"name": "sgemm", "pct": 60.0, "total_ms": 100}],
+            "top_kernels_by_device": {
+                0: [{"name": "sgemm", "pct": 90.0, "total_ms": 90}],
+                1: [{"name": "conv2d", "pct": 95.0, "total_ms": 95}],
+            },
+        }}
+        diags = diagnose_bottlenecks(summaries, "cuda")
+        assert any("different kernel" in d.bottleneck.lower() for d in diags)
+
+    def test_nsys_no_divergence_when_same_kernel_dominates_every_device(self):
+        summaries = {"nsys": {
+            "top_kernels": [{"name": "sgemm", "pct": 60.0, "total_ms": 100}],
+            "top_kernels_by_device": {
+                0: [{"name": "sgemm", "pct": 90.0, "total_ms": 90}],
+                1: [{"name": "sgemm", "pct": 92.0, "total_ms": 92}],
+            },
+        }}
+        diags = diagnose_bottlenecks(summaries, "cuda")
+        assert not any("different kernel" in d.bottleneck.lower() for d in diags)
+
+    def test_nsys_high_nccl_time(self):
+        summaries = {"nsys": {"nccl_pct": 35.0}}
+        diags = diagnose_bottlenecks(summaries, "cuda")
+        assert any("nccl" in d.bottleneck.lower() for d in diags)
+
+    def test_nsys_low_nccl_time_no_finding(self):
+        summaries = {"nsys": {"nccl_pct": 5.0}}
+        diags = diagnose_bottlenecks(summaries, "cuda")
+        assert not any("nccl" in d.bottleneck.lower() for d in diags)
+
     def test_perf_low_ipc(self):
         summaries = {"linux_perf": {"ipc": 0.4}}
         diags = diagnose_bottlenecks(summaries, "cpp")
@@ -49,6 +91,19 @@ class TestDiagnoseBottlenecks:
         summaries = {"linux_perf": {"cache_miss_rate": 0.15}}
         diags = diagnose_bottlenecks(summaries, "cpp")
         assert any("cache" in d.bottleneck.lower() for d in diags)
+
+    def test_perf_multiprocess_cpu_imbalance(self):
+        summaries = {"linux_perf": {"cpu_pct_by_pid": {100: 90.0, 200: 10.0}}}
+        diags = diagnose_bottlenecks(summaries, "python")
+        assert any("imbalance" in d.bottleneck.lower() for d in diags)
+        imbalance = next(d for d in diags if "imbalance" in d.bottleneck.lower())
+        assert "Worker" in imbalance.bottleneck
+        assert "CPU share" in imbalance.bottleneck
+
+    def test_perf_multiprocess_balanced_no_imbalance_finding(self):
+        summaries = {"linux_perf": {"cpu_pct_by_pid": {100: 55.0, 200: 45.0}}}
+        diags = diagnose_bottlenecks(summaries, "python")
+        assert not any("imbalance" in d.bottleneck.lower() for d in diags)
 
     def test_metal_gpu_underutilized(self):
         summaries = {"metal_trace": {"gpu_time_total_ms": 50, "duration_s": 10}}

@@ -632,8 +632,19 @@ class TestJaxPaths:
             with pytest.raises(AssertionError, match="not a jax.Array"):
                 assert_real_array(impostor)
 
-    def test_deleted_buffer_rejected(self):
+    def test_deleted_buffer_rejected(self, monkeypatch):
         from perflab.harness import assert_real_array
+
+        # FakeJaxArray identifies itself as JAX-shaped via __module__, not
+        # via a real jax.Array subclass -- that's the exact fallback path
+        # _assert_real_jax takes when jax isn't (yet) resolvable in
+        # sys.modules. If some *other* test in the same process already
+        # imported jax for real, that isinstance check would fire first and
+        # reject this mock for not being a genuine jax.Array -- correct
+        # behavior for real callers, but not what this test means to
+        # exercise. Force the fallback path deliberately rather than
+        # depending on which tests happened to run first.
+        monkeypatch.delitem(sys.modules, "jax", raising=False)
 
         array = FakeJaxArray([1.0])
         array.is_deleted = lambda: True

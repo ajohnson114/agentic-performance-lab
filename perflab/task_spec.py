@@ -82,6 +82,16 @@ class Constraints:
       ``bench_stats.cv_budget_for_gate`` — with the default 2% gate and 20
       repeats that is 2.2%, which is the honest answer and 5x tighter than the
       old hardcoded 10% alarm that the gate never consulted anyway.
+    * ``compute_sanitizer`` gates CUDA candidates through NVIDIA's
+      compute-sanitizer (memcheck + racecheck) before acceptance — a
+      numerical correctness pass does not prove a hand-written kernel is
+      free of out-of-bounds accesses or shared-memory races, which routinely
+      compute the right answer today and corrupt it under a different
+      driver/occupancy. Applies only to tasks whose build step invokes nvcc
+      (see ``perflab.tools.compute_sanitizer.uses_cuda_build``); a no-op
+      everywhere else. Degrades to "skipped, logged once" when
+      compute-sanitizer isn't installed, the same stance every other
+      profiling tool in PerfLab takes toward a missing binary.
     """
     max_iters: int = 10
     regression_tolerance: float = 0.02
@@ -108,6 +118,13 @@ class Constraints:
     # and every candidate are measured on identical cores — see
     # perflab.tools.shell.set_task_cpu_pinning.
     cpu_pinning: str = "auto"
+    # See class docstring. Per-task escape hatch for a CUDA task whose
+    # correctness command is too slow to re-run under a memory checker.
+    compute_sanitizer: bool = True
+    compute_sanitizer_tools: list[str] = field(
+        default_factory=lambda: ["memcheck", "racecheck"]
+    )
+    compute_sanitizer_timeout_s: int = 180
 
 @dataclass
 class RooflineSpec:
@@ -335,6 +352,16 @@ class TaskSpec:
             ),
             env_passthrough=list(constraints_data.get("env_passthrough", [])),
             cpu_pinning=str(constraints_data.get("cpu_pinning", "auto")),
+            compute_sanitizer=bool(constraints_data.get("compute_sanitizer", True)),
+            compute_sanitizer_tools=[
+                str(t) for t in (
+                    constraints_data.get("compute_sanitizer_tools")
+                    or ["memcheck", "racecheck"]
+                )
+            ],
+            compute_sanitizer_timeout_s=int(
+                constraints_data.get("compute_sanitizer_timeout_s", 180)
+            ),
         )
         # Publish the task's CPU pinning setting process-wide. The benchmark
         # and correctness runners read it from there instead of taking it as a

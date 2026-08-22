@@ -83,6 +83,21 @@ def _parse_nsys_sqlite(sqlite_path: Path) -> dict:
         logger.warning("Failed to extract top kernels from nsys", exc_info=True)
 
     try:
+        _extract_device_count(conn, result)
+    except sqlite3.Error:
+        logger.warning("Failed to extract GPU device count from nsys", exc_info=True)
+
+    try:
+        _extract_top_kernels_by_device(conn, result)
+    except sqlite3.Error:
+        logger.warning("Failed to extract per-device top kernels from nsys", exc_info=True)
+
+    try:
+        _extract_nccl_time(conn, result)
+    except sqlite3.Error:
+        logger.warning("Failed to extract NCCL time from nsys", exc_info=True)
+
+    try:
         _extract_memcpy(conn, result)
     except sqlite3.Error:
         logger.warning("Failed to extract memcpy data from nsys", exc_info=True)
@@ -174,6 +189,124 @@ def _extract_top_kernels(conn: sqlite3.Connection, result: dict) -> None:
     result["cuda_kernel_time_ms"] = total_all_ns / 1e6
 
 
+def _extract_top_kernels_by_device(conn: sqlite3.Connection, result: dict) -> None:
+    """Per-device top-10 kernel breakdown, gated to multi-GPU traces only.
+
+    top_kernels (above) intentionally stays a single cross-device ranking --
+    summing a kernel's time across devices is the right question for "which
+    kernel should I optimize" when devices replicate the same kernel. This
+    answers a different question: does one specific device's own workload
+    look different from the others (pipeline-parallel stage heterogeneity,
+    or a shape/dtype branch only some devices take)?
+    """
+    try:
+        cur = conn.execute("""
+            SELECT deviceId, demangledName,
+                   COUNT(*)       AS count,
+                   SUM(end-start) AS total_ns,
+                   AVG(end-start) AS avg_ns
+            FROM CUPTI_ACTIVITY_KIND_KERNEL
+            GROUP BY deviceId, demangledName
+            ORDER BY deviceId, total_ns DESC
+        """)
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        return
+
+    device_ids = {r["deviceId"] for r in rows}
+    if len(device_ids) <= 1:
+        return
+
+    device_totals: dict[int, int] = {}
+    for r in rows:
+        device_totals[r["deviceId"]] = device_totals.get(r["deviceId"], 0) + (r["total_ns"] or 0)
+
+    by_device: dict[int, list[dict]] = {}
+    for r in rows:
+        dev = r["deviceId"]
+        bucket = by_device.setdefault(dev, [])
+        if len(bucket) >= 10:
+            continue
+        total = device_totals.get(dev, 0)
+        pct = (r["total_ns"] / total * 100.0) if total > 0 else 0.0
+        bucket.append({
+            "name": r["demangledName"] or "(unknown)",
+            "count": r["count"],
+            "total_ms": r["total_ns"] / 1e6,
+            "avg_us": r["avg_ns"] / 1e3,
+            "pct": round(pct, 1),
+        })
+
+    if by_device:
+        result["top_kernels_by_device"] = by_device
+
+
+def _extract_nccl_time(conn: sqlite3.Connection, result: dict) -> None:
+    """NCCL (collective communication) kernel time as a fraction of GPU time.
+
+    Name-pattern match only: every NCCL kernel name contains "nccl" (e.g.
+    ncclKernel_AllReduce_..., ncclDevKernel_Broadcast_...), so this piggybacks
+    on the same KERNEL table rather than needing a new join. This says how
+    much GPU time went to collectives, not whether that time is hidden
+    behind overlapped compute -- that needs interval-intersection analysis
+    (comm-stream busy intervals vs compute-stream busy intervals) this
+    module doesn't have; nccl_pct is the cheap signal, not the full answer.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT demangledName, deviceId, (end - start) AS dur "
+            "FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    if not rows:
+        return
+
+    total_ns = 0
+    nccl_ns = 0
+    device_total: dict[int, int] = {}
+    device_nccl: dict[int, int] = {}
+    for r in rows:
+        dur = r["dur"] or 0
+        dev = r["deviceId"]
+        total_ns += dur
+        device_total[dev] = device_total.get(dev, 0) + dur
+        if "nccl" in (r["demangledName"] or "").lower():
+            nccl_ns += dur
+            device_nccl[dev] = device_nccl.get(dev, 0) + dur
+
+    if nccl_ns <= 0 or total_ns <= 0:
+        return
+
+    result["nccl_time_ms"] = round(nccl_ns / 1e6, 2)
+    result["nccl_pct"] = round(nccl_ns / total_ns * 100.0, 1)
+
+    if len(device_total) > 1:
+        by_device = {
+            dev: round(device_nccl.get(dev, 0) / tot * 100.0, 1)
+            for dev, tot in device_total.items() if tot > 0
+        }
+        if by_device:
+            result["nccl_pct_by_device"] = by_device
+
+
+def _extract_device_count(conn: sqlite3.Connection, result: dict) -> None:
+    """Count distinct GPU devices active in the trace.
+
+    Lets downstream consumers (bottleneck analysis, dashboard) tell a
+    single-GPU run apart from a multi-GPU one without re-deriving it from
+    the per-kernel device_id fields scattered across other summary keys.
+    """
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT deviceId) AS n FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return
+    if row and row["n"]:
+        result["gpu_device_count"] = row["n"]
+
+
 def _extract_memcpy(conn: sqlite3.Connection, result: dict) -> None:
     """Memory transfer summary grouped by direction."""
     kind_map = {1: "HtoD", 2: "DtoH", 8: "DtoD"}
@@ -257,9 +390,16 @@ def _extract_gpu_utilization(conn: sqlite3.Connection, result: dict) -> None:
     Kernels can run concurrently on multiple streams, so summing per-kernel
     durations double-counts overlap (and can exceed 100%). The GPU is
     "active" whenever at least one kernel is running, i.e. the interval union.
+
+    On a multi-GPU trace this "any device busy" union is still a meaningful
+    whole-machine metric (it tells you whether the CPU host ever leaves the
+    entire accelerator subsystem idle), but it can look healthy even when one
+    GPU is doing all the work and another sits idle. gpu_active_pct_by_device
+    covers that: each device's own busy union over the *same* trace span, so
+    devices are directly comparable and an idle straggler stands out.
     """
     rows = conn.execute(
-        "SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        "SELECT start, end, deviceId FROM CUPTI_ACTIVITY_KIND_KERNEL"
     ).fetchall()
     intervals = [(r["start"], r["end"]) for r in rows
                  if r["start"] is not None and r["end"] is not None]
@@ -270,6 +410,25 @@ def _extract_gpu_utilization(conn: sqlite3.Connection, result: dict) -> None:
     span_ns = max(e for _, e in intervals) - min(s for s, _ in intervals)
     if span_ns > 0:
         result["gpu_active_pct"] = round(busy_ns / span_ns * 100.0, 1)
+
+    device_ids = {r["deviceId"] for r in rows if r["deviceId"] is not None}
+    if len(device_ids) > 1 and span_ns > 0:
+        by_device: dict[int, float] = {}
+        for dev in device_ids:
+            dev_intervals = [
+                (r["start"], r["end"]) for r in rows
+                if r["deviceId"] == dev and r["start"] is not None and r["end"] is not None
+            ]
+            if not dev_intervals:
+                continue
+            dev_busy = union_duration(dev_intervals)
+            # Denominator is the *global* span (not this device's own local
+            # span) so devices stay comparable -- a GPU that starts late or
+            # finishes early should show up as less active, not 100% within
+            # its own narrower window.
+            by_device[dev] = round(dev_busy / span_ns * 100.0, 1)
+        if by_device:
+            result["gpu_active_pct_by_device"] = by_device
 
 
 def _extract_kernel_gaps(conn: sqlite3.Connection, result: dict) -> None:
@@ -481,7 +640,8 @@ def _extract_cpu_gpu_correlation(conn: sqlite3.Connection, result: dict) -> None
                 k.demangledName AS kernel_name,
                 k.start AS gpu_start,
                 k.end   AS gpu_end,
-                k.streamId
+                k.streamId,
+                k.deviceId
             FROM CUPTI_ACTIVITY_KIND_RUNTIME r
             JOIN StringIds s ON r.nameId = s.id
             JOIN CUPTI_ACTIVITY_KIND_KERNEL k ON r.correlationId = k.correlationId
@@ -515,6 +675,7 @@ def _extract_cpu_gpu_correlation(conn: sqlite3.Connection, result: dict) -> None
             "gpu_duration_ns": gpu_dur,
             "launch_overhead_ns": max(0, launch_overhead),
             "stream_id": r["streamId"],
+            "device_id": r["deviceId"],
         })
 
     result["cpu_gpu_correlations"] = correlations
@@ -661,12 +822,18 @@ def _extract_callchain_context(conn: sqlite3.Connection, result: dict) -> None:
 
 
 def _extract_per_stream_gaps(conn: sqlite3.Connection, result: dict) -> None:
-    """Compute kernel gaps per CUDA stream for pipeline stall detection."""
+    """Compute kernel gaps per (device, stream) for pipeline stall detection.
+
+    Keyed by "{device_id}:{stream_id}" rather than stream_id alone: CUDA
+    assigns stream IDs per-device, so on a multi-GPU trace the same
+    stream_id is reused on every device and a device-blind key would merge
+    unrelated streams from different GPUs into one bucket.
+    """
     try:
         cur = conn.execute("""
-            SELECT streamId, start, end
+            SELECT deviceId, streamId, start, end
             FROM CUPTI_ACTIVITY_KIND_KERNEL
-            ORDER BY streamId, start
+            ORDER BY deviceId, streamId, start
         """)
         rows = cur.fetchall()
     except sqlite3.OperationalError:
@@ -675,16 +842,16 @@ def _extract_per_stream_gaps(conn: sqlite3.Connection, result: dict) -> None:
     if len(rows) < 2:
         return
 
-    # Group by stream
-    streams: dict[int, list[tuple[int, int]]] = {}
+    # Group by (device, stream)
+    streams: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for r in rows:
-        sid = r["streamId"]
-        streams.setdefault(sid, []).append((r["start"], r["end"]))
+        dev_stream = (r["deviceId"], r["streamId"])
+        streams.setdefault(dev_stream, []).append((r["start"], r["end"]))
 
-    per_stream_gaps: dict[int, dict] = {}
-    stream_utilization: dict[int, dict] = {}
+    per_stream_gaps: dict[str, dict] = {}
+    stream_utilization: dict[str, dict] = {}
 
-    for sid, intervals in streams.items():
+    for (device_id, sid), intervals in streams.items():
         if not intervals:
             continue
 
@@ -702,9 +869,12 @@ def _extract_per_stream_gaps(conn: sqlite3.Connection, result: dict) -> None:
             prev_end = max(prev_end, end)
 
         span_ns = intervals[-1][1] - intervals[0][0]
+        key = f"{device_id}:{sid}"
 
         if gaps_ns:
-            per_stream_gaps[sid] = {
+            per_stream_gaps[key] = {
+                "device_id": device_id,
+                "stream_id": sid,
                 "avg_gap_us": round(sum(gaps_ns) / len(gaps_ns) / 1e3, 2),
                 "max_gap_us": round(max(gaps_ns) / 1e3, 2),
                 "num_gaps": len(gaps_ns),
@@ -713,7 +883,9 @@ def _extract_per_stream_gaps(conn: sqlite3.Connection, result: dict) -> None:
             }
 
         if span_ns > 0:
-            stream_utilization[sid] = {
+            stream_utilization[key] = {
+                "device_id": device_id,
+                "stream_id": sid,
                 "active_pct": round(total_kernel_ns / span_ns * 100.0, 1),
                 "kernel_count": len(intervals),
                 "total_kernel_ms": round(total_kernel_ns / 1e6, 2),

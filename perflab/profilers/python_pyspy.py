@@ -141,8 +141,13 @@ class PySpyProfiler:
         # GPU cross-referencing in a single run (no second benchmark execution).
         # Each attempt escalates to sudo when the non-sudo run failed and
         # produced no artifact (see run_bench_with_sudo_fallback).
+        # --subprocesses: py-spy's default is to sample *only* the directly
+        # launched process, so a multiprocessing.Pool/ProcessPoolExecutor
+        # benchmark would otherwise show almost nothing but the parent
+        # blocked in pool.join() -- this also attaches to worker processes
+        # spawned after py-spy starts (py-spy watches for new children).
         res, _ = run_bench_with_sudo_fallback(
-            ["py-spy", "record", "--native", "--format", "speedscope",
+            ["py-spy", "record", "--native", "--subprocesses", "--format", "speedscope",
              "-o", str(out_speedscope), "--"],
             bench_cmd, cwd, expect_artifact=out_speedscope,
         )
@@ -151,7 +156,7 @@ class PySpyProfiler:
         # Fall back to without --native (some platforms don't support it)
         if res.returncode != 0 and not out_speedscope.exists():
             res, _ = run_bench_with_sudo_fallback(
-                ["py-spy", "record", "--format", "speedscope",
+                ["py-spy", "record", "--subprocesses", "--format", "speedscope",
                  "-o", str(out_speedscope), "--"],
                 bench_cmd, cwd, expect_artifact=out_speedscope,
             )

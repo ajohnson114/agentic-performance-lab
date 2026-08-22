@@ -115,6 +115,9 @@ class AgentContext:
     early_stop_reason: str | None = None
     convergence: ConvergenceDetector | None = None
     wall_start: float = field(default_factory=time.monotonic)
+    # Set once the compute-sanitizer accept gate has warned about a missing
+    # binary, so a whole run doesn't repeat the same warning every iteration.
+    sanitizer_unavailable_warned: bool = False
 
     def to_dict(self) -> dict:
         """Serialize optimization state for the per-iteration state.json run

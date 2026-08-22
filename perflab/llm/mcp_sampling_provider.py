@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from perflab.llm.base import CompletionResult, Message
+from perflab.llm.base import CompletionResult, Message, ToolSpec
 
 
 @dataclass
@@ -26,6 +26,12 @@ class MCPSamplingProvider:
     def is_available(self) -> bool:
         return self._sample_fn is not None and self._loop is not None
 
+    def supports_tools(self) -> bool:
+        # Tool support depends entirely on the connected MCP client's own
+        # sampling capabilities, which perflab has no way to introspect --
+        # a tool loop must fall back to single-shot for this provider.
+        return False
+
     def complete(
         self,
         messages: Sequence[Message],
@@ -34,7 +40,10 @@ class MCPSamplingProvider:
         max_tokens: int = 4096,
         json_mode: bool = False,
         stop: Sequence[str] | None = None,
+        tools: Sequence[ToolSpec] | None = None,
     ) -> CompletionResult:
+        if tools:
+            raise NotImplementedError("MCPSamplingProvider does not support tool calling yet (supports_tools() is False)")
         if self._sample_fn is None or self._loop is None:
             raise RuntimeError(
                 "MCPSamplingProvider.complete() called before the MCP sample "

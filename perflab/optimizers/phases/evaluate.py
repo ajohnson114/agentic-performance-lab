@@ -45,6 +45,7 @@ from perflab.runners.correctness import run_correctness, run_correctness_twice
 from perflab.runners.paired import PairedRun, run_paired_benchmark
 from perflab.runners.pipeline import run_pipeline_for_ctx
 from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S
+from perflab.tools import compute_sanitizer
 from perflab.tools.shell import run_cmd
 
 if TYPE_CHECKING:
@@ -527,6 +528,78 @@ def _remeasure_full(ctx: AgentContext, cand: BeamCandidate) -> str:
     return ""
 
 
+def _cuda_sanitizer_gate(ctx: AgentContext, cand: BeamCandidate) -> str:
+    """Final CUDA memory/race-safety gate: compute-sanitizer, run once
+    against the candidate about to be accepted -- between the correctness
+    pass earlier in this iteration and the permanent apply below.
+
+    Returns "" to proceed: the task has no CUDA build, the check is
+    disabled, compute-sanitizer isn't installed, or the candidate is clean.
+    Otherwise a rejection reason. See perflab.tools.compute_sanitizer for why
+    this exists and why it targets the correctness command (not the much
+    slower, and irrelevant-to-what-this-catches, benchmark command).
+
+    Deliberately gated on the *winning* candidate only, not every prescreened
+    one: sanitizer instrumentation is expensive (racecheck especially), and
+    a losing candidate's memory safety was never going to matter.
+    """
+    task = ctx.task
+    build = getattr(task, "build", None)
+    if not compute_sanitizer.uses_cuda_build(build.cmd if build else None):
+        return ""
+    if not getattr(task.constraints, "compute_sanitizer", True):
+        return ""
+    if not compute_sanitizer.compute_sanitizer_available():
+        if not getattr(ctx, "sanitizer_unavailable_warned", False):
+            msg = (
+                "compute-sanitizer not found on PATH -- CUDA candidates are "
+                "being accepted on numerical correctness alone, without a "
+                "memory/race-safety check. Install NVIDIA's CUDA toolkit to "
+                "enable it."
+            )
+            ctx.progress.on_message(f"[agent]   WARNING: {msg}")
+            ctx.event_log.anti_gaming_warning(
+                ctx.iteration, "compute_sanitizer_unavailable", msg,
+            )
+            try:
+                ctx.sanitizer_unavailable_warned = True
+            except AttributeError:
+                pass  # duck-typed test double without the field; only affects repeat-warning suppression
+        return ""
+
+    with _patched_workspace_copy(
+        ctx.ws, cand.blocks, "perflab_sanitizer_", task.out_dir,
+    ) as temp_ws:
+        build_err = _build_arm(ctx, temp_ws)
+        if build_err:
+            return f"sanitizer {build_err}"
+        ctx.progress.on_message(
+            "[agent]   Running compute-sanitizer (memory/race safety)..."
+        )
+        report = compute_sanitizer.run_compute_sanitizer(
+            task.correctness.cmd, cwd=temp_ws,
+            tools=getattr(task.constraints, "compute_sanitizer_tools", None)
+            or list(compute_sanitizer.DEFAULT_TOOLS),
+            timeout_s=getattr(task.constraints, "compute_sanitizer_timeout_s", 180),
+            program_type=task.program_type,
+            rlimit_as_gb=task.constraints.rlimit_as_gb,
+            env_passthrough=task.constraints.env_passthrough,
+            isolation=ctx.config.isolation,
+        )
+
+    ctx.event_log.compute_sanitizer_check(
+        ctx.iteration, cand.index,
+        tools=[r.tool for r in report.results], clean=report.clean,
+        details=report.reason,
+    )
+    if not report.clean:
+        return report.reason
+    ctx.progress.on_message(
+        f"[agent]   compute-sanitizer clean ({', '.join(r.tool for r in report.results)})"
+    )
+    return ""
+
+
 def _incumbent_samples(ctx: AgentContext) -> list[float]:
     """Per-repeat samples for the *current best* program, or [] if unavailable.
 
@@ -789,6 +862,18 @@ def accept_best(
                 continue
 
         assert verdict is not None  # set by whichever branch reached here
+
+        # Final safety gate, between "correctness passed" and "accepted":
+        # a numerically-correct candidate can still be UB (out-of-bounds
+        # shared memory access, a missing __syncthreads()) that happens to
+        # compute the right answer today. See _cuda_sanitizer_gate; a no-op
+        # for non-CUDA tasks.
+        sanitizer_reason = _cuda_sanitizer_gate(ctx, cand)
+        if sanitizer_reason:
+            reject_reasons[idx] = sanitizer_reason
+            progress.on_message(f"[agent]   Rejected: {sanitizer_reason}")
+            continue
+
         if verdict.rule == accept_rule.name and paired_enabled and not verdict.paired:
             # Never silent, and distinct from the missing-samples note below:
             # the interleaved measurement did not happen, so this accept rests

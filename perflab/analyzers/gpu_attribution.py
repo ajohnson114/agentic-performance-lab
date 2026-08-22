@@ -41,6 +41,7 @@ class CpuGpuEdge:
     pct_of_total_gpu: float     # % of total GPU time
     framework_op: str | None = None  # enriched: "aten::matmul", "triton_fused_relu", etc.
     caller_function: str | None = None  # user-code function from call chain walking
+    device_id: int | None = None  # which GPU this edge ran on (multi-GPU traces)
 
 
 @dataclass
@@ -54,6 +55,7 @@ class AttributionEntry:
     cpu_pct: float | None = None       # % of CPU samples (from perf hotspots), if linkable
     launch_overhead_us: float | None = None
     stream_id: int | None = None
+    device_id: int | None = None  # which GPU this entry ran on (multi-GPU traces)
     caller_function: str | None = None  # user-code function that triggered this kernel
     framework_op: str | None = None     # framework-level op (e.g. aten::mm)
     diagnosis: str = ""      # human-readable description
@@ -63,17 +65,20 @@ class AttributionEntry:
 def build_cpu_gpu_call_graph(correlations: list[dict]) -> list[CpuGpuEdge]:
     """Build CPU→GPU call graph from correlation data.
 
-    Groups correlations by (api_name, kernel_name, stream_id) and computes
-    aggregate stats per edge, sorted by total GPU time descending.
+    Groups correlations by (api_name, kernel_name, stream_id, device_id) and
+    computes aggregate stats per edge, sorted by total GPU time descending.
+    device_id is part of the grouping key because stream IDs are assigned
+    per-device: without it, the same stream_id on two different GPUs would
+    be merged into a single (misleading) edge on multi-GPU traces.
     Propagates caller_function from call chain walking when available.
     """
     if not correlations:
         return []
 
-    # Group by (api_name, kernel_name, stream_id)
-    groups: dict[tuple[str, str, int], list[dict]] = {}
+    # Group by (api_name, kernel_name, stream_id, device_id)
+    groups: dict[tuple[str, str, int, int | None], list[dict]] = {}
     for c in correlations:
-        key = (c["api_name"], c["kernel_name"], c.get("stream_id", 0))
+        key = (c["api_name"], c["kernel_name"], c.get("stream_id", 0), c.get("device_id"))
         groups.setdefault(key, []).append(c)
 
     total_gpu_ns = sum(c.get("gpu_duration_ns", 0) for c in correlations)
@@ -81,7 +86,7 @@ def build_cpu_gpu_call_graph(correlations: list[dict]) -> list[CpuGpuEdge]:
         total_gpu_ns = 1  # avoid division by zero
 
     edges: list[CpuGpuEdge] = []
-    for (api_name, kernel_name, stream_id), items in groups.items():
+    for (api_name, kernel_name, stream_id, device_id), items in groups.items():
         count = len(items)
         total_ns = sum(it.get("gpu_duration_ns", 0) for it in items)
         overhead_ns = [it.get("launch_overhead_ns", 0) for it in items]
@@ -99,6 +104,7 @@ def build_cpu_gpu_call_graph(correlations: list[dict]) -> list[CpuGpuEdge]:
             avg_launch_overhead_us=avg_overhead_us,
             pct_of_total_gpu=total_ns / total_gpu_ns * 100.0,
             caller_function=caller,
+            device_id=device_id,
         ))
 
     edges.sort(key=lambda e: e.total_gpu_ms, reverse=True)
@@ -184,12 +190,14 @@ def compute_attribution_ranking(
         # Find matching edge for overhead info + caller
         overhead_us: float | None = None
         stream_id: int | None = None
+        device_id: int | None = None
         caller_function: str | None = None
         framework_op: str | None = None
         for edge in edges:
             if edge.kernel_name == name:
                 overhead_us = edge.avg_launch_overhead_us
                 stream_id = edge.stream_id
+                device_id = edge.device_id
                 caller_function = edge.caller_function
                 framework_op = edge.framework_op
                 break
@@ -248,6 +256,7 @@ def compute_attribution_ranking(
             cpu_pct=cpu_pct,
             launch_overhead_us=overhead_us,
             stream_id=stream_id,
+            device_id=device_id,
             caller_function=caller_function,
             framework_op=framework_op,
             diagnosis=diagnosis,
@@ -352,34 +361,41 @@ def detect_pipeline_stalls(
     per_stream_gaps: dict,
     stream_utilization: dict,
 ) -> list[AttributionEntry]:
-    """Detect per-stream pipeline stalls from gap analysis."""
+    """Detect per-(device, stream) pipeline stalls from gap analysis.
+
+    Both maps are keyed by "{device_id}:{stream_id}" (see
+    nsys_profiler._extract_per_stream_gaps) but each value also carries its
+    own device_id/stream_id, so the key itself is only used to join the two
+    maps together -- it's never parsed.
+    """
     entries: list[AttributionEntry] = []
 
     if not per_stream_gaps and not stream_utilization:
         return entries
 
-    for stream_id_str, util in (stream_utilization or {}).items():
-        stream_id = int(stream_id_str) if isinstance(stream_id_str, str) else stream_id_str
+    for key, util in (stream_utilization or {}).items():
+        stream_id = util.get("stream_id")
+        device_id = util.get("device_id")
         active_pct = util.get("active_pct", 100)
         kernel_count = util.get("kernel_count", 0)
 
-        gaps = (per_stream_gaps or {}).get(stream_id_str, {})
-        if not gaps:
-            gaps = (per_stream_gaps or {}).get(stream_id, {})
+        gaps = (per_stream_gaps or {}).get(key, {})
         max_gap_us = gaps.get("max_gap_us", 0)
 
         # 50% active: stream is idle more than busy — clear pipeline stall.
         # 100μs gap: kernel launch is ~5-20μs; >100μs between kernels = pipeline bubble.
         if active_pct < 50 and max_gap_us > 100:
+            gpu_label = f"GPU {device_id} " if device_id is not None else ""
             entries.append(AttributionEntry(
                 rank=0,
                 category="pipeline-stall",
-                name=f"stream_{stream_id}",
+                name=f"stream_{stream_id}" if device_id is None else f"gpu{device_id}_stream_{stream_id}",
                 gpu_time_ms=0,
                 gpu_pct=0,
                 stream_id=stream_id,
+                device_id=device_id,
                 diagnosis=(
-                    f"Stream {stream_id} is idle {100 - active_pct:.0f}% of the time "
+                    f"{gpu_label}Stream {stream_id} is idle {100 - active_pct:.0f}% of the time "
                     f"(max gap: {max_gap_us:.0f} us, {kernel_count} kernels)"
                 ),
                 suggestions=[
@@ -389,20 +405,31 @@ def detect_pipeline_stalls(
                 ],
             ))
 
-    # Detect multi-stream serialization
-    if len(stream_utilization or {}) > 1:
-        utils = list((stream_utilization or {}).values())
+    # Detect multi-stream serialization within a single device. Grouped by
+    # device_id first: comparing utilization spread across *different* GPUs
+    # is meaningless (they run independently), and would otherwise fire a
+    # false "imbalance" on every multi-GPU trace where one GPU is simply
+    # doing more work than another.
+    by_device: dict[int | None, list[dict]] = {}
+    for util in (stream_utilization or {}).values():
+        by_device.setdefault(util.get("device_id"), []).append(util)
+
+    for device_id, utils in by_device.items():
+        if len(utils) <= 1:
+            continue
         active_pcts = [u.get("active_pct", 0) for u in utils]
         # 40pp spread: streams with >40% utilization gap indicate serialization or load imbalance
         if active_pcts and max(active_pcts) - min(active_pcts) > 40:
+            gpu_label = f"GPU {device_id}: " if device_id is not None else ""
             entries.append(AttributionEntry(
                 rank=0,
                 category="pipeline-stall",
-                name="multi-stream-serialization",
+                name="multi-stream-serialization" if device_id is None else f"gpu{device_id}_multi-stream-serialization",
                 gpu_time_ms=0,
                 gpu_pct=0,
+                device_id=device_id,
                 diagnosis=(
-                    f"Multi-stream imbalance detected: utilization ranges from "
+                    f"{gpu_label}Multi-stream imbalance detected: utilization ranges from "
                     f"{min(active_pcts):.0f}% to {max(active_pcts):.0f}%"
                 ),
                 suggestions=[
