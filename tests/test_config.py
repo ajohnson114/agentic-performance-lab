@@ -53,17 +53,18 @@ class TestDefaults:
 
 class TestYamlOverlay:
     def test_overlay_all_sections(self):
+        # llm: is deliberately excluded here -- _overlay_yaml no longer
+        # touches it (LLMConfig.load() is the single source of truth for
+        # llm resolution, exercised via load_config() in TestLoadConfig and
+        # directly in test_llm_config.py).
         cfg = PerfLabConfig()
         data = {
-            "llm": {"provider": "anthropic", "model": "claude-opus-4-20250514"},
             "benchmark": {"warmup": 5, "repeats": 50},
             "profiler": {"peaks_no_cache": True},
             "mps": {"device_match": "M3 Max"},
             "ollama": {"allow_remote": True, "allowed_ports": [8080]},
         }
         _overlay_yaml(cfg, data)
-        assert cfg.llm.provider == "anthropic"
-        assert cfg.llm.model == "claude-opus-4-20250514"
         assert cfg.benchmark.warmup == 5
         assert cfg.profiler.peaks_no_cache is True
         assert cfg.mps.device_match == "M3 Max"
@@ -72,10 +73,9 @@ class TestYamlOverlay:
 
     def test_partial_overlay_preserves_defaults(self):
         cfg = PerfLabConfig()
-        _overlay_yaml(cfg, {"llm": {"model": "custom"}})
-        assert cfg.llm.model == "custom"
-        assert cfg.llm.provider == "openai"  # default preserved
-        assert cfg.benchmark.warmup == 3     # untouched section
+        _overlay_yaml(cfg, {"benchmark": {"repeats": 99}})
+        assert cfg.benchmark.repeats == 99
+        assert cfg.benchmark.warmup == 3     # untouched key
 
     def test_empty_yaml(self):
         cfg = PerfLabConfig()
@@ -117,14 +117,11 @@ class TestYamlOverlay:
         # load (and thereby every CLI command)
         cfg = PerfLabConfig()
         _overlay_yaml(cfg, {
-            "llm": {"temperature": "abc", "model": "custom"},
             "benchmark": {"warmup": "not-a-number"},
             "agent": {"max_iters": "nope", "n_candidates": 9},
             "ollama": {"allowed_ports": ["x"]},
             "mps": {"device_index": "zero"},
         })
-        assert cfg.llm.temperature == 0.7          # bad value skipped
-        assert cfg.llm.model == "custom"           # good sibling still applied
         assert cfg.benchmark.warmup == 3
         assert cfg.agent.max_iters == 12
         assert cfg.agent.n_candidates == 9
@@ -137,12 +134,16 @@ class TestYamlOverlay:
 # ---------------------------------------------------------------------------
 
 class TestEnvOverlay:
-    def test_env_overrides_yaml(self):
+    def test_env_overrides_isolation_level(self):
+        # llm: env overlay (PERFLAB_LLM_PROVIDER etc.) moved to
+        # LLMConfig.load(), which owns llm resolution end-to-end -- see
+        # test_llm_config.py. This exercises a section _overlay_env still
+        # handles directly.
         cfg = PerfLabConfig()
-        cfg.llm.provider = "openai"
-        with patch.dict(os.environ, {"PERFLAB_LLM_PROVIDER": "anthropic"}):
+        cfg.isolation.level = "auto"
+        with patch.dict(os.environ, {"PERFLAB_ISOLATION_LEVEL": "strict"}):
             _overlay_env(cfg)
-        assert cfg.llm.provider == "anthropic"
+        assert cfg.isolation.level == "strict"
 
     def test_env_benchmark_settings(self):
         cfg = PerfLabConfig()
@@ -192,8 +193,19 @@ class TestEnvOverlay:
 # ---------------------------------------------------------------------------
 
 class TestLoadConfig:
+    """cfg.llm is resolved entirely by LLMConfig.load() (see load_config()),
+    which does its own independent project-config discovery via
+    perflab.llm.config.find_project_config -- a separate bound name from
+    perflab.config.find_project_config even though both come from the same
+    underlying function, so tests that need to suppress project-config
+    discovery patch both to keep llm resolution and the other sections'
+    resolution equally isolated from whatever perflab.yaml might exist above
+    the real test-runner cwd.
+    """
+
     def test_loads_from_user_config(self, tmp_path, monkeypatch):
         import perflab.config as config_mod
+        import perflab.llm.config as llm_config_mod
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.dump({
             "llm": {"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
@@ -202,14 +214,17 @@ class TestLoadConfig:
         monkeypatch.setattr(config_mod, "_USER_CONFIG_PATH", config_path)
         monkeypatch.setattr(config_mod, "_cached_config", None)
         # No project config
-        monkeypatch.setattr(config_mod, "_find_project_config", lambda: None)
+        monkeypatch.setattr(config_mod, "find_project_config", lambda: None)
+        monkeypatch.setattr(llm_config_mod, "find_project_config", lambda: None)
 
         cfg = load_config(force_reload=True)
         assert cfg.llm.provider == "anthropic"
+        assert cfg.llm.model == "claude-sonnet-4-20250514"
         assert cfg.benchmark.warmup == 7
 
     def test_project_config_overrides_user(self, tmp_path, monkeypatch):
         import perflab.config as config_mod
+        import perflab.llm.config as llm_config_mod
         user_path = tmp_path / "user_config.yaml"
         user_path.write_text(yaml.dump({
             "llm": {"model": "user-model"},
@@ -221,21 +236,50 @@ class TestLoadConfig:
         }), encoding="utf-8")
         monkeypatch.setattr(config_mod, "_USER_CONFIG_PATH", user_path)
         monkeypatch.setattr(config_mod, "_cached_config", None)
-        monkeypatch.setattr(config_mod, "_find_project_config", lambda: project_path)
+        monkeypatch.setattr(config_mod, "find_project_config", lambda: project_path)
+        monkeypatch.setattr(llm_config_mod, "find_project_config", lambda: project_path)
 
         cfg = load_config(force_reload=True)
         assert cfg.llm.model == "user-model"  # from user config
         assert cfg.benchmark.warmup == 10      # project overrides
 
+    def test_project_config_llm_override_is_honored(self, tmp_path, monkeypatch):
+        # Regression test: LLMConfig.load() previously had no project-level
+        # perflab.yaml support at all, so a project-level llm: override was
+        # silently ignored for the config other call sites (cli.py,
+        # doctor.py) actually query. This proves a project-level llm:
+        # section now wins over the user config, matching the documented
+        # env > project > user > defaults order.
+        import perflab.config as config_mod
+        import perflab.llm.config as llm_config_mod
+        user_path = tmp_path / "user_config.yaml"
+        user_path.write_text(yaml.dump({
+            "llm": {"provider": "openai", "model": "user-model"},
+        }), encoding="utf-8")
+        project_path = tmp_path / "perflab.yaml"
+        project_path.write_text(yaml.dump({
+            "llm": {"provider": "anthropic", "model": "project-model"},
+        }), encoding="utf-8")
+        monkeypatch.setattr(config_mod, "_USER_CONFIG_PATH", user_path)
+        monkeypatch.setattr(config_mod, "_cached_config", None)
+        monkeypatch.setattr(config_mod, "find_project_config", lambda: project_path)
+        monkeypatch.setattr(llm_config_mod, "find_project_config", lambda: project_path)
+
+        cfg = load_config(force_reload=True)
+        assert cfg.llm.provider == "anthropic"
+        assert cfg.llm.model == "project-model"
+
     def test_env_overrides_all(self, tmp_path, monkeypatch):
         import perflab.config as config_mod
+        import perflab.llm.config as llm_config_mod
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.dump({
             "llm": {"model": "yaml-model"},
         }), encoding="utf-8")
         monkeypatch.setattr(config_mod, "_USER_CONFIG_PATH", config_path)
         monkeypatch.setattr(config_mod, "_cached_config", None)
-        monkeypatch.setattr(config_mod, "_find_project_config", lambda: None)
+        monkeypatch.setattr(config_mod, "find_project_config", lambda: None)
+        monkeypatch.setattr(llm_config_mod, "find_project_config", lambda: None)
         monkeypatch.setenv("PERFLAB_LLM_MODEL", "env-model")
 
         cfg = load_config(force_reload=True)
@@ -243,8 +287,10 @@ class TestLoadConfig:
 
     def test_caching(self, monkeypatch):
         import perflab.config as config_mod
+        import perflab.llm.config as llm_config_mod
         monkeypatch.setattr(config_mod, "_cached_config", None)
-        monkeypatch.setattr(config_mod, "_find_project_config", lambda: None)
+        monkeypatch.setattr(config_mod, "find_project_config", lambda: None)
+        monkeypatch.setattr(llm_config_mod, "find_project_config", lambda: None)
 
         cfg1 = load_config(force_reload=True)
         cfg2 = load_config()
@@ -252,8 +298,10 @@ class TestLoadConfig:
 
     def test_force_reload(self, monkeypatch):
         import perflab.config as config_mod
+        import perflab.llm.config as llm_config_mod
         monkeypatch.setattr(config_mod, "_cached_config", None)
-        monkeypatch.setattr(config_mod, "_find_project_config", lambda: None)
+        monkeypatch.setattr(config_mod, "find_project_config", lambda: None)
+        monkeypatch.setattr(llm_config_mod, "find_project_config", lambda: None)
 
         cfg1 = load_config(force_reload=True)
         cfg2 = load_config(force_reload=True)

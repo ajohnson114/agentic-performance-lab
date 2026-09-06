@@ -112,6 +112,78 @@ class TestPreexecExceptionNarrowing:
 
 
 # ---------------------------------------------------------------------------
+# 5. skip_preexec's ulimit-shell fallback (prescreen's ThreadPoolExecutor path)
+# ---------------------------------------------------------------------------
+#
+# skip_preexec=True previously meant NO resource limit at all -- preexec_fn
+# can't be used from a thread (preexec_fn + fork() in a multithreaded process
+# is undefined behavior), so it was skipped entirely rather than degraded.
+# That left prescreen's parallel candidate build+correctness (untrusted,
+# LLM-authored code) running with zero memory ceiling. _rlimit_shell_wrap
+# closes that gap via a bash `ulimit` shim, which needs no preexec_fn (so
+# Popen can use posix_spawn, never forking the parent at all).
+#
+# Real enforcement can't be proven on this dev box: _rlimit_shell_wrap (like
+# _make_linux_preexec) is gated to Linux only, and forcing platform.system()
+# to report "Linux" doesn't change the real underlying kernel -- macOS's own
+# bash rejects `ulimit -v` outright ("cannot modify limit: Invalid
+# argument"), it just doesn't abort the script. So these tests cover the
+# wrap's shape and that it doesn't break normal execution, not OS-level
+# enforcement (that's CI/docker-dev-container territory, like the bwrap/
+# seccomp acceptance tests).
+
+class TestSkipPreexecRlimitShellWrap:
+    def test_wrap_shape_includes_as_nproc_nofile(self, monkeypatch):
+        monkeypatch.setattr(shell.platform, "system", lambda: "Linux")
+        wrapped = shell._rlimit_shell_wrap(["echo", "hi"], 4 * 1024**3, 512)
+        assert wrapped[:2] == ["bash", "-c"]
+        script = wrapped[2]
+        assert f"ulimit -v {4 * 1024**2}" in script  # bytes -> KiB
+        assert "ulimit -u 512" in script
+        assert "ulimit -n 1024" in script
+        assert 'exec "$@"' in script
+        assert wrapped[3:] == ["bash", "echo", "hi"]
+
+    def test_wrap_omits_as_limit_when_rlimit_as_bytes_is_none(self, monkeypatch):
+        # None means "explicitly disabled" (see _resolve_rlimit) -- must not
+        # silently impose some other AS ceiling.
+        monkeypatch.setattr(shell.platform, "system", lambda: "Linux")
+        wrapped = shell._rlimit_shell_wrap(["echo", "hi"], None, 512)
+        script = wrapped[2]
+        assert "ulimit -v" not in script
+        assert "ulimit -u 512" in script
+
+    def test_non_linux_leaves_cmd_unwrapped(self, monkeypatch):
+        monkeypatch.setattr(shell.platform, "system", lambda: "Darwin")
+        wrapped = shell._rlimit_shell_wrap(["echo", "hi"], 4 * 1024**3, 512)
+        assert wrapped == ["echo", "hi"]
+
+    def test_run_cmd_skip_preexec_still_wraps_and_runs_correctly_on_linux(self, monkeypatch):
+        # End-to-end through run_cmd: platform forced to "Linux" so the wrap
+        # activates, proving it doesn't corrupt argv/output on a real
+        # (unpatched-kernel) subprocess run -- see the module note above for
+        # why this can't assert real memory-ceiling enforcement here.
+        monkeypatch.setattr(shell.platform, "system", lambda: "Linux")
+        res = shell.run_cmd(
+            ["python3", "-c", "print('wrapped-ok')"],
+            rlimit_as_bytes=4 * 1024**3,
+            skip_preexec=True,
+        )
+        assert res.returncode == 0
+        assert "wrapped-ok" in res.stdout
+
+    def test_run_cmd_skip_preexec_non_linux_runs_unwrapped(self, monkeypatch):
+        monkeypatch.setattr(shell.platform, "system", lambda: "Darwin")
+        res = shell.run_cmd(
+            ["python3", "-c", "print('unwrapped-ok')"],
+            rlimit_as_bytes=4 * 1024**3,
+            skip_preexec=True,
+        )
+        assert res.returncode == 0
+        assert "unwrapped-ok" in res.stdout
+
+
+# ---------------------------------------------------------------------------
 # 4. AgentEventLog.rlimit_warning + replay
 # ---------------------------------------------------------------------------
 

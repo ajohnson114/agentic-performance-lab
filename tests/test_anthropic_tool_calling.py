@@ -16,8 +16,13 @@ from perflab.llm.base import Message, ToolCall, ToolSpec
 
 
 def _mock_anthropic(resp) -> MagicMock:
+    # complete() streams internally (see anthropic_provider.py) and calls
+    # stream.get_final_message() to get the same Message shape create() used
+    # to return directly -- so the mock's __enter__ result is what needs
+    # get_final_message configured, not messages.create.
     mock_anthropic = MagicMock()
-    mock_anthropic.Anthropic.return_value.messages.create.return_value = resp
+    stream_cm = mock_anthropic.Anthropic.return_value.messages.stream
+    stream_cm.return_value.__enter__.return_value.get_final_message.return_value = resp
     return mock_anthropic
 
 
@@ -49,7 +54,7 @@ class TestToolsKwargShape:
             AnthropicProvider(api_key="sk-x").complete(
                 [Message("user", "show me the sass")], tools=tools
             )
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assert create_kwargs["tools"] == [
             {
                 "name": "get_sass",
@@ -71,7 +76,7 @@ class TestToolsKwargShape:
         mock_anthropic = _mock_anthropic(resp)
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             AnthropicProvider(api_key="sk-x").complete([Message("user", "hi")])
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assert "tools" not in create_kwargs
 
 
@@ -160,7 +165,7 @@ class TestToolResultRoundTrip:
         ]
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             AnthropicProvider(api_key="sk-x").complete(messages)
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assert create_kwargs["messages"] == [
             {"role": "user", "content": "show me the sass for matmul_kernel"},
             {
@@ -205,7 +210,7 @@ class TestToolResultRoundTrip:
         ]
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             AnthropicProvider(api_key="sk-x").complete(messages)
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assistant_turn = create_kwargs["messages"][1]
         assert assistant_turn["content"] == [
             {"type": "tool_use", "id": "toolu_1", "name": "run_ncu", "input": {}}
@@ -233,7 +238,7 @@ class TestToolResultRoundTrip:
         ]
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             AnthropicProvider(api_key="sk-x").complete(messages)
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         sent_messages = create_kwargs["messages"]
         # Exactly 3 turns -- user, assistant, and ONE batched user turn with
         # both tool_result blocks -- not 4 (which would mean one turn per
@@ -262,7 +267,7 @@ class TestToolResultRoundTrip:
         ]
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             AnthropicProvider(api_key="sk-x").complete(messages)
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         sent_messages = create_kwargs["messages"]
         assert len(sent_messages) == 3
         assert sent_messages[0]["content"] == [
@@ -292,7 +297,7 @@ class TestRegressionNoToolsPath:
         assert result.content == "hello world"
         assert result.finish_reason == "end_turn"
         assert result.tool_calls is None
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assert create_kwargs["system"] == "be terse"
         assert create_kwargs["messages"] == [{"role": "user", "content": "hi"}]
         assert "tools" not in create_kwargs

@@ -445,7 +445,7 @@ class TestBuildTimeout:
             self._load(tmp_path, "build:\n  cmd: \"make\"\n  timeout_s: 0\n")
 
     def _run_prescreen_build(self, tmp_path, monkeypatch, build_block: str) -> int:
-        import perflab.tools.shell as shell_mod
+        import perflab.runners.benchmark as benchmark_mod
         from perflab.optimizers.patch import SearchReplaceBlock
         from perflab.optimizers.phases import prescreen as prescreen_mod
 
@@ -467,7 +467,11 @@ class TestBuildTimeout:
             captured["timeout_s"] = timeout_s
             return CmdResult(cmd=list(cmd), returncode=0, stdout="", stderr="", duration_s=0.01)
 
-        monkeypatch.setattr(shell_mod, "run_cmd", fake_run_cmd)
+        # prescreen's build call now goes through run_build_cmd (the shared
+        # rlimit-resolving funnel), which calls run_cmd via its own
+        # module-level import -- the spy patches it there, matching
+        # TestBuildArmUsesGpuRlimit's pattern in test_candidate_workspace.py.
+        monkeypatch.setattr(benchmark_mod, "run_cmd", fake_run_cmd)
         monkeypatch.setattr(
             prescreen_mod, "run_correctness",
             lambda *a, **k: CmdResult(cmd=[], returncode=0, stdout="", stderr="", duration_s=0.01),

@@ -39,6 +39,19 @@ class NcuProfiler:
         report_res = run_bench_under(
             ncu_base + ["-o", str(report_path)], bench_cmd, cwd=cwd,
         )
+        if report_res.returncode != 0 and "ERR_NVGPUCTRPERM" in (report_res.stderr or ""):
+            # Well-known cause: GPU performance counters are restricted to
+            # admin users (NVreg_RestrictProfilingToAdminUsers=1) and this
+            # process isn't root -- surfaced distinctly from "ncu just
+            # produced no data" so it doesn't look like a parsing bug (`perflab
+            # doctor` also flags this proactively via the sysfs param, but
+            # that file isn't always readable, e.g. inside some containers).
+            logger.warning(
+                "ncu failed with ERR_NVGPUCTRPERM: GPU performance counters are "
+                "admin-restricted. Run perflab as root/sudo, or set "
+                "NVreg_RestrictProfilingToAdminUsers=0 (requires reloading the "
+                "nvidia kernel module or a reboot)."
+            )
 
         csv_returncode: int | None = None
         exported = False

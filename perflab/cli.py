@@ -457,15 +457,15 @@ def show_config():
     """Show the resolved PerfLab configuration (all layers merged)."""
     from perflab.config import (
         _USER_CONFIG_PATH,
-        _find_project_config,
         load_config,
     )
+    from perflab.llm.config import find_project_config
 
     cfg = load_config(force_reload=True)
     typer.echo("Resolved PerfLab configuration")
     typer.echo("=" * 40)
     typer.echo(f"User config:    {_USER_CONFIG_PATH}" + (" (found)" if _USER_CONFIG_PATH.exists() else " (not found)"))
-    project = _find_project_config()
+    project = find_project_config()
     typer.echo(f"Project config: {project or '(not found)'}")
     typer.echo("Priority: env vars > project > user > defaults\n")
 

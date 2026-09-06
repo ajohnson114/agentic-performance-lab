@@ -109,6 +109,39 @@ def _make_linux_preexec(
     return _preexec
 
 
+def _rlimit_shell_wrap(cmd: Sequence[str], rlimit_as_bytes: int | None, rlimit_nproc: int) -> list[str]:
+    """Enforce RLIMIT_AS/NPROC/NOFILE via a bash ulimit shim, not preexec_fn.
+
+    Used when skip_preexec=True so that untrusted candidate builds/tests run
+    from a ThreadPoolExecutor worker (prescreen) still get a memory ceiling
+    instead of none at all. preexec_fn requires Popen to fork() the parent,
+    and preexec_fn + fork() in a multithreaded process is undefined behavior
+    (a lock held by some other thread at fork time stays locked forever in
+    the child, since only the forking thread's stack survives) -- that's
+    exactly why skip_preexec exists, and why this cannot just call
+    _make_linux_preexec instead. `ulimit` is a bash builtin: it sets the
+    limit inside the child after bash starts, so Python never needs
+    preexec_fn for this and Popen is free to use posix_spawn (no fork of the
+    parent at all).
+
+    A ulimit failure (unsupported/too-large value) prints bash's own message
+    to stderr and the script continues -- this intentionally doesn't try to
+    reproduce _make_linux_preexec's structured "[perflab-rlimit-failed ...]"
+    marker/CmdResult.rlimits_applied bookkeeping, which is specific to that
+    preexec_fn path; a caller that skips preexec_fn already exits that
+    contract (rlimits_applied stays None, as documented on CmdResult).
+    """
+    if platform.system() != "Linux":
+        return list(cmd)
+    limits = []
+    if rlimit_as_bytes is not None:
+        limits.append(f"ulimit -v {rlimit_as_bytes // 1024}")
+    limits.append(f"ulimit -u {rlimit_nproc}")
+    limits.append("ulimit -n 1024")
+    script = "; ".join(limits) + '; exec "$@"'
+    return ["bash", "-c", script, "bash", *cmd]
+
+
 # Default wall-clock timeout for subprocesses launched via run_cmd. Benchmark
 # and profiler invocations previously defaulted to no timeout, so a wedged
 # candidate (deadlock, infinite loop) hung the whole stage forever. 600 s is
@@ -631,7 +664,10 @@ def run_cmd(
     threads (e.g. ThreadPoolExecutor) because preexec_fn + fork() in a
     multithreaded process has undefined behavior (Python docs). Note this
     also skips CPU pinning -- callers that need a *measured* run must not set
-    it (run_benchmark never does).
+    it (run_benchmark never does). RLIMIT_AS/NPROC/NOFILE are NOT skipped,
+    though: on Linux they're applied via a bash `ulimit` shim instead (see
+    _rlimit_shell_wrap), so untrusted candidate code run this way (prescreen)
+    still gets a memory ceiling rather than none at all.
 
     cpu_affinity / nice_adj: CPU environment for the child (Linux only, see
     CpuPlan). Callers running a benchmark should pass resolve_cpu_plan()'s
@@ -667,6 +703,8 @@ def run_cmd(
         )
     )
     cmd = _resolve_python(cmd)
+    if skip_preexec:
+        cmd = _rlimit_shell_wrap(cmd, rlimit_as_bytes, rlimit_nproc)
 
     if env_mode == "allowlist":
         run_env = agent_subprocess_env(env)

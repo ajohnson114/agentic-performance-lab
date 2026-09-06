@@ -151,7 +151,17 @@ class AnthropicProvider:
                 for t in tools
             ]
 
-        resp = client.messages.create(**kwargs)
+        # Streamed, not client.messages.create(): non-streaming requests risk
+        # an HTTP timeout at large max_tokens (Anthropic's own guidance caps
+        # non-streaming at ~16000 for this reason), and this provider's
+        # generate-phase callers routinely need far more than that for a full
+        # reasoning-plus-patch response -- confirmed on real hardware, where
+        # candidate generation for CUDA/tensor-core tasks needed 20-30k+
+        # output tokens per turn. get_final_message() reassembles the same
+        # Message shape create() would have returned, so every line below is
+        # unchanged from the non-streaming version.
+        with client.messages.stream(**kwargs) as stream:
+            resp = stream.get_final_message()
         content = ""
         tool_calls: list[ToolCall] = []
         for block in resp.content:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import shutil
 import sys
@@ -35,6 +36,38 @@ def _detect_cpu_vendor() -> str:
     except (OSError, ValueError):
         logger.debug("CPU vendor detection failed", exc_info=True)
     return "unknown"
+
+
+def _ncu_permission_restricted() -> bool | None:
+    """Check whether GPU performance counters are admin-restricted.
+
+    NVreg_RestrictProfilingToAdminUsers=1 is the documented cause of ncu/nsys
+    failing with ERR_NVGPUCTRPERM for a non-root user -- confirmed hitting
+    this on a real rented GPU pod, where it wasn't obvious from ncu's own
+    (fairly opaque) failure alone why profiling wasn't producing data. This
+    reads the same NVIDIA-documented sysfs param NVIDIA's own troubleshooting
+    guidance points at, so doctor can warn about it proactively instead of a
+    user discovering it only after a wasted profiled run.
+
+    Returns True if restricted, False if not, None if undetectable (no
+    NVIDIA driver present, non-Linux, or the param isn't exposed here).
+    """
+    params_path = Path("/proc/driver/nvidia/params")
+    try:
+        if not params_path.exists():
+            return None
+        text = params_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        logger.debug("Could not read %s", params_path, exc_info=True)
+        return None
+    for line in text.splitlines():
+        if line.startswith("NVreg_RestrictProfilingToAdminUsers:"):
+            return line.split(":", 1)[1].strip() == "1"
+    return None
+
+
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 @dataclass
@@ -142,16 +175,35 @@ def check_profiler_tools() -> list[CheckResult]:
     else:
         results.append(CheckResult("tool:bpftrace", "pass", "N/A (Linux only)"))
 
+    # Both nsys and ncu fail with ERR_NVGPUCTRPERM under the same restriction
+    # (NVreg_RestrictProfilingToAdminUsers=1 + not root) -- computed once and
+    # reused for both checks below.
+    ncu_restricted = _ncu_permission_restricted()
+    running_as_root = _is_root()
+    _perm_warning = (
+        "GPU performance counters are admin-restricted "
+        "(NVreg_RestrictProfilingToAdminUsers=1) and this process is not root "
+        "-- profiling will fail with ERR_NVGPUCTRPERM. Fix: run perflab as "
+        "root/sudo, or set NVreg_RestrictProfilingToAdminUsers=0 (requires "
+        "reloading the nvidia kernel module or a reboot)."
+    )
+
     # nsys (NVIDIA) — GPU timeline profiler: kernel launches, memory transfers, API overhead
     if shutil.which("nsys"):
-        results.append(CheckResult("tool:nsys", "pass", "found (NVIDIA GPU timeline profiler)"))
+        if ncu_restricted and not running_as_root:
+            results.append(CheckResult("tool:nsys", "warn", f"found, but {_perm_warning}"))
+        else:
+            results.append(CheckResult("tool:nsys", "pass", "found (NVIDIA GPU timeline profiler)"))
     else:
         results.append(CheckResult("tool:nsys", "warn",
             "not found (optional: NVIDIA GPU timeline profiler) — usually pre-installed on cloud GPU providers"))
 
     # ncu (NVIDIA) — GPU kernel profiler: SM utilization, memory throughput, occupancy
     if shutil.which("ncu"):
-        results.append(CheckResult("tool:ncu", "pass", "found (NVIDIA GPU kernel profiler)"))
+        if ncu_restricted and not running_as_root:
+            results.append(CheckResult("tool:ncu", "warn", f"found, but {_perm_warning}"))
+        else:
+            results.append(CheckResult("tool:ncu", "pass", "found (NVIDIA GPU kernel profiler)"))
     else:
         results.append(CheckResult("tool:ncu", "warn",
             "not found (optional: NVIDIA GPU kernel profiler) — usually pre-installed on cloud GPU providers"))

@@ -302,8 +302,9 @@ class TestOutDirNotCopied:
 class TestBuildArmUsesGpuRlimit:
     def test_build_arm_uses_gpu_rlimit_for_gpu_program_types(self, tmp_path, monkeypatch):
         # Confirmed on real H100 hardware: candidates that had just passed
-        # prescreen's own build (which disables rlimit entirely, via
-        # skip_preexec=True -- required for its ThreadPoolExecutor context)
+        # prescreen's own build (skip_preexec=True is required for its
+        # ThreadPoolExecutor context, but the rlimit itself is still enforced
+        # via run_cmd's ulimit shell fallback -- see _rlimit_shell_wrap)
         # then failed here with an opaque exit 1 when the build needed to
         # touch the GPU driver (nvcc -arch=native auto-detecting compute
         # capability, unlike a hardcoded -arch=sm_90) under the unadorned

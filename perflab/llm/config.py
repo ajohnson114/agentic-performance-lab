@@ -10,6 +10,7 @@ import yaml
 from perflab.llm.base import LLMProvider
 
 _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "perflab" / "config.yaml"
+_PROJECT_CONFIG_NAME = "perflab.yaml"
 
 # Single source of truth for per-provider default models. Referenced by
 # perflab.config, perflab.cli, and the provider defaults so they can't drift.
@@ -19,6 +20,32 @@ PROVIDER_DEFAULT_MODELS = {
     "ollama": "llama3.2",
 }
 DEFAULT_MODEL = PROVIDER_DEFAULT_MODELS["openai"]
+
+# Top-level keys that mark a YAML file as a general PerfLabConfig-style file
+# (see perflab.config.PerfLabConfig) rather than a dedicated flat llm-only
+# config -- used by LLMConfig._load_yaml_section to decide whether a missing
+# `llm:` key means "flat llm data at top level" or "no llm data here".
+_PERFLAB_CONFIG_SECTION_KEYS = frozenset({
+    "benchmark", "profiler", "mps", "ollama", "agent", "isolation", "analysis_thresholds",
+})
+
+
+def find_project_config(filename: str = _PROJECT_CONFIG_NAME) -> Path | None:
+    """Walk up from cwd looking for a project-level config file.
+
+    Shared by LLMConfig.load() and perflab.config.load_config() -- both
+    honor the same documented resolution order (env > project > user >
+    defaults), so there is exactly one place that decides what "project
+    config" means.
+    """
+    cwd = Path.cwd()
+    for parent in [cwd, *cwd.parents]:
+        candidate = parent / filename
+        if candidate.exists():
+            return candidate
+        if parent == Path.home() or parent == parent.parent:
+            break
+    return None
 
 
 def _check_config_permissions(path: Path) -> None:
@@ -116,17 +143,57 @@ class LLMConfig:
     api_key: str = ""
     api_base: str = ""
     temperature: float = 0.7
-    max_tokens: int = 16000
+    # 64000, not a lower "safe for non-streaming" figure: every provider's
+    # complete() now streams internally (see anthropic_provider.py), and
+    # real-hardware runs showed a full reasoning-plus-patch response for a
+    # CUDA/tensor-core task routinely needs 20-30k+ output tokens on Claude
+    # Opus 5, where thinking (on by default, no separate budget_tokens knob
+    # anymore) shares this same ceiling with the response text. A lower
+    # default here silently discards the tail of the model's patch and wastes
+    # the whole turn's cost on a candidate that never gets parsed.
+    max_tokens: int = 64000
     # Optional per-model USD-per-million-token overrides, merged over the
     # built-in table in perflab.llm.pricing (see estimate_cost_usd). Loaded
     # from an optional `pricing:` mapping in the llm: config section.
     pricing: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     @staticmethod
-    def load(path: Path | None = None) -> LLMConfig:
-        """Load config from YAML file, then override with env vars.
+    def _load_yaml_section(config_path: Path) -> dict:
+        if not config_path.exists():
+            return {}
+        _check_config_permissions(config_path)
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        if "llm" in raw:
+            section = raw["llm"]
+            return section if isinstance(section, dict) else {}
+        if _PERFLAB_CONFIG_SECTION_KEYS & raw.keys():
+            # A general PerfLabConfig-style file (a project perflab.yaml, or
+            # a user config with other sections) that simply has no llm:
+            # key -- not the dedicated flat llm-only file the fallback below
+            # supports. Falling through to "flat" here would leak unrelated
+            # keys like "benchmark" into llm resolution (data.get("model"),
+            # data.get("provider"), etc. would just miss, but data.get(...)
+            # for a coincidentally-matching key -- e.g. a section literally
+            # named "model" -- would not).
+            return {}
+        # Flat style: a dedicated llm-only config file with no `llm:` nesting.
+        return raw
 
-        The API key is never read from the config file -- only
+    @staticmethod
+    def load(path: Path | None = None) -> LLMConfig:
+        """Load config, layering user config < project config < env vars.
+
+        Resolution order (later wins), matching the order documented for
+        perflab.config.load_config(): dataclass defaults, then
+        ~/.config/perflab/config.yaml, then a discovered ./perflab.yaml
+        (walking up from cwd), then environment variables. Passing an
+        explicit ``path`` overrides the user-config step only -- project
+        config discovery and env overrides still apply on top of it, same
+        as the default case.
+
+        The API key is never read from either config file -- only
         PERFLAB_API_KEY is honored, so a key never has to live on disk. A
         legacy file with an ``api_key`` field still loads (the value is
         ignored) but emits a deprecation warning; run
@@ -138,61 +205,75 @@ class LLMConfig:
         direct SDK use is picked up automatically. PERFLAB_API_KEY always
         takes precedence when set.
         """
-        config_path = path or _DEFAULT_CONFIG_PATH
-        data: dict = {}
+        user_config_path = path or _DEFAULT_CONFIG_PATH
+        user_data = LLMConfig._load_yaml_section(user_config_path)
 
-        if config_path.exists():
-            # Security: warn if config file is world-readable (catches legacy
-            # files from before api_key was env-var-only)
-            _check_config_permissions(config_path)
-            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Support nested llm: section or flat
-                data = raw.get("llm", raw)
+        project_data: dict = {}
+        project_config_path = find_project_config()
+        if project_config_path is not None:
+            project_data = LLMConfig._load_yaml_section(project_config_path)
 
-        if isinstance(data, dict) and data.get("api_key"):
-            warnings.warn(
-                f"{config_path} contains an 'api_key' field, which is no longer "
-                "read from disk. Set the PERFLAB_API_KEY environment variable "
-                "instead, then run 'perflab init --scrub-key' to remove it from "
-                "the file.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        # Project config layers over user config key-by-key, not as a whole
+        # dict replacement -- a project file that only sets `model:` must
+        # not blow away a user-level `api_base:` for a self-hosted proxy.
+        data: dict = {**user_data, **project_data}
+
+        for source_path, source_data in ((user_config_path, user_data), (project_config_path, project_data)):
+            if source_path is not None and source_data.get("api_key"):
+                warnings.warn(
+                    f"{source_path} contains an 'api_key' field, which is no longer "
+                    "read from disk. Set the PERFLAB_API_KEY environment variable "
+                    "instead, then run 'perflab init --scrub-key' to remove it from "
+                    "the file.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
 
         defaults = LLMConfig()
+
+        # Provider must be resolved before model: an env override of just
+        # PERFLAB_LLM_PROVIDER (leaving PERFLAB_LLM_MODEL unset) must not
+        # silently keep the OLD provider's default/configured model name --
+        # that model id is very likely invalid for the new provider's API.
+        # Model is only carried over from the file/default when nothing --
+        # neither env nor file -- names one explicitly for the resolved
+        # provider; otherwise it's re-derived from PROVIDER_DEFAULT_MODELS.
+        provider = str(data.get("provider", defaults.provider))
+        if env_provider := os.environ.get("PERFLAB_LLM_PROVIDER"):
+            provider = env_provider
+
+        if env_model := os.environ.get("PERFLAB_LLM_MODEL"):
+            model = env_model
+        elif "model" in data:
+            model = str(data["model"])
+        else:
+            model = PROVIDER_DEFAULT_MODELS.get(provider.lower(), defaults.model)
+
         cfg = LLMConfig(
-            provider=str(data.get("provider", defaults.provider)),
-            model=str(data.get("model", defaults.model)),
+            provider=provider,
+            model=model,
             api_key="",
             api_base=str(data.get("api_base", defaults.api_base)),
             temperature=float(data.get("temperature", defaults.temperature)),
             max_tokens=int(data.get("max_tokens", defaults.max_tokens)),
-            pricing=_parse_pricing_overrides(data) if isinstance(data, dict) else {},
+            pricing=_parse_pricing_overrides(data),
         )
 
-        # Env var overrides. Provider must be resolved first (immediately
-        # below) so the provider-specific API key fallback further down
-        # reads the right conventional env var.
-        if env_provider := os.environ.get("PERFLAB_LLM_PROVIDER"):
-            cfg.provider = env_provider
-        if env_model := os.environ.get("PERFLAB_LLM_MODEL"):
-            cfg.model = env_model
         if env_key := os.environ.get("PERFLAB_API_KEY"):
             cfg.api_key = env_key
         elif not cfg.api_key:
-            # PERFLAB_API_KEY is unset/empty and no api_key came from the
+            # PERFLAB_API_KEY is unset/empty and no api_key came from either
             # config file (file-sourced keys are never honored -- see
             # above). Fall back to the provider's own conventional env var
             # so a user who already has OPENAI_API_KEY / ANTHROPIC_API_KEY
             # exported doesn't hit an opaque "provider configured but not
             # available" with no clue why. PERFLAB_API_KEY, when set, always
             # wins -- this branch only runs when it's absent.
-            provider = cfg.provider.lower()
-            if provider == "openai":
+            provider_lower = cfg.provider.lower()
+            if provider_lower == "openai":
                 if openai_key := os.environ.get("OPENAI_API_KEY"):
                     cfg.api_key = openai_key
-            elif provider == "anthropic":
+            elif provider_lower == "anthropic":
                 if anthropic_key := os.environ.get("ANTHROPIC_API_KEY"):
                     cfg.api_key = anthropic_key
         if env_base := os.environ.get("PERFLAB_API_BASE"):

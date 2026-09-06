@@ -21,26 +21,13 @@ from pathlib import Path
 
 import yaml
 
-from perflab.llm.config import DEFAULT_MODEL
+from perflab.llm.config import DEFAULT_MODEL, LLMConfig, find_project_config
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class LLMSection:
-    """LLM provider settings."""
-    provider: str = "openai"
-    model: str = DEFAULT_MODEL
-    api_base: str = ""
-    temperature: float = 0.7
-    max_tokens: int = 16000
-    # api_key is deliberately NOT stored in this config — it comes from
-    # PERFLAB_API_KEY env var only, so it never gets written to disk or
-    # serialized into run artifacts.
 
 
 @dataclass
@@ -126,7 +113,7 @@ class PerfLabConfig:
     Combines all config sections into a single typed structure.
     Loaded once at startup, accessible throughout the session.
     """
-    llm: LLMSection = field(default_factory=LLMSection)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     benchmark: BenchmarkSection = field(default_factory=BenchmarkSection)
     profiler: ProfilerSection = field(default_factory=ProfilerSection)
     mps: MPSSection = field(default_factory=MPSSection)
@@ -139,8 +126,16 @@ class PerfLabConfig:
     analysis_thresholds: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """Serialize to a plain dict (JSON-safe, no api_key)."""
-        return dataclasses.asdict(self)
+        """Serialize to a plain dict (JSON-safe, no api_key).
+
+        LLMConfig (unlike the old LLMSection this replaced) carries an
+        api_key field so LLMConfig.load()'s resolved value can be reused
+        directly -- it must never reach a serialized resolved_config.json,
+        so it's stripped here rather than trusted to stay empty upstream.
+        """
+        d = dataclasses.asdict(self)
+        d["llm"].pop("api_key", None)
+        return d
 
     def save(self, path: Path) -> None:
         """Save resolved config to JSON (for run reproducibility)."""
@@ -158,19 +153,6 @@ _PROJECT_CONFIG_NAME = "perflab.yaml"
 _cached_config: PerfLabConfig | None = None
 
 
-def _find_project_config() -> Path | None:
-    """Walk up from cwd to find a project-level perflab.yaml."""
-    cwd = Path.cwd()
-    for parent in [cwd, *cwd.parents]:
-        candidate = parent / _PROJECT_CONFIG_NAME
-        if candidate.exists():
-            return candidate
-        # Stop at filesystem root or home directory
-        if parent == Path.home() or parent == parent.parent:
-            break
-    return None
-
-
 def _safe_set(obj: object, attr: str, raw: object, cast) -> None:
     """Set obj.attr to cast(raw), warning instead of crashing on a bad value.
 
@@ -185,15 +167,14 @@ def _safe_set(obj: object, attr: str, raw: object, cast) -> None:
 
 
 def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
-    """Overlay a parsed YAML dict onto a PerfLabConfig instance."""
+    """Overlay a parsed YAML dict onto a PerfLabConfig instance.
+
+    llm: is deliberately not handled here -- LLMConfig.load() is the single
+    source of truth for LLM config resolution (see load_config()), so this
+    overlay only needs to cover the other sections.
+    """
     if not isinstance(data, dict):
         return
-
-    llm = data.get("llm", {})
-    if isinstance(llm, dict):
-        for key in ("provider", "model", "api_base", "temperature", "max_tokens"):
-            if key in llm:
-                _safe_set(cfg.llm, key, llm[key], type(getattr(cfg.llm, key)))
 
     bench = data.get("benchmark", {})
     if isinstance(bench, dict):
@@ -253,15 +234,10 @@ def _overlay_yaml(cfg: PerfLabConfig, data: dict) -> None:
 
 
 def _overlay_env(cfg: PerfLabConfig) -> None:
-    """Overlay environment variables onto the config (highest priority)."""
-    # LLM (api_key handled separately in LLMConfig — never stored in PerfLabConfig)
-    if v := os.environ.get("PERFLAB_LLM_PROVIDER"):
-        cfg.llm.provider = v
-    if v := os.environ.get("PERFLAB_LLM_MODEL"):
-        cfg.llm.model = v
-    if v := os.environ.get("PERFLAB_API_BASE"):
-        cfg.llm.api_base = v
+    """Overlay environment variables onto the config (highest priority).
 
+    llm: is deliberately not handled here -- see _overlay_yaml's docstring.
+    """
     # Benchmark
     if v := os.environ.get("PERFLAB_BENCH_WARMUP"):
         try:
@@ -329,7 +305,7 @@ def load_config(*, force_reload: bool = False) -> PerfLabConfig:
             logger.warning("Failed to load user config %s", _USER_CONFIG_PATH, exc_info=True)
 
     # Layer 2: Project-level config (./perflab.yaml, walks up)
-    project_config = _find_project_config()
+    project_config = find_project_config()
     if project_config:
         try:
             data = yaml.safe_load(project_config.read_text(encoding="utf-8"))
@@ -339,6 +315,17 @@ def load_config(*, force_reload: bool = False) -> PerfLabConfig:
 
     # Layer 3: Environment variables (always win)
     _overlay_env(cfg)
+
+    # llm: is resolved entirely by LLMConfig.load() -- the same function
+    # cli.py, doctor.py, and server/agent_tools.py already call directly for
+    # real provider/model/api_key resolution. Before this, PerfLabConfig.llm
+    # was a second, independently-maintained implementation of the same
+    # provider/model/env-var logic (LLMSection + the blocks above) that had
+    # drifted from LLMConfig (e.g. a stale max_tokens default, and a
+    # duplicate copy of the provider/model env-override bug fixed in
+    # LLMConfig.load()). Passing _USER_CONFIG_PATH through explicitly keeps
+    # this in sync with the same user-config layer used above.
+    cfg.llm = LLMConfig.load(_USER_CONFIG_PATH)
 
     _cached_config = cfg
     return cfg
@@ -382,7 +369,7 @@ llm:
   model: {DEFAULT_MODEL}            # Model identifier
   api_base: ""               # Custom API endpoint (leave empty for default)
   temperature: 0.7
-  max_tokens: 16000
+  max_tokens: 64000
   # NOTE: api_key is NOT stored here for security — always use:
   #   export PERFLAB_API_KEY=sk-...
 

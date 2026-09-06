@@ -84,7 +84,7 @@ def _resolve_rlimit(program_type: str | None, rlimit_as_gb: float | None) -> int
     return DEFAULT_RLIMIT_AS_BYTES
 
 
-def run_build_cmd(task: TaskSpec, cwd: Path) -> CmdResult:
+def run_build_cmd(task: TaskSpec, cwd: Path, *, skip_preexec: bool = False) -> CmdResult:
     """Run task.build.cmd with the same GPU-aware memory limit every build
     call site needs. Caller must check task.build is not None first (every
     current caller already branches on that before reaching here).
@@ -104,12 +104,18 @@ def run_build_cmd(task: TaskSpec, cwd: Path) -> CmdResult:
     missing line, found one exhausting real-API-cost run at a time. This is
     the single funnel now; a future build call site that goes through this
     function inherits the fix automatically instead of needing to remember it.
+
+    skip_preexec: forwarded to run_cmd -- pass True when calling from a
+    ThreadPoolExecutor worker (prescreen's parallel candidate builds). The
+    resolved rlimit is still enforced there via run_cmd's ulimit shell
+    fallback, not silently dropped.
     """
     assert task.build is not None, "run_build_cmd called with no build step configured"
     return run_cmd(
         shlex.split(task.build.cmd), cwd=cwd,
         timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
         rlimit_as_bytes=_resolve_rlimit(task.program_type, task.constraints.rlimit_as_gb),
+        skip_preexec=skip_preexec,
     )
 
 

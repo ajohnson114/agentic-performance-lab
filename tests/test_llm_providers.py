@@ -48,8 +48,11 @@ class TestAnthropicProvider:
             stop_reason="end_turn",
             usage=SimpleNamespace(input_tokens=10, output_tokens=4),
         )
+        # complete() streams internally and calls get_final_message() to get
+        # the same Message shape create() used to return directly.
         mock_anthropic = MagicMock()
-        mock_anthropic.Anthropic.return_value.messages.create.return_value = resp
+        stream_cm = mock_anthropic.Anthropic.return_value.messages.stream
+        stream_cm.return_value.__enter__.return_value.get_final_message.return_value = resp
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
             result = AnthropicProvider(api_key="sk-x").complete(
                 [Message("system", "be terse"), Message("user", "hi")]
@@ -62,7 +65,7 @@ class TestAnthropicProvider:
             "total_tokens": 14,
         }
         # system message is extracted into the separate parameter
-        create_kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        create_kwargs = stream_cm.call_args.kwargs
         assert create_kwargs["system"] == "be terse"
         assert create_kwargs["messages"] == [{"role": "user", "content": "hi"}]
 
@@ -88,7 +91,7 @@ class TestAnthropicSamplingParams:
             AnthropicProvider(api_key="sk-x", model=model).complete(
                 [Message("user", "hi")], temperature=0.8
             )
-        kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assert "temperature" not in kwargs
         assert "top_p" not in kwargs and "top_k" not in kwargs
 
@@ -102,7 +105,7 @@ class TestAnthropicSamplingParams:
             AnthropicProvider(api_key="sk-x", model=model).complete(
                 [Message("user", "hi")], temperature=0.8
             )
-        kwargs = mock_anthropic.Anthropic.return_value.messages.create.call_args.kwargs
+        kwargs = mock_anthropic.Anthropic.return_value.messages.stream.call_args.kwargs
         assert kwargs["temperature"] == 0.8
 
     def test_sonnet_5_not_confused_with_sonnet_4_6(self):

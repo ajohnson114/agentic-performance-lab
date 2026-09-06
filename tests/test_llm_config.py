@@ -12,7 +12,19 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from perflab.llm.config import LLMConfig, scrub_api_key
+from perflab.llm.config import PROVIDER_DEFAULT_MODELS, LLMConfig, scrub_api_key
+
+
+@pytest.fixture(autouse=True)
+def _no_project_config(monkeypatch):
+    """Isolate LLMConfig.load() from whatever cwd pytest happens to run in.
+
+    load() now also discovers a project-level ./perflab.yaml (walking up
+    from cwd) -- without this, a stray perflab.yaml in a parent of the test
+    runner's cwd could pollute every test in this file. Tests that
+    specifically exercise project-config layering override this locally.
+    """
+    monkeypatch.setattr("perflab.llm.config.find_project_config", lambda *a, **k: None)
 
 
 class TestApiKeyNeverLoadedFromFile:
@@ -244,6 +256,122 @@ class TestPricingOverrides:
 
         cost = estimate_cost_usd("my-model", 1_000_000, 1_000_000, overrides=cfg.pricing)
         assert cost == 5.0
+
+
+class TestProviderModelResolution:
+    """Regression coverage: overriding just PERFLAB_LLM_PROVIDER via env
+    (leaving PERFLAB_LLM_MODEL unset) must re-derive the model default from
+    the NEW provider, not silently keep the OLD provider's default/configured
+    model name -- which the new provider's API would very likely reject."""
+
+    def test_env_provider_override_rederives_default_model(self, tmp_path):
+        # No file at all -- provider comes purely from env, so the model
+        # must resolve to anthropic's default, not openai's.
+        config_path = tmp_path / "missing.yaml"
+        with patch.dict(
+            "os.environ", {"PERFLAB_LLM_PROVIDER": "anthropic"}, clear=True
+        ):
+            cfg = LLMConfig.load(config_path)
+        assert cfg.provider == "anthropic"
+        assert cfg.model == PROVIDER_DEFAULT_MODELS["anthropic"]
+
+    def test_env_provider_override_with_file_default_model_rederives(self, tmp_path):
+        # File configures openai with no explicit model (so the file's
+        # "model" is really just the dataclass default). Overriding the
+        # provider via env must not carry the openai default over.
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+        with patch.dict(
+            "os.environ", {"PERFLAB_LLM_PROVIDER": "anthropic"}, clear=True
+        ):
+            cfg = LLMConfig.load(config_path)
+        assert cfg.provider == "anthropic"
+        assert cfg.model == PROVIDER_DEFAULT_MODELS["anthropic"]
+
+    def test_env_model_override_wins_even_with_env_provider_override(self, tmp_path):
+        config_path = tmp_path / "missing.yaml"
+        with patch.dict(
+            "os.environ",
+            {"PERFLAB_LLM_PROVIDER": "anthropic", "PERFLAB_LLM_MODEL": "my-custom-model"},
+            clear=True,
+        ):
+            cfg = LLMConfig.load(config_path)
+        assert cfg.model == "my-custom-model"
+
+    def test_explicit_file_model_survives_env_provider_override(self, tmp_path):
+        # An explicit model in the file for the file's own provider is user
+        # intent -- it is not silently discarded just because the provider
+        # was overridden via env (only the *default-derived* case is fixed
+        # up; an explicit choice is respected either way).
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.dump({"llm": {"provider": "openai", "model": "explicit-model"}})
+        )
+        with patch.dict(
+            "os.environ", {"PERFLAB_LLM_PROVIDER": "anthropic"}, clear=True
+        ):
+            cfg = LLMConfig.load(config_path)
+        assert cfg.provider == "anthropic"
+        assert cfg.model == "explicit-model"
+
+    def test_no_env_override_keeps_file_provider_and_default_model(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump({"llm": {"provider": "anthropic"}}))
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(config_path)
+        assert cfg.provider == "anthropic"
+        assert cfg.model == PROVIDER_DEFAULT_MODELS["anthropic"]
+
+
+class TestProjectConfigLayering:
+    """LLMConfig.load() now also discovers and layers a project-level
+    ./perflab.yaml on top of the user config, matching the resolution order
+    perflab.config.load_config() documents (env > project > user >
+    defaults) -- previously it only ever read the single user-level path
+    passed in, so a project-level llm: override was silently inert."""
+
+    def test_project_config_overrides_user_config(self, tmp_path, monkeypatch):
+        user_path = tmp_path / "user.yaml"
+        user_path.write_text(yaml.dump({"llm": {"provider": "openai", "model": "user-model"}}))
+        project_path = tmp_path / "perflab.yaml"
+        project_path.write_text(yaml.dump({"llm": {"model": "project-model"}}))
+        monkeypatch.setattr("perflab.llm.config.find_project_config", lambda: project_path)
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(user_path)
+
+        assert cfg.provider == "openai"       # from user config, untouched by project
+        assert cfg.model == "project-model"   # project overrides user
+
+    def test_project_config_without_llm_section_does_not_leak_other_sections(
+        self, tmp_path, monkeypatch
+    ):
+        # A real project perflab.yaml typically has benchmark:/agent:/etc.
+        # sections and no llm: key at all -- that must not be misread as
+        # "flat" llm data (see _load_yaml_section / _PERFLAB_CONFIG_SECTION_KEYS).
+        user_path = tmp_path / "user.yaml"
+        user_path.write_text(yaml.dump({"llm": {"provider": "anthropic", "model": "user-model"}}))
+        project_path = tmp_path / "perflab.yaml"
+        project_path.write_text(yaml.dump({"benchmark": {"warmup": 10}, "agent": {"max_iters": 5}}))
+        monkeypatch.setattr("perflab.llm.config.find_project_config", lambda: project_path)
+
+        with patch.dict("os.environ", {}, clear=True):
+            cfg = LLMConfig.load(user_path)
+
+        assert cfg.provider == "anthropic"
+        assert cfg.model == "user-model"
+
+    def test_env_still_wins_over_project_config(self, tmp_path, monkeypatch):
+        user_path = tmp_path / "user.yaml"
+        user_path.write_text(yaml.dump({"llm": {"provider": "openai"}}))
+        project_path = tmp_path / "perflab.yaml"
+        project_path.write_text(yaml.dump({"llm": {"model": "project-model"}}))
+        monkeypatch.setattr("perflab.llm.config.find_project_config", lambda: project_path)
+
+        with patch.dict("os.environ", {"PERFLAB_LLM_MODEL": "env-model"}, clear=True):
+            cfg = LLMConfig.load(user_path)
+
+        assert cfg.model == "env-model"
 
 
 class TestScrubApiKey:

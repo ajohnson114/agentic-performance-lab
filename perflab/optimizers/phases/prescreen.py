@@ -10,8 +10,9 @@ from perflab.optimizers.patch import (
     validate_patch,
     workspace_copy_ignore,
 )
+from perflab.runners.benchmark import run_build_cmd
 from perflab.runners.correctness import run_correctness
-from perflab.task_spec import DEFAULT_BUILD_TIMEOUT_S, TaskSpec
+from perflab.task_spec import TaskSpec
 from perflab.tools.isolation import IsolationPolicy
 
 if TYPE_CHECKING:
@@ -35,8 +36,6 @@ def _prescreen_candidate(
     """
     import shutil as _shutil
     import tempfile
-
-    from perflab.tools.shell import run_cmd
 
     result: dict = {
         "ci": ci,
@@ -76,14 +75,12 @@ def _prescreen_candidate(
 
         # Build in temp copy
         # skip_preexec=True because we're inside ThreadPoolExecutor —
-        # preexec_fn + fork() in a multithreaded process is undefined behavior.
+        # preexec_fn + fork() in a multithreaded process is undefined
+        # behavior. run_build_cmd still resolves the program-type-aware
+        # rlimit and enforces it via run_cmd's ulimit shell fallback rather
+        # than dropping it entirely (see _rlimit_shell_wrap in tools/shell.py).
         if task.build is not None:
-            import shlex
-            bres = run_cmd(
-                shlex.split(task.build.cmd), cwd=temp_ws,
-                timeout_s=task.build.timeout_s or DEFAULT_BUILD_TIMEOUT_S,
-                skip_preexec=True,
-            )
+            bres = run_build_cmd(task, temp_ws, skip_preexec=True)
             if bres.returncode != task.build.expected_exit:
                 result["error"] = {
                     "type": "build",
