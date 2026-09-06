@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -942,11 +943,36 @@ class TestRunCmdPassFds:
             os.fstat(fd)  # closed by run_cmd (ownership contract)
 
     def test_pass_fds_closed_when_spawn_fails(self):
+        """A nonexistent cwd fails before exec on every platform: unlike a
+        missing target binary (see the Linux-only test below), there is no
+        program on the command line for _rlimit_shell_wrap's bash shim to
+        absorb -- the chdir itself fails, so subprocess.run always raises
+        here regardless of skip_preexec/platform."""
         from perflab.tools.shell import run_cmd
 
         fd = self._pipe_read_end()
         with pytest.raises(FileNotFoundError):
-            run_cmd(["/nonexistent-perflab-binary"], skip_preexec=True, pass_fds=[fd])
+            run_cmd(
+                ["true"], cwd=Path("/nonexistent-perflab-cwd"),
+                skip_preexec=True, pass_fds=[fd],
+            )
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+    @pytest.mark.skipif(platform.system() != "Linux", reason="_rlimit_shell_wrap is a no-op off Linux")
+    def test_pass_fds_closed_when_shell_wrapped_exec_fails(self):
+        """On Linux, skip_preexec=True routes the command through _rlimit_shell_wrap's
+        bash shim (see its docstring), so a missing *target* binary no longer fails to
+        spawn at all -- bash spawns fine and its `exec "$@"` fails inside the child,
+        surfacing as a nonzero returncode rather than a Python exception. pass_fds must
+        still be closed on this path (the ownership contract is unconditional in
+        run_cmd's `finally`), which is what this locks in now that the exception-based
+        assertion above no longer exercises it on Linux."""
+        from perflab.tools.shell import run_cmd
+
+        fd = self._pipe_read_end()
+        res = run_cmd(["/nonexistent-perflab-binary"], skip_preexec=True, pass_fds=[fd])
+        assert res.returncode != 0
         with pytest.raises(OSError):
             os.fstat(fd)
 
